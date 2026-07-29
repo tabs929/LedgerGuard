@@ -1,8 +1,13 @@
 # Data Model
 
-> **Status: planning document.** Describes the approved Phase 1 schema and
-> accounting semantics. **No Flyway migrations exist yet** — this schema is
-> not implemented in the database. It will be created in Task 2.
+> **Status: schema implemented (Task 2), business layer not implemented.**
+> The tables, constraints, indexes, and triggers described below exist in
+> the database via
+> `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
+> and are verified by `SchemaMigrationIntegrationTest`. **No Java code reads
+> or writes this schema yet** — there are no JPA entities, repositories,
+> services, or controllers. Account creation, deposits, transfers, balance
+> lookups, and transaction history remain unimplemented (Tasks 3–6).
 
 ## Account Taxonomy
 
@@ -69,7 +74,7 @@ Both `ledger_entry` and `ledger_transaction` reject `UPDATE`/`DELETE` via a
 `BEFORE UPDATE OR DELETE` PostgreSQL trigger, since both are part of the
 authoritative financial record.
 
-## Planned Schema (Flyway, Task 2 — not yet created)
+## Implemented Schema (Flyway V1, Task 2)
 
 ```sql
 CREATE TABLE account (
@@ -122,8 +127,29 @@ CREATE TABLE ledger_entry (
 
 Plus indexes on `ledger_entry(account_id, created_at)` and
 `ledger_entry(transaction_id)`, and immutability triggers on both ledger
-tables (see `docs/ARCHITECTURE.md`).
+tables (see `docs/ARCHITECTURE.md`). The single seeded row —
+`SYSTEM/ASSET/EXTERNAL_FUNDING`, currency `USD`, balance `0` — is inserted
+by the same migration; no customer accounts or other example data are
+seeded.
+
+**What the schema enforces on its own** (verified in
+`SchemaMigrationIntegrationTest`, no application code involved):
+account-taxonomy combinations, currency format, non-negative balances,
+one `EXTERNAL_FUNDING` account per currency, valid debit/credit entry
+types, positive entry amounts, required foreign keys, and immutability of
+`ledger_transaction`/`ledger_entry` rows (`INSERT` allowed, `UPDATE`/
+`DELETE` rejected).
+
+**What the schema deliberately does not enforce** (left to the future
+domain service, per `CLAUDE.md` and `docs/ARCHITECTURE.md`):
+USD-only account creation (the `CHECK` only validates currency *format*,
+not the specific code — see the migration's header comment), and the
+"total debits equal total credits per transaction" trial-balance
+invariant (no deferred constraint trigger exists for this; it is enforced
+by the future `@Transactional` service boundary and verified by
+integration tests once that service exists).
 
 Application-side `AccountCategory`, `AccountClass`, `AccountPurpose`,
 `TransactionType`, `TransactionStatus`, and `LedgerEntryType` Java enums are
-planned to map 1:1 to these string literals — none of these types exist yet.
+planned to map 1:1 to these string literals — none of these types exist yet;
+Task 2 is schema-only.

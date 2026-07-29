@@ -5,18 +5,24 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 1 — Project Foundation
+## Status: Phase 1, Task 2 — Flyway Account and Ledger Schema
 
-This repository currently contains **only the project foundation**: a
-runnable Spring Boot application skeleton, PostgreSQL via Docker Compose,
-and a Testcontainers-backed integration test proving database connectivity.
+This repository currently contains the project foundation (Task 1) plus the
+initial database schema (Task 2): a runnable Spring Boot application
+skeleton, PostgreSQL via Docker Compose, and a Flyway migration
+(`V1__init_account_ledger_schema.sql`) that creates the `account`,
+`ledger_transaction`, and `ledger_entry` tables with their constraints,
+indexes, and immutability triggers, verified by PostgreSQL Testcontainers
+integration tests.
 
-**No financial functionality exists yet.** There are no accounts, no
-deposits, no transfers, no ledger, no balance or transaction-history APIs,
-and no database schema beyond an empty Flyway migration folder. There is
-also no authentication, no Kafka/event processing, and no reconciliation —
-those are explicitly out of scope until later tasks/phases per
-`docs/TASKS.md` and `CLAUDE.md`.
+**No financial functionality exists yet.** There are no JPA entities, no
+repositories, no services, and no controllers beyond Actuator's health
+endpoint — so there is no account creation, no deposits, no transfers, and
+no balance or transaction-history APIs. The schema exists in the database,
+but nothing in the application reads or writes it yet. There is also no
+authentication, no Kafka/event processing, and no reconciliation — those
+are explicitly out of scope until later tasks/phases per `docs/TASKS.md`
+and `CLAUDE.md`.
 
 ## Technology Stack
 
@@ -78,11 +84,12 @@ curl http://localhost:8080/actuator/health
 ./mvnw verify
 ```
 
-This runs the full test suite, including a Testcontainers-backed
-integration test that starts an isolated PostgreSQL container (independent
-of the Docker Compose service above), verifies the Spring application
-context loads, and confirms connectivity by executing `SELECT 1` against
-the datasource. The test's PostgreSQL container starts and stops
+This runs the full test suite, including Testcontainers-backed integration
+tests that each start an isolated PostgreSQL container (independent of the
+Docker Compose service above): a connectivity smoke test (`SELECT 1`
+against the datasource) and a schema-verification test that confirms the
+Flyway migration applies and every table, constraint, index, and trigger
+behaves as designed. Each test's PostgreSQL container starts and stops
 automatically as part of the test run — no manually running database is
 required.
 
@@ -92,8 +99,10 @@ required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (largely forward-looking; most described components are not yet built)
-- `docs/DATA_MODEL.md` — planned account/ledger schema and accounting
-  semantics (not yet implemented — no migrations exist yet)
+  (database-layer sections are implemented; Java-layer sections are
+  forward-looking and not yet built)
+- `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
+  The schema is implemented (Flyway V1); no Java code reads or writes it yet.
 - `docs/API_SPEC.md` — planned API contracts (not yet implemented)
-- `docs/TEST_STRATEGY.md` — planned testing approach for Phase 1
+- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level
+  tests are implemented, business-logic tests are planned

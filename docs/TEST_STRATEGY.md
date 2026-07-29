@@ -1,9 +1,13 @@
 # Test Strategy
 
-> **Status: planning document.** Describes the approved Phase 1 testing
-> approach. As of Task 1, only a foundational connectivity test exists (see
-> "Currently Implemented" below) — none of the business-logic or invariant
-> tests described here have been written yet.
+> **Status: planning document, schema-level tests now implemented.**
+> Describes the approved Phase 1 testing approach. As of Task 2, the
+> connectivity smoke test (Task 1) and a full set of schema-verification
+> tests (Task 2) exist (see "Currently Implemented" below). Business-logic
+> tests that require a domain service — invariant tests over actual
+> deposits/transfers, concurrency tests, validation/rejection tests, and
+> the 404-for-SYSTEM-account tests — remain unwritten, since the code they
+> would exercise doesn't exist yet.
 
 ## Split
 
@@ -26,7 +30,46 @@ service used for local development — the two are never conflated. The
 accidentally depend on, or fight with, a developer's locally running
 Docker Compose Postgres.
 
-## Planned Invariant Tests (not yet written)
+## Schema-Level Tests (implemented, Task 2)
+
+`SchemaMigrationIntegrationTest` verifies the V1 migration directly against
+a Testcontainers-provisioned `postgres:16.4` instance, using plain JDBC
+(`DataSource`/`Connection`) — no JPA entities or repositories exist yet, so
+these tests talk to the database directly:
+
+- **Migration applies:** Flyway migrates a fresh database to version 1
+  successfully (`flyway_schema_history` shows `success = true`); all three
+  tables exist.
+- **Constraints, indexes, and triggers exist:** queried directly from
+  `pg_constraint`, `pg_indexes`, and `pg_trigger`.
+- **Taxonomy-combination test:** the two valid `(category, class, purpose)`
+  combinations are accepted; an invalid combination
+  (`CUSTOMER + ASSET + EXTERNAL_FUNDING`) is rejected by
+  `chk_account_taxonomy_combination`.
+- **Currency-format test:** a malformed currency code is rejected by
+  `chk_account_currency_format`.
+- **Non-negative-balance test:** a negative `account.balance` is rejected by
+  `chk_account_balance_nonneg`.
+- **Positive-amount test:** a zero-amount `ledger_entry` is rejected by
+  `chk_ledger_entry_amount_positive`.
+- **Uniqueness test:** a second `SYSTEM`/`EXTERNAL_FUNDING`/`USD` account
+  insert fails `uq_system_account_purpose_currency` (the migration already
+  seeds one such row).
+- **Valid insert test:** a `ledger_transaction` with two `ledger_entry` rows
+  (one `DEBIT`, one `CREDIT`) referencing valid accounts inserts
+  successfully — proving the foreign keys and row-level constraints don't
+  block legitimate double-entry postings.
+- **Immutability tests:** direct `UPDATE`/`DELETE` against both
+  `ledger_entry` and `ledger_transaction` rows are rejected by their
+  triggers; `INSERT` is unaffected.
+
+**Not covered by these tests, by design:** the "total debits equal total
+credits per transaction" trial-balance invariant, ledger-as-source-of-truth
+balance recomputation, deterministic-locking/deadlock behavior, and the
+404-for-SYSTEM-account API behavior. These require the future domain
+service and are planned below, not implemented in Task 2.
+
+## Planned Invariant Tests (require the future domain service — not yet written)
 
 - **Ledger-as-source-of-truth:** after a sequence of deposits and transfers,
   recompute each account's balance by summing its `ledger_entry` rows per
@@ -40,12 +83,6 @@ Docker Compose Postgres.
 - **Concurrent-deposit test:** concurrent deposits into different customer
   accounts (racing on the shared `EXTERNAL_FUNDING` row) all succeed with
   no lost updates.
-- **Immutability tests:** direct `UPDATE`/`DELETE` against `ledger_entry`
-  and `ledger_transaction` rows both fail due to the database trigger.
-- **Uniqueness test:** a second `SYSTEM`/`EXTERNAL_FUNDING`/USD account
-  insert fails the partial unique index.
-- **Taxonomy-combination test:** an invalid `(category, class, purpose)`
-  combination fails the cross-column `CHECK` constraint.
 - **Validation/rejection tests:** self-transfer, unsupported currency,
   currency mismatch, zero/negative amount, insufficient funds, missing
   account.
@@ -59,6 +96,8 @@ Docker Compose Postgres.
 - `canConnectToTestcontainerDatabase()` — runs `SELECT 1` through the
   application's configured `DataSource` against a Testcontainers-provisioned
   `postgres:16.4` instance, proving real PostgreSQL connectivity end to end.
+
+`SchemaMigrationIntegrationTest` (Task 2) — see "Schema-Level Tests" above.
 
 ## CI
 

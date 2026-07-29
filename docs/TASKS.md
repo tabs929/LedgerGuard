@@ -3,18 +3,21 @@
 Work one task at a time. Mark a task done only when its tests pass and
 `./mvnw verify` passes for the whole project.
 
-- [ ] 1. Project foundation — Spring Boot 4.0.7 + Java 21 project via Maven
+- [x] 1. Project foundation — Spring Boot 4.0.7 + Java 21 project via Maven
       Wrapper, package structure (`account`, `ledger`, `transfer`, `common`
       only), `application.yml` profiles (default/test), Docker Compose for
       PostgreSQL, `.env.example`, health check endpoint. No business logic yet.
-- [ ] 2. Flyway baseline schema — migrations for `account`, `ledger_transaction`,
+- [x] 2. Flyway baseline schema — migrations for `account`, `ledger_transaction`,
       `ledger_entry` tables; `account_category`/`account_class`/
       `account_purpose` columns with CHECK constraints plus the cross-column
       taxonomy-combination constraint; the partial unique index on
       `(account_purpose, currency) WHERE account_category = 'SYSTEM'`; the
       ledger-immutability triggers on both `ledger_entry` and
       `ledger_transaction`; the zero-balance seeded USD funding account.
-      `docs/DATA_MODEL.md` and `docs/ARCHITECTURE.md` created here.
+      `docs/DATA_MODEL.md` and `docs/ARCHITECTURE.md` updated here.
+      Implemented as `V1__init_account_ledger_schema.sql`, verified by
+      `SchemaMigrationIntegrationTest` (16 tests, PostgreSQL Testcontainers).
+      Schema only — no JPA entities, repositories, services, or controllers.
 - [ ] 3. Account creation — `POST /api/v1/accounts`, `GET /api/v1/accounts/{id}`,
       request/response DTOs, validation (currency must be USD), service +
       repository with separate public-lookup vs. internal-lookup methods so

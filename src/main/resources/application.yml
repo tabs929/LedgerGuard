@@ -1,3 +1,6 @@
 spring:
   application:
     name: ledgerguard
+  jpa:
+    hibernate:
+      ddl-auto: none
