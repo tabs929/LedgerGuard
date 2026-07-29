@@ -92,6 +92,20 @@
 			<scope>test</scope>
 		</dependency>
 		<dependency>
+			<!-- Provides RestTemplateBuilder, required by TestRestTemplate
+			     (spring-boot-starter-restclient-test) for HTTP-boundary
+			     integration tests. Test-scoped only: the application has
+			     no production need to make outbound REST calls. -->
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-restclient</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-restclient-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-testcontainers</artifactId>
 			<scope>test</scope>

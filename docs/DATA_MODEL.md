@@ -1,13 +1,16 @@
 # Data Model
 
-> **Status: schema implemented (Task 2), business layer not implemented.**
-> The tables, constraints, indexes, and triggers described below exist in
-> the database via
+> **Status: schema implemented (Task 2); account creation implemented
+> (Task 3).** The tables, constraints, indexes, and triggers described
+> below exist in the database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
-> and are verified by `SchemaMigrationIntegrationTest`. **No Java code reads
-> or writes this schema yet** — there are no JPA entities, repositories,
-> services, or controllers. Account creation, deposits, transfers, balance
-> lookups, and transaction history remain unimplemented (Tasks 3–6).
+> and are verified by `SchemaMigrationIntegrationTest`. The `account` table
+> now has a matching JPA entity (`Account`, `AccountRepository`) used by
+> account creation only — `POST /api/v1/accounts` creates
+> `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` rows with a zero balance. No Java
+> code yet reads or writes `ledger_transaction` or `ledger_entry` — deposits,
+> transfers, balance lookups, and transaction history remain unimplemented
+> (Tasks 4–6).
 
 ## Account Taxonomy
 
@@ -149,7 +152,22 @@ invariant (no deferred constraint trigger exists for this; it is enforced
 by the future `@Transactional` service boundary and verified by
 integration tests once that service exists).
 
-Application-side `AccountCategory`, `AccountClass`, `AccountPurpose`,
-`TransactionType`, `TransactionStatus`, and `LedgerEntryType` Java enums are
-planned to map 1:1 to these string literals — none of these types exist yet;
-Task 2 is schema-only.
+Application-side `AccountCategory`, `AccountClass`, and `AccountPurpose`
+Java enums (Task 3) map 1:1 to the `account` table's string literals, via
+`@Enumerated(EnumType.STRING)` on the `Account` entity.
+`TransactionType`, `TransactionStatus`, and `LedgerEntryType` remain
+unimplemented — no code writes to `ledger_transaction` or `ledger_entry`
+yet.
+
+## Account Creation Enforcement (implemented, Task 3)
+
+`POST /api/v1/accounts` only ever inserts rows with
+`(CUSTOMER, LIABILITY, CUSTOMER_WALLET)` — `AccountService` constructs this
+combination directly; it is never read from the request. `balance` is
+forced to `0.0000` in the same way. `ownerName` and `currency` are the only
+client-supplied values; `currency` must be `USD` (case-insensitive input is
+normalized to uppercase), enforced in `AccountService`, not the database
+(the DB's `chk_account_currency_format` still just checks the ISO-4217
+shape, per the header comment in `V1__init_account_ledger_schema.sql`).
+`created_at` is populated by the database's `DEFAULT now()`, not by
+application code.

@@ -1,13 +1,14 @@
 # Test Strategy
 
-> **Status: planning document, schema-level tests now implemented.**
-> Describes the approved Phase 1 testing approach. As of Task 2, the
-> connectivity smoke test (Task 1) and a full set of schema-verification
-> tests (Task 2) exist (see "Currently Implemented" below). Business-logic
-> tests that require a domain service — invariant tests over actual
-> deposits/transfers, concurrency tests, validation/rejection tests, and
-> the 404-for-SYSTEM-account tests — remain unwritten, since the code they
-> would exercise doesn't exist yet.
+> **Status: planning document; schema-level (Task 2) and account-creation
+> (Task 3) tests are now implemented.** As of Task 3, the connectivity
+> smoke test (Task 1), schema-verification tests (Task 2), and account
+> creation's HTTP-boundary + persisted-state tests (Task 3) all exist (see
+> "Currently Implemented" below). Business-logic tests that require the
+> future ledger-posting domain service — deposit/transfer invariant tests,
+> concurrency tests, and the 404-for-SYSTEM-account tests for `GET
+> /api/v1/accounts/{id}` and later endpoints — remain unwritten, since the
+> code they would exercise doesn't exist yet.
 
 ## Split
 
@@ -98,6 +99,25 @@ service and are planned below, not implemented in Task 2.
   `postgres:16.4` instance, proving real PostgreSQL connectivity end to end.
 
 `SchemaMigrationIntegrationTest` (Task 2) — see "Schema-Level Tests" above.
+
+`AccountCreationIntegrationTest` (Task 3) — HTTP-boundary tests via
+`TestRestTemplate` against `POST /api/v1/accounts`, plus direct JDBC checks
+of the persisted `account` row, all against a Testcontainers-provisioned
+`postgres:16.4` instance running the Flyway migrations from scratch:
+- Valid USD account creation: 201, correct response fields
+  (`id`/`ownerName`/`currency`/`balance`/`createdAt`), and the persisted row
+  has `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`/`USD`/zero balance.
+- Lowercase `"usd"` is normalized to `"USD"` in the response.
+- Missing currency, malformed currency (400), and unsupported-but-well-formed
+  non-USD currency (422) are all rejected, and none of these persist a row.
+- An attempt to set `accountCategory`, `accountClass`, `accountPurpose`,
+  `balance`, `id`, or `createdAt` via extra JSON properties is rejected
+  (400, unrecognized property) and persists nothing — proving a client
+  cannot create a `SYSTEM` account or choose any protected field.
+- A direct repository save of an invalid taxonomy combination (bypassing
+  `AccountService` entirely) still fails against
+  `chk_account_taxonomy_combination` — proving the JPA mapping doesn't
+  weaken the schema's guarantees.
 
 ## CI
 

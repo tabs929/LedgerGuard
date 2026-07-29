@@ -18,11 +18,19 @@ Work one task at a time. Mark a task done only when its tests pass and
       Implemented as `V1__init_account_ledger_schema.sql`, verified by
       `SchemaMigrationIntegrationTest` (16 tests, PostgreSQL Testcontainers).
       Schema only — no JPA entities, repositories, services, or controllers.
-- [ ] 3. Account creation — `POST /api/v1/accounts`, `GET /api/v1/accounts/{id}`,
-      request/response DTOs, validation (currency must be USD), service +
-      repository with separate public-lookup vs. internal-lookup methods so
-      SYSTEM accounts are 404 not-found through every public path by
-      construction, unit + Testcontainers integration tests.
+- [x] 3. Account creation — `POST /api/v1/accounts` implemented: request/
+      response DTOs, Jakarta validation, `AccountService` (fixed
+      CUSTOMER/LIABILITY/CUSTOMER_WALLET taxonomy, zero opening balance,
+      USD-only currency with lowercase normalization), `AccountRepository`,
+      minimal endpoint-local error handling (400 validation, 422 unsupported
+      currency). Verified by `AccountCreationIntegrationTest` (7 tests,
+      PostgreSQL Testcontainers, HTTP boundary + persisted DB state).
+      **Scope note:** `GET /api/v1/accounts/{id}` — originally bundled into
+      this task line above — was descoped to a later task per explicit
+      instruction; the public-lookup vs. internal-lookup repository split
+      it depends on (see `docs/ARCHITECTURE.md`) is not yet needed since no
+      endpoint looks accounts up by id yet. No deposits, transfers, ledger
+      entries, balance, or history were implemented.
 - [ ] 4. Deposits — `POST /api/v1/accounts/{id}/deposits`, balanced DEBIT
       `EXTERNAL_FUNDING` / CREDIT customer-account transaction; locks both
       the customer account and `EXTERNAL_FUNDING` rows in ascending id order

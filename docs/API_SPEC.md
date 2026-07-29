@@ -1,19 +1,38 @@
 # API Specification
 
-> **Status: planning document.** None of the endpoints below exist yet. No
-> controllers, services, or DTOs have been written. This describes the
-> approved Phase 1 API contracts that Tasks 3–7 will implement.
+> **Status: account creation implemented (Task 3); the rest is still a
+> planning document.** `POST /api/v1/accounts` exists and matches the
+> contract below exactly. It creates only customer USD wallet accounts,
+> which always open with a zero balance. `GET /api/v1/accounts/{id}` and
+> everything below it remain unimplemented — no controllers, services, or
+> DTOs exist for them yet.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
 
-## POST /api/v1/accounts (not implemented)
+## POST /api/v1/accounts (implemented, Task 3)
 
 Request: `{ "ownerName": string, "currency": "USD" }`
 
 Response 201: `{ "id": uuid, "ownerName": string, "currency": string, "balance": "0.0000", "createdAt": iso8601 }`
 
-Errors: 422 unsupported currency (only `USD` is accepted in Phase 1).
+Creates a customer wallet account only. The server always assigns
+`account_category = CUSTOMER`, `account_class = LIABILITY`,
+`account_purpose = CUSTOMER_WALLET`, and `balance = 0` — the request has no
+fields for any of these, so a client cannot select or override them, and
+cannot create a `SYSTEM` account through this endpoint.
+
+`currency` accepts `"USD"` case-insensitively (`"usd"` is normalized to
+`"USD"` in the response); any other value is rejected. Any JSON property
+not in the request shape above (e.g. an attempt to set `balance`,
+`accountCategory`, `id`, or `createdAt`) is rejected outright as a 400 —
+never silently ignored.
+
+Errors:
+- 400 validation — missing/blank `ownerName`, missing or malformed
+  `currency` (not a 3-letter code), or an unrecognized JSON property.
+- 422 unsupported currency — a well-formed but non-`USD` currency code
+  (only `USD` is accepted in Phase 1).
 
 ## GET /api/v1/accounts/{id} (not implemented)
 
@@ -74,8 +93,8 @@ Implemented via a global `@ControllerAdvice` (planned for Task 7).
 
 ## Currently Available Endpoints
 
-The only endpoint that actually exists today is Spring Boot Actuator's
-built-in health check:
+- `POST /api/v1/accounts` (Task 3) — see above.
+- Spring Boot Actuator's built-in health check:
 
 ```
 GET /actuator/health
