@@ -6,7 +6,7 @@ platform built to demonstrate backend software engineering.
 ## Technology Stack
 
 - Java 21
-- Spring Boot 3.5.x
+- Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL
 - Flyway
