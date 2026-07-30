@@ -5,11 +5,12 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 5 — Transfers
+## Status: Phase 1, Task 6 — Account Balance and Transaction History
 
 This repository contains the project foundation (Task 1), the initial
-database schema (Task 2), account creation (Task 3), deposits (Task 4), and
-transfers (Task 5).
+database schema (Task 2), account creation (Task 3), deposits (Task 4),
+transfers (Task 5), and read-only account balance/transaction-history APIs
+(Task 6).
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -46,11 +47,26 @@ Ledger rows remain immutable — deposit and transfer processing only ever
 insert into `ledger_transaction`/`ledger_entry`, never update or delete
 them, and the Task 2 immutability triggers are untouched.
 
-**Balance lookups, transaction history, and account lookup by id (`GET
-/api/v1/accounts/{id}`) are not implemented.** There is also no
-authentication, no Kafka/event processing, and no reconciliation — those
-are explicitly out of scope until later tasks/phases per `docs/TASKS.md`
-and `CLAUDE.md`.
+`GET /api/v1/accounts/{id}/balance` returns an account's current
+**materialized balance** — the same persisted number deposits and
+transfers maintain — read directly, never recomputed and never cached.
+`GET /api/v1/accounts/{id}/transactions` returns that account's own
+transaction history, derived from the immutable `ledger_entry` records:
+deposits appear as customer-wallet **credits**, outgoing transfers appear
+as **debits**, incoming transfers appear as **credits**. History is
+newest-first (`created_at DESC`, with the entry's own id as a deterministic
+tie-breaker) and paginated (`page`/`size` query parameters, defaults
+`page=0`/`size=20`, `size` capped at `100`). Both read endpoints are plain
+database reads — no row locking, no ledger writes, no balance changes —
+and both hide `SYSTEM` accounts (like `EXTERNAL_FUNDING`) exactly like the
+write endpoints already do: a `SYSTEM` account id is indistinguishable
+from a nonexistent one (404).
+
+**Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
+implemented** — no task has been assigned it so far. There is also no
+authentication, no Kafka/event processing, no reconciliation, no OpenAPI
+docs, and no CI workflow — those are explicitly out of scope until later
+tasks/phases per `docs/TASKS.md` and `CLAUDE.md`.
 
 ## Technology Stack
 
@@ -118,15 +134,19 @@ Docker Compose service above): a connectivity smoke test (`SELECT 1`
 against the datasource), a schema-verification test that confirms the
 Flyway migration applies and every table, constraint, index, and trigger
 behaves as designed, an account-creation test suite, a deposit test suite,
-and a transfer test suite. The deposit and transfer suites both verify
-balanced double-entry postings, balance correctness, a genuine
-database-failure rollback scenario, and real concurrency against
-PostgreSQL row locking (no mocks, no Java-only synchronization) — the
-transfer suite additionally proves concurrent transfers from one source
-never overspend it, and that concurrent opposite-direction transfers
-between the same two accounts complete without deadlocking. Each test's
-PostgreSQL container starts and stops automatically as part of the test
-run — no manually running database is required.
+a transfer test suite, and an account balance/transaction-history test
+suite. The deposit and transfer suites both verify balanced double-entry
+postings, balance correctness, a genuine database-failure rollback
+scenario, and real concurrency against PostgreSQL row locking (no mocks,
+no Java-only synchronization) — the transfer suite additionally proves
+concurrent transfers from one source never overspend it, and that
+concurrent opposite-direction transfers between the same two accounts
+complete without deadlocking. The balance/history suite proves reads never
+create ledger rows or change balances, history ordering and pagination
+match the approved contract exactly, and no account's history ever leaks
+another account's entries. Each test's PostgreSQL container starts and
+stops automatically as part of the test run — no manually running
+database is required.
 
 ## Documentation
 
@@ -134,15 +154,18 @@ run — no manually running database is required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (database layer, account creation, deposit, and transfer processing are
-  all implemented)
+  (database layer, account creation, deposit, transfer, and account-query
+  processing are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The schema is implemented (Flyway V1); account creation, deposits, and
   transfers all read/write `account`, `ledger_transaction`, and
-  `ledger_entry`.
+  `ledger_entry`; the balance/history endpoints read all three but write
+  none of them.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
-  /api/v1/accounts/{id}/deposits`, and `POST /api/v1/transfers` are
-  implemented and documented exactly as built; the remaining endpoints are
-  still planned contracts.
+  /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
+  /api/v1/accounts/{id}/balance`, and `GET
+  /api/v1/accounts/{id}/transactions` are all implemented and documented
+  exactly as built; the remaining endpoints are still planned contracts.
 - `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level,
-  account-creation, deposit, and transfer tests are all implemented
+  account-creation, deposit, transfer, and account-query tests are all
+  implemented

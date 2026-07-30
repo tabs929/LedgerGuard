@@ -1,15 +1,17 @@
 # Test Strategy
 
-> **Status: planning document; schema-level (Task 2), account-creation
-> (Task 3), deposit (Task 4), and transfer (Task 5) tests are now
-> implemented.** As of Task 5, the connectivity smoke test (Task 1),
+> **Status: schema-level (Task 2), account-creation (Task 3), deposit
+> (Task 4), transfer (Task 5), and account balance/transaction-history
+> (Task 6) tests are all implemented — no Phase 1 test-writing tasks
+> remain planned.** The connectivity smoke test (Task 1),
 > schema-verification tests (Task 2), account creation's tests (Task 3),
-> deposit's ledger-balance/rollback/concurrency tests (Task 4), and
-> transfer's ledger-balance/conservation/insufficient-funds/rollback/
-> deadlock-avoidance tests (Task 5) all exist (see "Currently Implemented"
-> below). The 404-for-SYSTEM-account tests for `GET /api/v1/accounts/{id}`
-> and later endpoints (balance, history) remain unwritten, since that code
-> doesn't exist yet.
+> deposit's ledger-balance/rollback/concurrency tests (Task 4), transfer's
+> ledger-balance/conservation/insufficient-funds/rollback/
+> deadlock-avoidance tests (Task 5), and the balance/history read tests
+> (Task 6) all exist (see "Currently Implemented" below). The
+> 404-for-SYSTEM-account behavior itself remains untested only for `GET
+> /api/v1/accounts/{id}`, since that plain-lookup endpoint was never
+> assigned to any task and so still doesn't exist.
 
 ## Split
 
@@ -159,6 +161,49 @@ JDBC), against a Testcontainers-provisioned `postgres:16.4` instance:
     id-ordered locking prevents the deadlock that source-then-destination
     locking would risk) and both balances return to their starting values.
 
+## Account Balance and Transaction History Tests (implemented, Task 6)
+
+`AccountQueryIntegrationTest` (31 tests) verifies the two read endpoints at
+the HTTP boundary (`TestRestTemplate`), against a Testcontainers-provisioned
+`postgres:16.4` instance:
+
+- **Balance:** a new wallet reports exactly `0.0000`; deposits and
+  transfers change the returned balance by exactly the expected amount
+  (including a multi-operation sequence); the response contains exactly
+  the three approved fields (`accountId`, `balance`, `currency` — no more,
+  no fewer); the returned `BigDecimal` retains its full stored scale
+  (`4`, not silently rounded to `2`); a nonexistent account and a `SYSTEM`
+  account (`EXTERNAL_FUNDING`) both return 404; a malformed UUID returns
+  400 (a request-shape error, not a not-found error — see
+  `docs/API_SPEC.md`); repeated `GET`s create no `ledger_transaction`/
+  `ledger_entry` rows and never change the balance they just read.
+- **Transaction history:** a new account's history is the documented empty
+  page (`content: []`, `totalElements: 0`, `totalPages: 0`, default
+  `page`/`size`); a deposit appears as exactly one `CREDIT` item with the
+  correct amount/currency/transaction id; a transfer appears as a `DEBIT`
+  in the source's history and a `CREDIT` in the destination's, both
+  referencing the same `transactionId`; a mixed sequence of deposits and
+  transfers across two accounts produces exactly the expected item count
+  for each account, with entries belonging only to the *other* account
+  never appearing; ordering is verified newest-first across three
+  time-separated deposits; `SYSTEM`/nonexistent/malformed-UUID behave the
+  same as the balance endpoint; reads create no ledger rows and change no
+  balance.
+- **Pagination:** default `page=0, size=20`; explicit `page`/`size` values
+  produce correct `totalElements`/`totalPages` and item counts per page,
+  with every item across all requested pages appearing exactly once (no
+  duplicates, no gaps) — proven by collecting all `transactionId`s across
+  three pages of a 25-item history and asserting the resulting set has
+  exactly 25 distinct entries; `size=1` and `size=100` (the documented
+  bounds) are both accepted; `page=-1`, `size=0`, `size=-5`, `size=101`,
+  and non-numeric `page`/`size` values are all rejected with 400.
+- **Cross-feature regression:** a deposit-then-transfer sequence, with
+  Task 6 reads interleaved between every write, still leaves the transfer's
+  two ledger entries balanced (`SUM(debits) == SUM(credits)`, checked
+  directly via JDBC); `EXTERNAL_FUNDING`'s balance is unaffected by any
+  Task 6 read; the Task 2 immutability triggers still reject `UPDATE`/
+  `DELETE` against rows a real deposit created.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -191,6 +236,9 @@ of the persisted `account` row, all against a Testcontainers-provisioned
 `DepositIntegrationTest` (Task 4) — see "Deposit Tests" above.
 
 `TransferIntegrationTest` (Task 5) — see "Transfer Tests" above.
+
+`AccountQueryIntegrationTest` (Task 6) — see "Account Balance and
+Transaction History Tests" above.
 
 ## CI
 

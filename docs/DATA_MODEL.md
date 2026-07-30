@@ -1,13 +1,20 @@
 # Data Model
 
 > **Status: schema implemented (Task 2); account creation (Task 3),
-> deposits (Task 4), and transfers (Task 5) implemented.** The tables,
-> constraints, indexes, and triggers described below exist in the database
-> via `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
-> and are verified by `SchemaMigrationIntegrationTest`. `account`,
+> deposits (Task 4), transfers (Task 5), and account balance/transaction-
+> history reads (Task 6) implemented.** The tables, constraints, indexes,
+> and triggers described below exist in the database via
+> `src/main/resources/db/migration/V1__init_account_ledger_schema.sql` and
+> are verified by `SchemaMigrationIntegrationTest`. `account`,
 > `ledger_transaction`, and `ledger_entry` all have matching JPA entities,
-> written by account creation, deposit, and now transfer processing.
-> Balance lookups and transaction history remain unimplemented (Task 6).
+> written by account creation, deposit, and transfer processing, and now
+> also read by `AccountQueryService` (Task 6) — which never writes to any
+> of them. The materialized `account.balance` it returns and the
+> `ledger_entry` history it returns are two distinct things: the former is
+> a cached number kept in lockstep with the latter by every write path;
+> the latter is the immutable record those numbers are derived from. Task 6
+> reads one, then the other, independently — it never recomputes one from
+> the other.
 
 ## Account Taxonomy
 
@@ -231,3 +238,27 @@ then have to roll back. A transfer for exactly the source's current
 balance is allowed (`balance >= amount` including equality) and correctly
 leaves the source at exactly `0.0000`, still satisfying
 `chk_account_balance_nonneg`.
+
+## Account Balance and Transaction History Enforcement (implemented, Task 6)
+
+`GET /api/v1/accounts/{id}/balance` returns `account.balance` — the
+persisted materialized column — read via a single `SELECT`, with no
+`FOR UPDATE` lock (reads don't need one; see `docs/ARCHITECTURE.md`'s
+"Account Balance and Transaction History" section for why) and no
+recomputation from `ledger_entry`. The database's own guarantees
+(`chk_account_balance_nonneg`, and every write path updating this column
+only alongside balanced ledger entries in one transaction) are what make
+this plain read trustworthy without Task 6 needing to verify anything
+itself.
+
+`GET /api/v1/accounts/{id}/transactions` reads `ledger_entry` rows filtered
+by `account_id = {id}`, ordered `created_at DESC, id DESC` (the approved
+Task 6 ordering — see `docs/API_SPEC.md`). Because the filter is on
+`account_id`, the account's own entries are the only ones a query can ever
+return — there's no separate step that could accidentally include or leak
+a counterparty's or an unrelated account's row. Immutability
+(`docs/ARCHITECTURE.md`'s "Ledger Immutability") is what makes this
+history safe to serve directly: the rows a `GET` reads cannot have been
+altered since they were written by a deposit or transfer, so there's no
+"stale vs. current" distinction to worry about — the row as written is the
+row as read, always.

@@ -68,9 +68,23 @@ Work one task at a time. Mark a task done only when its tests pass and
       concurrent same-source transfers that don't overspend, and concurrent
       opposite-direction (A→B / B→A) transfers that complete without
       deadlock. No balance/history endpoints were implemented.
-- [ ] 6. Balance & transaction history APIs — `GET /api/v1/accounts/{id}/balance`,
-      `GET /api/v1/accounts/{id}/transactions` (paginated ledger history),
-      DTOs that never expose JPA entities.
+- [x] 6. Balance & transaction history APIs — `GET /api/v1/accounts/{id}/balance`
+      and `GET /api/v1/accounts/{id}/transactions` implemented:
+      `AccountQueryService` (read-only, `@Transactional(readOnly = true)`,
+      no locking), `AccountBalanceResponse`/`TransactionHistoryItem`/
+      `PagedResponse<T>` DTOs, `LedgerEntryRepository.findByAccountIdOrderByCreatedAtDescIdDesc`
+      (one query for a page of entries + Spring Data's derived count query
+      — no N+1, no full-history loading). Ordering and the custom
+      pagination envelope (`{content, page, size, totalElements,
+      totalPages}`, `page`/`size` defaults and bounds) were ambiguous in
+      the original `docs/API_SPEC.md` stub and were confirmed with the
+      user before implementation — see that file's Task 6 sections for the
+      now-approved contract. SYSTEM accounts and incompatible taxonomies
+      are hidden as 404, same rule as deposits/transfers. Verified by
+      `AccountQueryIntegrationTest` (31 tests, PostgreSQL Testcontainers).
+      **Scope note:** plain `GET /api/v1/accounts/{id}` was not
+      implemented — this task's line above never included it, so it
+      remains deferred, consistent with the Task 3 scope note.
 - [ ] 7. Global error handling & validation polish — `@ControllerAdvice`,
       consistent error response shape, request validation annotations across
       all endpoints, mapping of domain exceptions to HTTP status codes.

@@ -5,20 +5,21 @@ import com.tarun.ledgerguard.account.CurrencyMismatchException;
 import com.tarun.ledgerguard.account.InsufficientFundsException;
 import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
+import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /**
- * Minimal, shared error mapping for the account-creation, deposit, and
- * transfer endpoints (Tasks 3–5) — not the complete cross-cutting
- * error-response framework, which is Task 7's responsibility. This exists
- * only so the same handful of domain exceptions aren't mapped twice, once
- * per controller, now that both {@code AccountController} and
- * {@code TransferController} can throw them. Bean-validation failures and
- * unknown-JSON-property rejections are still left to Spring's own default
- * exception resolution (400), unchanged.
+ * Minimal, shared error mapping for the account-creation, deposit,
+ * transfer, and account-query endpoints (Tasks 3–6) — not the complete
+ * cross-cutting error-response framework, which is Task 7's
+ * responsibility. This exists only so the same handful of domain
+ * exceptions aren't mapped twice, once per controller. Bean-validation
+ * failures on {@code @RequestBody} DTOs and unknown-JSON-property
+ * rejections are still left to Spring's own default exception resolution
+ * (400), unchanged.
  */
 @RestControllerAdvice
 public class AccountAndTransferExceptionHandler {
@@ -32,6 +33,17 @@ public class AccountAndTransferExceptionHandler {
 	@ExceptionHandler(AccountNotFoundException.class)
 	public ResponseEntity<ErrorBody> handleAccountNotFound(AccountNotFoundException ex) {
 		return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorBody(ex.getMessage()));
+	}
+
+	// @Validated method-parameter constraints (e.g. the transaction-history
+	// endpoint's @Min/@Max on page/size, Task 6) are enforced via Bean
+	// Validation's AOP method interceptor, which throws this JSR-380
+	// exception directly rather than the web-aware exception Spring MVC's
+	// own default resolvers already map to 400 -- without this handler it
+	// would surface as an unmapped 500.
+	@ExceptionHandler(ConstraintViolationException.class)
+	public ResponseEntity<ErrorBody> handleConstraintViolation(ConstraintViolationException ex) {
+		return ResponseEntity.badRequest().body(new ErrorBody(ex.getMessage()));
 	}
 
 	private record ErrorBody(String message) {

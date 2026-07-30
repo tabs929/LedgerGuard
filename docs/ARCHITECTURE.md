@@ -1,18 +1,19 @@
 # Architecture
 
 > **Status: database layer (Task 2), account creation (Task 3), deposits
-> (Task 4), and transfers (Task 5) implemented; balance/history APIs and
-> beyond are still planning.** The `account` package has account creation
-> and deposit processing; the `ledger` package has `LedgerTransaction`,
-> `LedgerEntry`, and their repositories/enums; the `transfer` package now
-> exists too. Transaction boundaries, deterministic lock ordering, and the
-> ledger-as-source-of-truth write path are implemented for both deposits
-> and transfers. A small shared exception-handling class was extracted to
-> `common` (see "Error Handling" at the end of this document) — the first
-> code in that package. `GET /api/v1/accounts/{id}` still does not exist,
-> so the public-vs-internal lookup split described below is still only
-> partially realized (see that section for exactly what deposits and
-> transfers do instead).
+> (Task 4), transfers (Task 5), and account balance/transaction-history
+> reads (Task 6) implemented; nothing in Phase 1 remains unimplemented
+> except plain account lookup by id.** The `account` package has account
+> creation, deposit processing, and now read-only account queries; the
+> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
+> repositories/enums; the `transfer` package has transfer processing. The
+> `common` package now also holds `PagedResponse<T>` (Task 6), alongside
+> the shared exception-handling class from Task 5. `GET
+> /api/v1/accounts/{id}` still does not exist — `docs/TASKS.md`'s Task 6
+> line scoped that task to balance and history only, not general account
+> lookup — so the public-vs-internal lookup split described below is still
+> only partially realized (see that section for exactly what deposits,
+> transfers, and the new read endpoints do instead).
 
 ## Style
 
@@ -24,21 +25,24 @@ technical layer. No microservices.
 Only these packages are created in Phase 1, each only when the task that
 needs it starts — no empty placeholder packages are scaffolded in advance:
 
-- `account` — **account creation (Task 3) and deposits (Task 4)
-  implemented**; also holds exceptions reused by transfers
-  (`AccountNotFoundException`, `CurrencyMismatchException`,
-  `UnsupportedCurrencyException`, plus new `InsufficientFundsException`/
-  `SameAccountTransferException` from Task 5). Account lookup by id remains
-  unimplemented.
+- `account` — **account creation (Task 3), deposits (Task 4), and
+  balance/history reads (Task 6) implemented**; also holds exceptions
+  reused by transfers (`AccountNotFoundException`,
+  `CurrencyMismatchException`, `UnsupportedCurrencyException`, plus
+  `InsufficientFundsException`/`SameAccountTransferException` from
+  Task 5). Plain account lookup by id (`GET /api/v1/accounts/{id}`)
+  remains unimplemented — never assigned to any task so far.
 - `ledger` — **implemented (Task 4)**: `LedgerTransaction`, `LedgerEntry`,
   `TransactionType`, `TransactionStatus`, `LedgerEntryType`, and their
-  repositories.
+  repositories. `LedgerEntryRepository` gained one query in Task 6 for
+  paginated account history.
 - `transfer` — **implemented (Task 5)**: `TransferController`,
   `TransferService`, `TransferRequest`/`TransferResponse` — the transfer
   use case, spanning `account` and `ledger` as planned.
-- `common` — **implemented (Task 5)**: `AccountAndTransferExceptionHandler`,
-  the first shared cross-cutting type — see "Error Handling" below. Not
-  the full `ApiExceptionHandler`/`ApiError` envelope described in
+- `common` — **implemented (Tasks 5–6)**: `AccountAndTransferExceptionHandler`
+  (Task 5) and `PagedResponse<T>` (Task 6) — see "Error Handling" and
+  "Account Balance and Transaction History" below. Not the full
+  `ApiExceptionHandler`/`ApiError` envelope described in
   `docs/API_SPEC.md`'s "Error Response Shape", which remains Task 7's
   responsibility.
 
@@ -179,6 +183,64 @@ still sum to the same amount, so the transaction stays balanced, and unlike
 a deposit, the *combined* balance of the two accounts is unchanged (money
 moves internally; none enters or leaves the ledger).
 
+## Account Balance and Transaction History (implemented, Task 6)
+
+`AccountController.getBalance`/`getTransactionHistory`
+(`GET /api/v1/accounts/{id}/balance`, `GET /api/v1/accounts/{id}/transactions`)
+→ `AccountQueryService` → `AccountRepository` + `LedgerEntryRepository`.
+Both methods are `@Transactional(readOnly = true)` and use plain
+`findById`/`findBy...` reads — **no `@Lock(PESSIMISTIC_WRITE)`, unlike
+every write path in Tasks 4–5**. A read needs no lock: PostgreSQL's
+read-committed isolation guarantees a `GET` only ever sees fully committed
+rows, and every prior write (Task 4/5) already updated the ledger and the
+materialized balance together, atomically, before its own transaction
+committed — so by the time a `GET` can see a balance change at all, the
+ledger entries that justify it are already committed too. There is nothing
+for a read-side lock to protect against.
+
+- **Balance:** `getBalance` resolves the account (404 if missing or not a
+  `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` row — the same taxonomy check
+  `DepositService`/`TransferService` already use, duplicated here as a
+  small private method rather than extracted into a shared abstraction,
+  consistent with how each write service already has its own copy) and
+  returns its `balance` field exactly as stored — no summing, no
+  recomputation, no caching. A `GET` never constructs a `LedgerTransaction`
+  or `LedgerEntry`, and never mutates the `Account` entity it reads.
+- **Transaction history:** `getTransactionHistory` performs the same
+  existence/taxonomy check, then calls
+  `LedgerEntryRepository.findByAccountIdOrderByCreatedAtDescIdDesc(accountId, PageRequest.of(page, size))`.
+  This is a derived Spring Data query — Spring Data JPA issues exactly two
+  SQL statements per call (the page's content via `LIMIT`/`OFFSET`, and a
+  `COUNT` for `totalElements`/`totalPages`), never one query per row and
+  never the account's entire history. The existing
+  `idx_ledger_entry_account_id(account_id, created_at)` index from Task 2
+  supports the `account_id` filter and `created_at` ordering directly
+  (Postgres can walk a B-tree backwards for `DESC`, so no separate sort
+  step is needed for the primary key; only the rare exact-timestamp tie
+  needs an in-memory comparison against `id`). Because the query filters by
+  `account_id`, an account only ever sees its own entries — a deposit's
+  `EXTERNAL_FUNDING` `DEBIT` entry belongs to a different `account_id` and
+  is structurally excluded, not filtered out after the fact; likewise a
+  transfer's two entries belong to two different accounts, so each
+  account's history shows only its own one entry from that transaction,
+  never the counterparty's.
+- **Ordering and pagination:** the ordering (`created_at DESC, id DESC`)
+  and the pagination contract (`page`/`size` defaults and bounds, the
+  custom `PagedResponse` envelope) were both genuinely underspecified in
+  the original `docs/API_SPEC.md` stub inherited from Task 1's planning
+  pass, and were confirmed with the user before implementation rather than
+  invented — see `docs/API_SPEC.md`'s Task 6 sections for the now-approved
+  contract. `page`/`size` are validated with `@Min`/`@Max` on the
+  controller's `@RequestParam`s (`@Validated` at the class level); this
+  triggers Bean Validation's method-interceptor path, which throws
+  `jakarta.validation.ConstraintViolationException` directly (not the
+  newer web-aware exception Spring MVC's own defaults already map to 400)
+  — so `common.AccountAndTransferExceptionHandler` gained one more mapping
+  in Task 6 for that specific exception type, still 400, still minimal.
+  `PagedResponse<T>` (in `common`) is a plain generic record, not Spring
+  Data's own `Page` type — the response body never leaks Spring Data's
+  default JSON shape, per the approved contract.
+
 ## Ledger as Source of Truth vs. Materialized Balance (implemented, Tasks 4–5)
 
 `ledger_entry` rows are the authoritative financial record; `account.balance`
@@ -281,17 +343,26 @@ by a client-supplied id at all — it's the *other* row the same query
 returns, selected purely by taxonomy and currency; transfers never touch
 `EXTERNAL_FUNDING` in the first place.
 
-`GET /api/v1/accounts/{id}` still does not exist. If/when it's added, the
-original two-method split (a `findPubliclyVisibleById` used by every
-read-only public path, vs. an internal-only lookup) may still be the
-better shape for a plain single-row read — the combined locking query
-above is specific to needing both rows locked together for a write.
+`AccountQueryService` (Task 6) confirms the prediction this section made:
+for a plain single-row read (no locking needed, see "Account Balance and
+Transaction History" above), the shape really is closer to the originally
+sketched "public-lookup" method — `AccountQueryService.resolveCustomerWallet`
+uses plain `AccountRepository.findById` (already inherited from
+`JpaRepository`, no new repository method needed) plus the same taxonomy
+check pattern, rather than anything resembling the write paths' combined
+locking queries. `GET /api/v1/accounts/{id}` itself still does not exist —
+`docs/TASKS.md`'s Task 6 line never included it — but if/when it's added,
+it can reuse this same `findById` + taxonomy-check shape directly.
 
 ## Money and Currency (implemented)
 
 `NUMERIC(19,4)` in PostgreSQL (never `FLOAT`/`REAL`/`DOUBLE PRECISION`),
 present on `account.balance` and `ledger_entry.amount`, mapped to
 `BigDecimal` in the `Account` and `LedgerEntry` entities (Tasks 3–4).
+`AccountBalanceResponse.balance` and `TransactionHistoryItem.amount`
+(Task 6) both carry that same `BigDecimal` straight through from the
+entity to the response — read, never recomputed, never rounded to a
+different scale.
 `DepositRequest.amount` and `TransferRequest.amount` are both validated
 with `@Digits(integer = 15, fraction = 4)` — matching `NUMERIC(19,4)`'s
 precision exactly — so an out-of-range amount is rejected as a clean 400
@@ -306,23 +377,37 @@ normalize accepted lowercase input (`"usd"` → `"USD"`) before validating;
 this is a value-preserving normalization, not a contract change, so it
 doesn't conflict with `docs/API_SPEC.md`.
 
-## Error Handling (implemented, Task 5)
+## Error Handling (implemented, Tasks 5–6)
 
 `common.AccountAndTransferExceptionHandler` (`@RestControllerAdvice`) maps
 `UnsupportedCurrencyException`/`CurrencyMismatchException`/
-`InsufficientFundsException`/`SameAccountTransferException` to 422 and
-`AccountNotFoundException` to 404, for every controller in the
-application. This replaces the two `@ExceptionHandler` methods that used
-to live directly on `AccountController` (added in Task 3, extended in
-Task 4) — moved here in Task 5 once `TransferController` needed to map the
-same exception types and copy-pasting the same handler methods into a
-second controller was the alternative. This is a behavior-preserving
-refactor: response status codes and bodies are unchanged, and
+`InsufficientFundsException`/`SameAccountTransferException` to 422,
+`AccountNotFoundException` to 404, and (since Task 6)
+`jakarta.validation.ConstraintViolationException` to 400 — for every
+controller in the application. This replaces the two `@ExceptionHandler`
+methods that used to live directly on `AccountController` (added in
+Task 3, extended in Task 4) — moved here in Task 5 once
+`TransferController` needed to map the same exception types and
+copy-pasting the same handler methods into a second controller was the
+alternative. This was a behavior-preserving refactor: response status
+codes and bodies were unchanged, and
 `AccountCreationIntegrationTest`/`DepositIntegrationTest` (which assert on
-exactly these statuses) still pass without modification. Bean-validation
-failures and unknown-JSON-property rejections are still left to Spring's
-own default exception resolution (400), unchanged since Task 3. This is
-still not the complete Task 7 framework: there is no unified
-`{timestamp, status, error, message, path}` envelope yet (see
-`docs/API_SPEC.md`'s "Error Response Shape") — just a consistent,
-minimal `{message}` body and the correct status code.
+exactly these statuses) still passed without modification.
+
+The `ConstraintViolationException` mapping was added in Task 6 because
+`@Validated`-driven method-parameter constraints (the transaction-history
+endpoint's `@Min`/`@Max` on `page`/`size`) go through Bean Validation's AOP
+method interceptor, which throws that JSR-380 exception type directly —
+distinct from `MethodArgumentNotValidException` (thrown for `@Valid
+@RequestBody` failures, e.g. deposit/transfer amount validation) and from
+`MethodArgumentTypeMismatchException` (thrown for a malformed path
+variable, e.g. a non-UUID `{id}`), both of which Spring MVC already maps
+to 400 automatically without any handler here. Without the added mapping,
+an out-of-range `page`/`size` would have surfaced as an unmapped 500.
+
+Bean-validation failures on request bodies and unknown-JSON-property
+rejections are still left to Spring's own default exception resolution
+(400), unchanged since Task 3. This is still not the complete Task 7
+framework: there is no unified `{timestamp, status, error, message, path}`
+envelope yet (see `docs/API_SPEC.md`'s "Error Response Shape") — just a
+consistent, minimal `{message}` body and the correct status code.
