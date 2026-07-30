@@ -5,24 +5,35 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 3 — Account Creation
+## Status: Phase 1, Task 4 — Deposits
 
 This repository contains the project foundation (Task 1), the initial
-database schema (Task 2), and account creation (Task 3): `POST
-/api/v1/accounts` creates a **customer USD wallet account**. Every account
-created through this endpoint always opens with a **zero balance** and the
-server-assigned `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` taxonomy — a client
-cannot choose the account category, class, purpose, currency (other than
-USD), initial balance, id, or creation timestamp.
+database schema (Task 2), account creation (Task 3), and deposits (Task 4).
 
-**Deposits, transfers, balance lookups, transaction history, and account
-lookup by id (`GET /api/v1/accounts/{id}`) are not implemented.** The
-`ledger_transaction` and `ledger_entry` tables exist in the database but no
-Java code reads or writes them yet — there is no ledger posting, no
-double-entry transactions, and no balanced-entry logic in the running
-application. There is also no authentication, no Kafka/event processing,
-and no reconciliation — those are explicitly out of scope until later
-tasks/phases per `docs/TASKS.md` and `CLAUDE.md`.
+`POST /api/v1/accounts` creates a **customer USD wallet account**. Every
+account created through this endpoint always opens with a **zero balance**
+and the server-assigned `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` taxonomy —
+a client cannot choose the account category, class, purpose, currency
+(other than USD), initial balance, id, or creation timestamp.
+
+`POST /api/v1/accounts/{id}/deposits` deposits USD into a customer wallet.
+**Every deposit is an atomic, balanced double-entry ledger transaction**:
+it DEBITs the internal `EXTERNAL_FUNDING` asset account and CREDITs the
+destination wallet (a liability account), both for the same amount and
+currency, both referencing one new ledger transaction row — and it
+increases both accounts' materialized balances in the very same database
+transaction as those two ledger-entry writes. PostgreSQL row-level locks
+(acquired on both accounts, in a deterministic order) prevent lost updates
+under concurrent deposits. Ledger rows remain immutable — deposit
+processing only ever inserts into `ledger_transaction`/`ledger_entry`,
+never updates or deletes them, and the Task 2 immutability triggers are
+untouched.
+
+**Transfers, balance lookups, transaction history, and account lookup by
+id (`GET /api/v1/accounts/{id}`) are not implemented.** There is also no
+authentication, no Kafka/event processing, and no reconciliation — those
+are explicitly out of scope until later tasks/phases per `docs/TASKS.md`
+and `CLAUDE.md`.
 
 ## Technology Stack
 
@@ -30,7 +41,7 @@ tasks/phases per `docs/TASKS.md` and `CLAUDE.md`.
 - Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL (via Docker Compose for local development)
-- Flyway (dependency present; no migrations written yet)
+- Flyway (V1 migration: account and ledger schema)
 - Spring Data JPA
 - JUnit 5, Mockito, Testcontainers
 - Spring Boot Actuator
@@ -89,11 +100,12 @@ tests that each start an isolated PostgreSQL container (independent of the
 Docker Compose service above): a connectivity smoke test (`SELECT 1`
 against the datasource), a schema-verification test that confirms the
 Flyway migration applies and every table, constraint, index, and trigger
-behaves as designed, and an account-creation test suite that exercises
-`POST /api/v1/accounts` over real HTTP and checks the persisted database
-row directly. Each test's PostgreSQL container starts and stops
-automatically as part of the test run — no manually running database is
-required.
+behaves as designed, an account-creation test suite, and a deposit test
+suite that verifies balanced double-entry postings, balance correctness,
+a genuine database-failure rollback scenario, and real concurrent deposits
+against PostgreSQL row locking (no mocks, no Java-only synchronization).
+Each test's PostgreSQL container starts and stops automatically as part of
+the test run — no manually running database is required.
 
 ## Documentation
 
@@ -101,14 +113,14 @@ required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (database layer and account creation are implemented; deposit/transfer
-  sections are forward-looking and not yet built)
+  (database layer, account creation, and deposit processing are
+  implemented; the transfer section is forward-looking and not yet built)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
-  The schema is implemented (Flyway V1); account creation reads/writes the
-  `account` table; nothing yet reads or writes `ledger_transaction`/
-  `ledger_entry`.
-- `docs/API_SPEC.md` — `POST /api/v1/accounts` is implemented and documented
-  exactly as built; the remaining endpoints are still planned contracts.
-- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level and
-  account-creation tests are implemented, deposit/transfer business-logic
-  tests are planned
+  The schema is implemented (Flyway V1); account creation and deposits
+  read/write `account`, `ledger_transaction`, and `ledger_entry`.
+- `docs/API_SPEC.md` — `POST /api/v1/accounts` and `POST
+  /api/v1/accounts/{id}/deposits` are implemented and documented exactly as
+  built; the remaining endpoints are still planned contracts.
+- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level,
+  account-creation, and deposit tests are implemented, transfer
+  business-logic tests are planned

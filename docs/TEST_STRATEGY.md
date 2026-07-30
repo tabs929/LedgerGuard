@@ -1,14 +1,14 @@
 # Test Strategy
 
-> **Status: planning document; schema-level (Task 2) and account-creation
-> (Task 3) tests are now implemented.** As of Task 3, the connectivity
-> smoke test (Task 1), schema-verification tests (Task 2), and account
-> creation's HTTP-boundary + persisted-state tests (Task 3) all exist (see
-> "Currently Implemented" below). Business-logic tests that require the
-> future ledger-posting domain service — deposit/transfer invariant tests,
-> concurrency tests, and the 404-for-SYSTEM-account tests for `GET
-> /api/v1/accounts/{id}` and later endpoints — remain unwritten, since the
-> code they would exercise doesn't exist yet.
+> **Status: planning document; schema-level (Task 2), account-creation
+> (Task 3), and deposit (Task 4) tests are now implemented.** As of Task 4,
+> the connectivity smoke test (Task 1), schema-verification tests (Task 2),
+> account creation's tests (Task 3), and deposit's ledger-balance,
+> rollback, and concurrency tests (Task 4) all exist (see "Currently
+> Implemented" below). Transfer invariant/concurrency tests and the
+> 404-for-SYSTEM-account tests for `GET /api/v1/accounts/{id}` and later
+> endpoints remain unwritten, since the code they would exercise doesn't
+> exist yet.
 
 ## Split
 
@@ -67,28 +67,67 @@ these tests talk to the database directly:
 **Not covered by these tests, by design:** the "total debits equal total
 credits per transaction" trial-balance invariant, ledger-as-source-of-truth
 balance recomputation, deterministic-locking/deadlock behavior, and the
-404-for-SYSTEM-account API behavior. These require the future domain
-service and are planned below, not implemented in Task 2.
+404-for-SYSTEM-account API behavior. These required the future domain
+service — implemented for deposits in Task 4, see "Deposit Tests" below.
 
-## Planned Invariant Tests (require the future domain service — not yet written)
+## Deposit Tests (implemented, Task 4)
 
-- **Ledger-as-source-of-truth:** after a sequence of deposits and transfers,
-  recompute each account's balance by summing its `ledger_entry` rows per
-  the account's class formula, and assert equality with the materialized
-  `account.balance`.
-- **Trial-balance invariant:** after each deposit and transfer, assert
-  `SUM(debit amounts) == SUM(credit amounts)` for that transaction's
-  entries, and system-wide `SUM(asset balances) == SUM(liability balances)`.
+`DepositIntegrationTest` (18 tests) verifies deposit processing at the HTTP
+boundary (`TestRestTemplate`) and the persisted database state (direct
+JDBC), against a Testcontainers-provisioned `postgres:16.4` instance:
+
+- **Success + response shape:** a valid deposit returns 201 with the
+  documented response fields.
+- **Balanced double-entry proof:** exactly one `ledger_transaction`
+  (`DEPOSIT`/`COMPLETED`) and exactly two `ledger_entry` rows are created —
+  one `DEBIT` against the funding account, one `CREDIT` against the
+  destination account, same amount, same currency, same `transaction_id`,
+  `SUM(debits) == SUM(credits)` for the transaction.
+- **Balance correctness:** both the customer wallet's and the funding
+  account's materialized balances increase by exactly the deposit amount; a
+  second deposit accumulates correctly on top of the first.
+- **Validation/rejection tests:** zero amount, negative amount, missing
+  amount, malformed amount, excess fractional precision (>4 digits), an
+  amount exceeding 15 integer digits, a nonexistent destination account, the
+  `EXTERNAL_FUNDING` account itself as destination, a directly-inserted
+  non-USD customer wallet as destination, and an attempt to set protected/
+  unknown JSON fields (`transactionId`, `entryType`, `fundingAccountId`,
+  `newBalance`, etc.) — each is rejected with the documented status code
+  and persists nothing.
+- **Rollback proof:** `databaseOverflowMidTransactionRollsBackTheEntireDeposit`
+  pre-seeds an account balance near `NUMERIC(19,4)`'s precision limit via
+  direct SQL, then deposits an amount that pushes the balance `UPDATE` over
+  that limit — a genuine PostgreSQL `numeric field overflow`, not a
+  synthetic throw — and asserts no transaction, no entries, and no balance
+  change survive; the error response body contains no SQL/ORM internals.
+- **Immutability re-check:** `UPDATE`/`DELETE` against the `ledger_transaction`
+  and `ledger_entry` rows a real deposit just created are still rejected by
+  the Task 2 triggers.
+- **Concurrency (real PostgreSQL locking, no mocks, no Java-only
+  synchronization):** `concurrentDepositsIntoSameWalletDoNotLoseUpdates`
+  fires 20 concurrent HTTP deposit requests at the same customer account
+  via an `ExecutorService`, and asserts the final customer and funding
+  balances equal their pre-batch starting balances plus the sum of all 20
+  deposits, with an exactly-20-row ledger-entry count for that account —
+  proving PostgreSQL's row locking (not application code) serializes the
+  concurrent balance updates correctly.
+
+## Planned Invariant Tests (transfers — require the future domain service, not yet written)
+
+- **Ledger-as-source-of-truth (general form):** after an arbitrary sequence
+  of deposits and transfers, recompute each account's balance by summing
+  its `ledger_entry` rows per the account's class formula, and assert
+  equality with the materialized `account.balance`. (Deposit-specific
+  balance correctness is already covered above; this generalized version is
+  most meaningful once transfers add a second write path.)
 - **Deterministic-locking / deadlock test:** simultaneous A→B and B→A
   transfers between the same two accounts complete without deadlock.
-- **Concurrent-deposit test:** concurrent deposits into different customer
-  accounts (racing on the shared `EXTERNAL_FUNDING` row) all succeed with
-  no lost updates.
-- **Validation/rejection tests:** self-transfer, unsupported currency,
-  currency mismatch, zero/negative amount, insufficient funds, missing
-  account.
-- **SYSTEM-account-as-404 tests:** every public endpoint returns 404 (not a
-  distinct error) for a `SYSTEM` account id.
+- **Validation/rejection tests:** self-transfer, currency mismatch,
+  insufficient funds.
+- **SYSTEM-account-as-404 tests:** every remaining public endpoint (`GET
+  /api/v1/accounts/{id}`, transfers as source/destination, balance,
+  history) returns 404 (not a distinct error) for a `SYSTEM` account id —
+  deposits already do this; the other endpoints don't exist yet.
 
 ## Currently Implemented
 
@@ -118,6 +157,8 @@ of the persisted `account` row, all against a Testcontainers-provisioned
   `AccountService` entirely) still fails against
   `chk_account_taxonomy_combination` — proving the JPA mapping doesn't
   weaken the schema's guarantees.
+
+`DepositIntegrationTest` (Task 4) — see "Deposit Tests" above.
 
 ## CI
 

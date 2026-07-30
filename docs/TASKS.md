@@ -31,13 +31,24 @@ Work one task at a time. Mark a task done only when its tests pass and
       it depends on (see `docs/ARCHITECTURE.md`) is not yet needed since no
       endpoint looks accounts up by id yet. No deposits, transfers, ledger
       entries, balance, or history were implemented.
-- [ ] 4. Deposits — `POST /api/v1/accounts/{id}/deposits`, balanced DEBIT
-      `EXTERNAL_FUNDING` / CREDIT customer-account transaction; locks both
-      the customer account and `EXTERNAL_FUNDING` rows in ascending id order
-      before updating; treats a SYSTEM account id as 404 not-found; tests for
-      success, validation, rollback, materialized-balance-matches-ledger
-      correctness, and concurrent deposits racing on the shared
-      `EXTERNAL_FUNDING` row.
+- [x] 4. Deposits — `POST /api/v1/accounts/{id}/deposits` implemented: one
+      balanced DEBIT `EXTERNAL_FUNDING` / CREDIT customer-wallet double-entry
+      transaction per deposit, `DepositService` (`ledger` entities
+      `LedgerTransaction`/`LedgerEntry`, `AccountRepository` locks both the
+      customer account and the internally-resolved `EXTERNAL_FUNDING` row in
+      ascending id order in one query — deterministic lock ordering, no
+      funding-account id ever accepted from the client), materialized
+      balances updated in the same transaction as the ledger writes, SYSTEM
+      account ids treated as 404 not-found, minimal endpoint-local error
+      handling (400 validation, 404 not found, 422 currency mismatch).
+      Verified by `DepositIntegrationTest` (18 tests, PostgreSQL
+      Testcontainers): balanced double-entry correctness, balance
+      accumulation, validation/rejection cases, a genuine
+      database-level-failure rollback test (NUMERIC(19,4) overflow),
+      immutability-trigger checks, and a real concurrent-deposit test (20
+      parallel HTTP requests against PostgreSQL row locking) proving no lost
+      updates. No transfers, balance/history endpoints, or account lookup by
+      id were implemented.
 - [ ] 5. Transfers — `POST /api/v1/transfers`, double-entry ledger transaction
       between two CUSTOMER/LIABILITY accounts, currency-match check,
       rejection of self-transfers, SYSTEM account ids treated as 404

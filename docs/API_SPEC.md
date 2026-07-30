@@ -1,11 +1,13 @@
 # API Specification
 
-> **Status: account creation implemented (Task 3); the rest is still a
-> planning document.** `POST /api/v1/accounts` exists and matches the
-> contract below exactly. It creates only customer USD wallet accounts,
-> which always open with a zero balance. `GET /api/v1/accounts/{id}` and
-> everything below it remain unimplemented — no controllers, services, or
-> DTOs exist for them yet.
+> **Status: account creation (Task 3) and deposits (Task 4) implemented;
+> the rest is still a planning document.** `POST /api/v1/accounts` and
+> `POST /api/v1/accounts/{id}/deposits` exist and match the contracts below
+> exactly. Deposits are USD-only and always post a balanced double-entry
+> ledger transaction (DEBIT `EXTERNAL_FUNDING`, CREDIT the customer wallet)
+> in the same database transaction as the materialized balance updates.
+> `GET /api/v1/accounts/{id}` and everything below it remain unimplemented —
+> no controllers, services, or DTOs exist for them yet.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -43,14 +45,36 @@ Response 404: not found — including when `{id}` is a `SYSTEM` account, which
 is treated identically to a nonexistent id (see `docs/ARCHITECTURE.md` on
 public vs. internal account lookup).
 
-## POST /api/v1/accounts/{id}/deposits (not implemented)
+## POST /api/v1/accounts/{id}/deposits (implemented, Task 4)
 
 Request: `{ "amount": "100.00", "currency": "USD" }`
 
 Response 201: `{ "transactionId": uuid, "accountId": uuid, "amount": "100.00", "currency": "USD", "newBalance": "100.00", "createdAt": iso8601 }`
 
-Errors: 400 validation (amount <= 0), 404 account not found (including a
-`SYSTEM` account id), 422 currency mismatch.
+A deposit is a single atomic, balanced double-entry ledger transaction:
+DEBIT the internal `SYSTEM`/`ASSET`/`EXTERNAL_FUNDING` account, CREDIT the
+`{id}` customer wallet, both for the same amount and currency, both
+referencing the same new `ledger_transaction` row
+(`transaction_type = DEPOSIT`, `status = COMPLETED`). Both accounts'
+materialized balances increase by the deposit amount in the same database
+transaction as the two ledger-entry inserts — never independently of them.
+The request has no field for the funding account, transaction id/type/
+status, entry direction, ledger-entry ids, balances, timestamps, or account
+taxonomy, so none of these can be supplied or overridden by the client; any
+unrecognized JSON property is rejected outright (400), not silently
+ignored. `amount` accepts up to 15 integer digits and exactly 4 decimal
+digits (matching `NUMERIC(19,4)`) — anything outside that shape is
+rejected as a validation error rather than silently rounded.
+
+Errors:
+- 400 validation — missing/non-positive/malformed `amount`, an amount with
+  unsupported precision or scale, missing or malformed `currency`, or an
+  unrecognized JSON property.
+- 404 account not found — including when `{id}` is a `SYSTEM` account
+  (treated identically to a nonexistent id) or any account that is not a
+  `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`.
+- 422 currency mismatch — `currency` is a well-formed but non-`USD` code,
+  or (in principle) the destination account's own currency is not `USD`.
 
 ## POST /api/v1/transfers (not implemented)
 
@@ -94,6 +118,7 @@ Implemented via a global `@ControllerAdvice` (planned for Task 7).
 ## Currently Available Endpoints
 
 - `POST /api/v1/accounts` (Task 3) — see above.
+- `POST /api/v1/accounts/{id}/deposits` (Task 4) — see above.
 - Spring Boot Actuator's built-in health check:
 
 ```

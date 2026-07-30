@@ -106,4 +106,16 @@ public class Account {
 		return createdAt;
 	}
 
+	/**
+	 * Increases the materialized balance in place. The caller is
+	 * responsible for having locked this row (see
+	 * {@link AccountRepository#findByIdAndFundingAccountForUpdate}) and for
+	 * writing the matching balanced ledger entries in the same database
+	 * transaction — this method only ever changes the number, never the
+	 * ledger.
+	 */
+	public void increaseBalance(BigDecimal amount) {
+		this.balance = this.balance.add(amount);
+	}
+
 }

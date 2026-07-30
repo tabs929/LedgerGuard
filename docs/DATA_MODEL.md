@@ -1,16 +1,15 @@
 # Data Model
 
-> **Status: schema implemented (Task 2); account creation implemented
-> (Task 3).** The tables, constraints, indexes, and triggers described
-> below exist in the database via
+> **Status: schema implemented (Task 2); account creation (Task 3) and
+> deposits (Task 4) implemented.** The tables, constraints, indexes, and
+> triggers described below exist in the database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
-> and are verified by `SchemaMigrationIntegrationTest`. The `account` table
-> now has a matching JPA entity (`Account`, `AccountRepository`) used by
-> account creation only — `POST /api/v1/accounts` creates
-> `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` rows with a zero balance. No Java
-> code yet reads or writes `ledger_transaction` or `ledger_entry` — deposits,
-> transfers, balance lookups, and transaction history remain unimplemented
-> (Tasks 4–6).
+> and are verified by `SchemaMigrationIntegrationTest`. `account` has a
+> matching JPA entity used by both account creation and deposits.
+> `ledger_transaction`/`ledger_entry` now have matching JPA entities too
+> (`LedgerTransaction`, `LedgerEntry`), written only by deposit processing
+> so far. Transfers, balance lookups, and transaction history remain
+> unimplemented (Tasks 5–6).
 
 ## Account Taxonomy
 
@@ -50,9 +49,18 @@ Balance direction depends on account class:
 
 ## Posting Rules
 
-- **Deposit:** DEBIT `EXTERNAL_FUNDING` (asset) / CREDIT customer account
-  (liability).
-- **Transfer:** DEBIT sender (liability) / CREDIT recipient (liability).
+- **Deposit** (implemented, Task 4): DEBIT `EXTERNAL_FUNDING` (asset) /
+  CREDIT customer account (liability). Both entries carry the same amount
+  and currency and reference the same `ledger_transaction` row
+  (`transaction_type = DEPOSIT`, `status = COMPLETED`). Both accounts'
+  balances increase by the deposit amount — an asset debit and a liability
+  credit both increase their respective balance, per the formulas above,
+  which is exactly what keeps the books balanced: money entering the
+  system from outside increases what the platform holds (the funding
+  asset) by the same amount it increases what the platform owes the
+  customer (the wallet liability).
+- **Transfer** (not yet implemented): DEBIT sender (liability) / CREDIT
+  recipient (liability).
 - **Withdrawal** (designed for, not implemented in Phase 1): DEBIT customer
   account (liability) / CREDIT `EXTERNAL_FUNDING` (asset).
 
@@ -143,21 +151,22 @@ types, positive entry amounts, required foreign keys, and immutability of
 `ledger_transaction`/`ledger_entry` rows (`INSERT` allowed, `UPDATE`/
 `DELETE` rejected).
 
-**What the schema deliberately does not enforce** (left to the future
-domain service, per `CLAUDE.md` and `docs/ARCHITECTURE.md`):
-USD-only account creation (the `CHECK` only validates currency *format*,
-not the specific code — see the migration's header comment), and the
-"total debits equal total credits per transaction" trial-balance
-invariant (no deferred constraint trigger exists for this; it is enforced
-by the future `@Transactional` service boundary and verified by
-integration tests once that service exists).
+**What the schema deliberately does not enforce** (left to the domain
+service layer, per `CLAUDE.md` and `docs/ARCHITECTURE.md`): USD-only
+account creation and deposits (the `CHECK` only validates currency
+*format*, not the specific code — see the migration's header comment), and
+the "total debits equal total credits per transaction" trial-balance
+invariant (no deferred constraint trigger exists for this; `DepositService`
+enforces it by construction — it always writes exactly one `DEBIT` and one
+`CREDIT` of the same amount and currency for every transaction it creates —
+and `DepositIntegrationTest` verifies the resulting rows are in fact
+balanced).
 
 Application-side `AccountCategory`, `AccountClass`, and `AccountPurpose`
 Java enums (Task 3) map 1:1 to the `account` table's string literals, via
-`@Enumerated(EnumType.STRING)` on the `Account` entity.
-`TransactionType`, `TransactionStatus`, and `LedgerEntryType` remain
-unimplemented — no code writes to `ledger_transaction` or `ledger_entry`
-yet.
+`@Enumerated(EnumType.STRING)` on the `Account` entity. `TransactionType`,
+`TransactionStatus`, and `LedgerEntryType` (Task 4) map the same way onto
+`LedgerTransaction`/`LedgerEntry`.
 
 ## Account Creation Enforcement (implemented, Task 3)
 
@@ -171,3 +180,20 @@ normalized to uppercase), enforced in `AccountService`, not the database
 shape, per the header comment in `V1__init_account_ledger_schema.sql`).
 `created_at` is populated by the database's `DEFAULT now()`, not by
 application code.
+
+## Deposit Enforcement (implemented, Task 4)
+
+`DepositRequest` has fields for `amount` and `currency` only. `DepositService`
+resolves the funding account purely from its taxonomy and the request
+currency — never from a client-supplied id — and constructs the
+`ledger_transaction`/`ledger_entry` rows directly:
+`transaction_type = DEPOSIT`, `status = COMPLETED`, one `DEBIT` entry
+against the funding account and one `CREDIT` entry against the destination
+account, both for the exact validated amount, both `currency = 'USD'`. None
+of these values are read from the request. `amount` is validated with
+`@NotNull @Positive @Digits(integer = 15, fraction = 4)` before the service
+ever runs, matching `ledger_entry.amount`'s and `account.balance`'s
+`NUMERIC(19,4)` shape exactly, so an out-of-range or malformed amount is a
+clean 400 rather than a database error. The destination account must
+already be `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` and `USD` — checked in
+`DepositService` against the locked row before any ledger write happens.
