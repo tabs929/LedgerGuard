@@ -1,16 +1,16 @@
 # Test Strategy
 
-> **Status: schema-level (Task 2), account-creation (Task 3), deposit
-> (Task 4), transfer (Task 5), account balance/transaction-history
-> (Task 6), and global error handling (Task 7) tests are all implemented —
-> no Phase 1 test-writing tasks remain planned.** The connectivity smoke
-> test (Task 1), schema-verification tests (Task 2), account creation's
-> tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
-> (Task 4), transfer's
+> **Status: all Phase 1 test-writing tasks are implemented, and every
+> test now runs automatically in CI (Task 9) on every push/PR.** The
+> connectivity smoke test (Task 1), schema-verification tests (Task 2),
+> account creation's tests (Task 3), deposit's
+> ledger-balance/rollback/concurrency tests (Task 4), transfer's
 > ledger-balance/conservation/insufficient-funds/rollback/
 > deadlock-avoidance tests (Task 5), the balance/history read tests
-> (Task 6), and the global error-envelope/validation/leakage tests
-> (Task 7) all exist (see "Currently Implemented" below). Only `GET
+> (Task 6), the global error-envelope/validation/leakage tests (Task 7),
+> and the OpenAPI document/schema-accuracy tests (Task 8) all exist (see
+> "Currently Implemented" below) and all run in
+> `.github/workflows/ci.yml` (see "CI" below). Only `GET
 > /api/v1/accounts/{id}` remains untested, since that plain-lookup
 > endpoint was never assigned to any task and so still doesn't exist.
 
@@ -252,6 +252,61 @@ Testcontainers-provisioned `postgres:16.4` instance:
   (`page=0`/`size=20`, `1..100`); the Task 2 immutability triggers still
   reject `UPDATE`/`DELETE`.
 
+## OpenAPI Documentation Tests (implemented, Task 8)
+
+`OpenApiDocumentationIntegrationTest` (24 tests) verifies the generated
+OpenAPI document and Swagger UI against the real, running application. It
+runs against a real PostgreSQL 16.4 Testcontainer like every other test in
+this project — the application requires a working datasource to start at
+all (JPA + Flyway are mandatory auto-configuration), so there is no
+database-free way to boot the context here:
+
+- **Availability:** `/v3/api-docs` returns 200 with `application/json`;
+  the document declares OpenAPI `3.x`; `info.title`/`info.version`/
+  `info.description` are present and the description covers every Phase 1
+  capability; `/swagger-ui/index.html` (and the `/swagger-ui.html`
+  redirect) both return 200 with `text/html`.
+- **Endpoint coverage:** all five implemented paths appear with the
+  correct HTTP method; plain `/api/v1/accounts/{id}` is absent as its own
+  path template; no undocumented `/api/v1/...` path exists at all (a
+  generic loop over every path fails the test if one appears that isn't
+  in the known set of five — this is what would catch a Task 9+ endpoint
+  leaking in early).
+- **Schema accuracy:** every request/response schema exists with the
+  correct `required` field sets; UUID fields declare
+  `type: string, format: uuid`; every monetary field
+  (`amount`/`balance`/`newBalance`) declares `type: string` with no
+  `float`/`double` format (proving decimal, not floating-point,
+  representation); the `entryType` enum matches `LedgerEntryType` exactly;
+  no request schema contains a protected/server-controlled field name
+  (`id`, `balance`, `accountCategory`, etc. — checked generically, not
+  field-by-field); no schema name or the schemas map itself references a
+  JPA entity, a Hibernate proxy, or `PageImpl`; the `ApiError` schema's
+  properties are exactly the five documented fields.
+- **Response documentation:** documented success/error status codes match
+  `docs/API_SPEC.md`/Task 7 exactly per endpoint; every response's content
+  map has exactly one key, `application/json`; the transaction-history
+  200 response resolves (by following its `$ref`) to a schema whose
+  properties are exactly `{content, page, size, totalElements,
+  totalPages}` — proving the custom envelope, not Spring Data's `Page` —
+  with `content[]` items themselves `$ref`-ing `TransactionHistoryItem`
+  (proving the generic type parameter was actually resolved, not erased);
+  `page`/`size` parameters document the exact default/min/max contract;
+  the operation description names the exact ordering
+  (`created_at DESC` + tie-breaker).
+- **Safety:** the full raw document is checked against the same kind of
+  forbidden-substring list used in `GlobalExceptionHandlingIntegrationTest`
+  (Java/Jackson/Hibernate/PostgreSQL class-name fragments, `SQLState`,
+  internal table names, `password`/`credential`, a local port-style
+  hostname string); no `components.securitySchemes` and no top-level
+  `security` array exist; no request schema or path exposes a
+  client-suppliable "funding"/"system" account field or path segment.
+- **Regression:** a full create-account → deposit → balance → history
+  sequence still succeeds through real HTTP with the documentation layer
+  active, a 404 still returns the unchanged Task 7 envelope, and the
+  Task 2 immutability triggers still reject `UPDATE` against a row a real
+  deposit just created.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -291,9 +346,39 @@ Transaction History Tests" above.
 `GlobalExceptionHandlingIntegrationTest` (Task 7) — see "Global Error
 Handling Tests" above.
 
-## CI
+`OpenApiDocumentationIntegrationTest` (Task 8) — see "OpenAPI
+Documentation Tests" above.
+
+## CI (implemented, Task 9)
 
 `./mvnw verify` runs the full suite, including Testcontainers integration
 tests, and is required to pass before any task is marked done (per
-`CLAUDE.md`'s Definition of Done). GitHub Actions wiring is planned for
-Task 9 and does not exist yet.
+`CLAUDE.md`'s Definition of Done) — locally, and now also automatically.
+
+`.github/workflows/ci.yml` runs on every push and pull request targeting
+`master`: one job, `ubuntu-latest`, Java 21 (Temurin), that runs
+`./mvnw --batch-mode --no-transfer-progress verify` — the exact same
+authoritative command developers run locally, with no skipped tests and
+no altered profiles. GitHub-hosted runners come with a Docker daemon
+already running, so Testcontainers starts real `postgres:16.4` containers
+on the runner exactly as it does on a developer's machine — no
+`docker-compose.yml` service container, no shared or long-lived database.
+A failure at any stage (compilation, a unit test, an integration test,
+Spring context startup, a Flyway migration, an immutability-trigger check,
+a concurrency test, an OpenAPI schema-accuracy check — anything `verify`
+already covers) fails the step, and therefore the job; nothing in the
+workflow suppresses or ignores a failing exit code.
+
+The workflow requests only `contents: read` — it never writes to the
+repository, never deploys, and never publishes a package. `concurrency`
+cancels a superseded run for the same branch/PR without affecting other
+branches. Maven's dependency repository is cached (keyed on `pom.xml`,
+via `setup-java`'s built-in `cache: maven`) — build *outputs* are never
+cached, so a stale cache can only skip a redundant download, never mask a
+real compilation or test failure. On failure only, Surefire/Failsafe
+reports are uploaded as a short-retention (7-day) build artifact for
+diagnosis; a successful run uploads nothing.
+
+**Reproducing CI locally:** the workflow runs nothing a developer can't
+run themselves — `./mvnw verify` from a checkout with Docker running is
+the complete local equivalent.

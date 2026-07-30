@@ -1,6 +1,7 @@
 package com.tarun.ledgerguard.transfer.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -28,18 +29,25 @@ import java.util.UUID;
 public record TransferRequest(
 
 		@NotNull
+		@Schema(example = "3fa85f64-5717-4562-b3fc-2c963f66afa6", requiredMode = Schema.RequiredMode.REQUIRED)
 		UUID sourceAccountId,
 
 		@NotNull
+		@Schema(example = "9c858901-8a57-4791-81fe-4c455b099bc9", requiredMode = Schema.RequiredMode.REQUIRED)
 		UUID destinationAccountId,
 
 		@NotNull
 		@Positive
 		@Digits(integer = 15, fraction = 4, message = "amount must have at most 15 integer digits and 4 decimal digits")
+		@Schema(type = "string", example = "50.00",
+				description = "Decimal amount, greater than 0, at most 15 integer digits and 4 decimal digits",
+				requiredMode = Schema.RequiredMode.REQUIRED)
 		BigDecimal amount,
 
 		@NotBlank
 		@Pattern(regexp = "^[A-Za-z]{3}$", message = "currency must be a 3-letter ISO 4217 code")
+		@Schema(example = "USD", description = "ISO 4217 code; only USD is supported in Phase 1",
+				requiredMode = Schema.RequiredMode.REQUIRED)
 		String currency
 
 ) {

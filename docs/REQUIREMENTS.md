@@ -1,9 +1,7 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
-> **Status: planning document.** This describes the approved scope for all
-> of Phase 1. As of Task 1 (project foundation), none of the financial
-> functionality described below is implemented. See `docs/TASKS.md` for
-> per-task progress.
+> **Status: Phase 1 complete.** All 9 tasks below are implemented. See
+> `docs/TASKS.md` for the per-task breakdown and what each one covered.
 
 ## Scope
 
@@ -11,18 +9,19 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
 
 1. Spring Boot 4.0.7 + Java 21 project via Maven Wrapper — **done (Task 1)**
 2. PostgreSQL through Docker Compose — **done (Task 1)**
-3. Flyway database migrations — **not implemented**
-4. Account creation — **not implemented**
-5. Deposits — **not implemented**
-6. Transfers between accounts — **not implemented**
-7. Double-entry ledger transactions — **not implemented**
-8. Balance and transaction-history APIs — **not implemented**
-9. Request validation — **not implemented**
-10. Global API error handling — **not implemented**
-11. OpenAPI/Swagger — **not implemented**
-12. JUnit and PostgreSQL Testcontainers tests — partially in place (a
-    connectivity smoke test exists; no persistence/business-logic tests yet)
-13. GitHub Actions CI — **not implemented**
+3. Flyway database migrations — **done (Task 2)**
+4. Account creation — **done (Task 3)**
+5. Deposits — **done (Task 4)**
+6. Transfers between accounts — **done (Task 5)**
+7. Double-entry ledger transactions — **done (Tasks 2, 4, 5)**
+8. Balance and transaction-history APIs — **done (Task 6)**
+9. Request validation — **done (Tasks 3–7)**
+10. Global API error handling — **done (Task 7)**
+11. OpenAPI/Swagger — **done (Task 8)**
+12. JUnit and PostgreSQL Testcontainers tests — **done (Tasks 1–8)**, 163
+    tests across 8 test classes, all against real PostgreSQL 16.4
+    Testcontainers, never H2
+13. GitHub Actions CI — **done (Task 9)**, `.github/workflows/ci.yml`
 
 ## Acceptance Criteria (Phase 1, overall)
 

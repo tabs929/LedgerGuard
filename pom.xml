@@ -54,6 +54,16 @@
 			<groupId>org.flywaydb</groupId>
 			<artifactId>flyway-database-postgresql</artifactId>
 		</dependency>
+		<dependency>
+			<!-- Generates the OpenAPI 3 document (/v3/api-docs) and serves
+			     Swagger UI (/swagger-ui/index.html) from the existing Spring
+			     MVC controllers/DTOs, no second web framework, no server
+			     stub generation. Version 3.0.2 is the release vetted for
+			     Spring Boot 4.0.7 / Spring Framework 7 by start.spring.io. -->
+			<groupId>org.springdoc</groupId>
+			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+			<version>3.0.2</version>
+		</dependency>
 
 		<dependency>
 			<groupId>org.springframework.boot</groupId>

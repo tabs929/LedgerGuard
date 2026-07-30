@@ -103,10 +103,42 @@ Work one task at a time. Mark a task done only when its tests pass and
       Testcontainers): envelope shape/consistency across every endpoint,
       request-validation and domain-error mappings, internal-detail-leakage
       checks, and atomicity/success regression.
-- [ ] 8. OpenAPI/Swagger — springdoc integration, annotations/descriptions on
-      all Phase 1 endpoints.
-- [ ] 9. GitHub Actions CI — workflow running `./mvnw verify` (including
-      Testcontainers integration tests) on push/PR. `docs/TEST_STRATEGY.md`
+- [x] 8. OpenAPI/Swagger — `springdoc-openapi-starter-webmvc-ui:3.0.2` added
+      (the release vetted for Spring Boot 4.0.7 by start.spring.io).
+      `common.OpenApiConfig` supplies API title/description/version (no
+      license/contact/server — none documented anywhere, so none invented).
+      `@Operation`/`@ApiResponses`/`@Parameter`/`@Schema` annotations added
+      to `AccountController` and `TransferController`, matching
+      docs/API_SPEC.md exactly for all 5 implemented endpoints; no new
+      endpoint, path, or business behavior. `/v3/api-docs` (OpenAPI 3.1
+      JSON) and `/swagger-ui/index.html` (+ the `/swagger-ui.html`
+      redirect) confirmed reachable and correct. No security scheme
+      declared (Phase 1 has no authentication). Verified by
+      `OpenApiDocumentationIntegrationTest` (24 tests, PostgreSQL
+      Testcontainers): document availability/metadata, endpoint coverage
+      (including confirming plain `GET /api/v1/accounts/{id}` and any
+      Task 9+ endpoint are absent), schema accuracy (required fields, UUID
+      formats, decimal-string monetary fields, enum values, no protected
+      fields, no JPA entities, exact `ApiError` shape), response-status
+      accuracy, the custom pagination envelope (not Spring Data's `Page`),
+      no internal-detail leakage, no security scheme, and a full
+      create→deposit→balance→history regression alongside immutability
+      re-verification.
+- [x] 9. GitHub Actions CI — `.github/workflows/ci.yml` added: one job,
+      `ubuntu-latest`, Java 21 (Temurin, via `actions/setup-java`), runs
+      `./mvnw --batch-mode --no-transfer-progress verify` (the full
+      lifecycle — unit tests + PostgreSQL 16.4 Testcontainers integration
+      tests, no skipped tests, no altered profiles) on push and pull
+      request to `master`. `permissions: contents: read` only;
+      `concurrency` cancels a superseded in-progress run for the same
+      ref; Maven dependency caching via `setup-java`'s built-in `cache:
+      maven`; Surefire/Failsafe reports uploaded as a build artifact only
+      `if: failure()`, 7-day retention. Docker is preinstalled on the
+      GitHub-hosted runner — Testcontainers uses it directly, no
+      `docker-compose.yml` service container, no shared database. Workflow
+      validated locally with `actionlint` (0 errors/warnings) and PyYAML
+      (parses as valid YAML) before this review; no GitHub-hosted run has
+      occurred yet since nothing has been pushed. `docs/TEST_STRATEGY.md`
       and `docs/REQUIREMENTS.md` finalized here.
 
 Full design decisions, schema, transaction model, and API contracts are in

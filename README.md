@@ -5,12 +5,13 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 7 — Global Error Handling and API Error Consistency
+## Status: Phase 1 complete (Tasks 1–9)
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
 transfers (Task 5), read-only account balance/transaction-history APIs
-(Task 6), and centralized error handling (Task 7).
+(Task 6), centralized error handling (Task 7), OpenAPI/Swagger
+documentation (Task 8), and continuous integration (Task 9).
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -73,11 +74,24 @@ the real exception logged server-side only). No internal detail is ever
 returned to a client: no Java class or package names, no stack traces, no
 SQL, no database constraint or table names.
 
+**Every implemented endpoint, request/response schema, and the shared
+error envelope are documented via OpenAPI**, generated directly from the
+controllers and DTOs (not a hand-maintained spec file, so it can't drift
+from the real API): the OpenAPI 3.1 JSON document is at `/v3/api-docs`,
+and interactive Swagger UI is at `/swagger-ui/index.html`. No
+authentication scheme is declared, because Phase 1 has none — declaring
+one would falsely imply these endpoints are protected.
+
+**Every push and pull request to `master` automatically runs the complete
+verification suite** — `.github/workflows/ci.yml` runs the exact same
+`./mvnw verify` a developer runs locally, against real PostgreSQL 16.4
+Testcontainers, with no tests skipped. See "Continuous Integration" below.
+
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
 implemented** — no task has been assigned it so far. There is also no
-authentication, no Kafka/event processing, no reconciliation, no OpenAPI
-docs, and no CI workflow — those are explicitly out of scope until later
-tasks/phases per `docs/TASKS.md` and `CLAUDE.md`.
+authentication, no Kafka/event processing, and no reconciliation — those
+are explicitly out of scope until later phases per `docs/TASKS.md` and
+`CLAUDE.md`.
 
 ## Technology Stack
 
@@ -89,6 +103,7 @@ tasks/phases per `docs/TASKS.md` and `CLAUDE.md`.
 - Spring Data JPA
 - JUnit 5, Mockito, Testcontainers
 - Spring Boot Actuator
+- springdoc-openapi (OpenAPI 3 + Swagger UI)
 
 ## Prerequisites
 
@@ -133,6 +148,25 @@ Once running:
 curl http://localhost:8080/actuator/health
 ```
 
+## Viewing the API Documentation
+
+Once running, open Swagger UI in a browser:
+
+```
+http://localhost:8080/swagger-ui/index.html
+```
+
+Or fetch the raw OpenAPI 3.1 document:
+
+```
+curl http://localhost:8080/v3/api-docs
+```
+
+The document is generated from the actual controllers and DTOs, not a
+hand-maintained file, and covers exactly the five implemented endpoints
+(account creation, deposit, transfer, balance, transaction history) plus
+the shared error-response schema. No authentication scheme is declared.
+
 ## Running Tests
 
 ```
@@ -146,21 +180,44 @@ against the datasource), a schema-verification test that confirms the
 Flyway migration applies and every table, constraint, index, and trigger
 behaves as designed, an account-creation test suite, a deposit test suite,
 a transfer test suite, an account balance/transaction-history test suite,
-and a global error-handling test suite. The deposit and transfer suites
-both verify balanced double-entry postings, balance correctness, a genuine
-database-failure rollback scenario, and real concurrency against
-PostgreSQL row locking (no mocks, no Java-only synchronization) — the
-transfer suite additionally proves concurrent transfers from one source
-never overspend it, and that concurrent opposite-direction transfers
-between the same two accounts complete without deadlocking. The
-balance/history suite proves reads never create ledger rows or change
-balances, history ordering and pagination match the approved contract
-exactly, and no account's history ever leaks another account's entries.
-The error-handling suite proves every endpoint's error responses share the
-one documented envelope, contain no internal implementation detail, and
-that every rejected write still leaves no partial financial state. Each
-test's PostgreSQL container starts and stops automatically as part of the
-test run — no manually running database is required.
+a global error-handling test suite, and an OpenAPI documentation test
+suite. The deposit and transfer suites both verify balanced double-entry
+postings, balance correctness, a genuine database-failure rollback
+scenario, and real concurrency against PostgreSQL row locking (no mocks,
+no Java-only synchronization) — the transfer suite additionally proves
+concurrent transfers from one source never overspend it, and that
+concurrent opposite-direction transfers between the same two accounts
+complete without deadlocking. The balance/history suite proves reads never
+create ledger rows or change balances, history ordering and pagination
+match the approved contract exactly, and no account's history ever leaks
+another account's entries. The error-handling suite proves every
+endpoint's error responses share the one documented envelope, contain no
+internal implementation detail, and that every rejected write still
+leaves no partial financial state. The OpenAPI suite proves the generated
+document matches the real implementation exactly — correct paths,
+schemas, required fields, status codes, and pagination contract — with no
+internal detail leaked and no undeclared security scheme. Each test's
+PostgreSQL container starts and stops automatically as part of the test
+run — no manually running database is required.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request targeting
+`master`. One job, `ubuntu-latest`, Java 21 (Temurin), runs:
+
+```
+./mvnw --batch-mode --no-transfer-progress verify
+```
+
+— the same authoritative command shown above, so a green local `./mvnw
+verify` is the real local equivalent of CI. GitHub-hosted runners have
+Docker preinstalled and running, so Testcontainers starts real
+`postgres:16.4` containers on the runner exactly as it does locally; the
+workflow never uses the local `docker-compose.yml` service, H2, or a
+shared/long-lived database. The workflow requests `permissions: contents:
+read` only — it never writes to the repository and contains no
+deployment, publishing, or release step. On failure, Surefire/Failsafe
+reports are uploaded as a short-retention build artifact for diagnosis.
 
 ## Documentation
 
@@ -168,8 +225,8 @@ test run — no manually running database is required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (database layer, account creation, deposit, transfer, account-query, and
-  error-handling processing are all implemented)
+  (database layer, account creation, deposit, transfer, account-query,
+  error-handling, API-documentation, and CI are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The schema is implemented (Flyway V1); account creation, deposits, and
   transfers all read/write `account`, `ledger_transaction`, and
@@ -179,8 +236,8 @@ test run — no manually running database is required.
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET
   /api/v1/accounts/{id}/transactions` are all implemented and documented
-  exactly as built, including the now-finalized shared error-response
-  contract; the remaining endpoints are still planned contracts.
-- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level,
-  account-creation, deposit, transfer, account-query, and error-handling
-  tests are all implemented
+  exactly as built, including the shared error-response contract and the
+  now-implemented OpenAPI/Swagger endpoints; the remaining endpoints are
+  still planned contracts.
+- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; every test suite
+  is implemented and all of them now run automatically in CI (Task 9)

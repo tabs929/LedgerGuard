@@ -1,0 +1,72 @@
+name: CI
+
+# Runs the full Maven verification suite (unit tests + PostgreSQL 16.4
+# Testcontainers integration tests) against every push and pull request
+# targeting the default branch. This is the only verification workflow in
+# the repository -- there is no separate/overlapping build job.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# A newer push to the same branch/PR supersedes an in-progress run for that
+# same ref; it does not touch runs on other branches or PRs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this workflow only ever reads the repository to build
+# and test it. It never writes to the repository, never deploys, and never
+# publishes a package or release.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build and verify (Maven + PostgreSQL 16.4 Testcontainers)
+    runs-on: ubuntu-latest
+    # Bounds a hung Docker/Testcontainers run instead of consuming the
+    # runner indefinitely; ordinary local runs complete in well under a
+    # minute, so 20 minutes is a generous ceiling, not a tight budget.
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          # Caches the local Maven dependency repository (~/.m2/repository)
+          # keyed on pom.xml, not build outputs -- a stale cache can only
+          # save a redundant download, never hide a compilation or test
+          # failure, since the actual compile/test/verify steps always run.
+          cache: maven
+
+      - name: Run full verification (unit tests + PostgreSQL Testcontainers integration tests)
+        # The GitHub-hosted ubuntu-latest runner has a Docker daemon
+        # preinstalled and running; Testcontainers talks to it directly
+        # (the default /var/run/docker.sock socket) to start a fresh
+        # postgres:16.4 container per test class, exactly as it does
+        # locally -- no docker-compose.yml, no manually defined service
+        # container, no shared/long-lived database. `verify` runs the
+        # complete lifecycle (compile, unit tests, integration tests, and
+        # every Maven plugin already bound to it) with no skipped tests
+        # and no altered profiles, so any failure at any stage fails this
+        # step and therefore this job.
+        run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,5 +1,7 @@
 package com.tarun.ledgerguard.common;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 /**
  * The shared error-response envelope for every public endpoint, per
  * docs/API_SPEC.md's "Error Response Shape". Exactly these five fields —
@@ -10,11 +12,13 @@ package com.tarun.ledgerguard.common;
  * omitted the way Spring Boot's own default error body omits it) and never
  * contains a Java class name, stack trace, SQL, or constraint name.
  */
+@Schema(description = "Shared error envelope returned by every endpoint. Never contains internal "
+		+ "implementation details (stack traces, SQL, constraint names, Java class names).")
 public record ApiError(
-		String timestamp,
-		int status,
-		String error,
-		String message,
-		String path
+		@Schema(example = "2026-07-30T19:20:00.123456Z") String timestamp,
+		@Schema(example = "404") int status,
+		@Schema(example = "Not Found") String error,
+		@Schema(example = "Account not found: 3fa85f64-5717-4562-b3fc-2c963f66afa6") String message,
+		@Schema(example = "/api/v1/accounts/3fa85f64-5717-4562-b3fc-2c963f66afa6/balance") String path
 ) {
 }

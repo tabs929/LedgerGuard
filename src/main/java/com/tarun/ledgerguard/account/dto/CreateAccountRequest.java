@@ -1,6 +1,7 @@
 package com.tarun.ledgerguard.account.dto;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
@@ -19,10 +20,13 @@ public record CreateAccountRequest(
 
 		@NotBlank
 		@Size(max = 255)
+		@Schema(example = "Ada Lovelace", requiredMode = Schema.RequiredMode.REQUIRED)
 		String ownerName,
 
 		@NotBlank
 		@Pattern(regexp = "^[A-Za-z]{3}$", message = "currency must be a 3-letter ISO 4217 code")
+		@Schema(example = "USD", description = "ISO 4217 code; only USD is supported in Phase 1",
+				requiredMode = Schema.RequiredMode.REQUIRED)
 		String currency
 
 ) {

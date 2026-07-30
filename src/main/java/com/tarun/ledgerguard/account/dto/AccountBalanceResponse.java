@@ -1,5 +1,7 @@
 package com.tarun.ledgerguard.account.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 import java.math.BigDecimal;
 import java.util.UUID;
 
@@ -10,8 +12,8 @@ import java.util.UUID;
  * the ledger and never cached in application memory.
  */
 public record AccountBalanceResponse(
-		UUID accountId,
-		BigDecimal balance,
-		String currency
+		@Schema(example = "3fa85f64-5717-4562-b3fc-2c963f66afa6") UUID accountId,
+		@Schema(type = "string", example = "150.0000", description = "Materialized account.balance") BigDecimal balance,
+		@Schema(example = "USD") String currency
 ) {
 }

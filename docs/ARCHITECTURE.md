@@ -1,19 +1,21 @@
 # Architecture
 
-> **Status: database layer (Task 2), account creation (Task 3), deposits
-> (Task 4), transfers (Task 5), account balance/transaction-history reads
-> (Task 6), and global error handling (Task 7) implemented; only plain
-> account lookup by id, OpenAPI docs, and CI remain unimplemented in
-> Phase 1.** The `account` package has account creation, deposit
-> processing, and read-only account queries; the `ledger` package has
-> `LedgerTransaction`, `LedgerEntry`, and their repositories/enums; the
-> `transfer` package has transfer processing. The `common` package now
-> holds `PagedResponse<T>` (Task 6), `ApiError` (Task 7), and
-> `GlobalExceptionHandler` (Task 7, replacing the narrower
-> `AccountAndTransferExceptionHandler` from Tasks 5–6 — see "Error
-> Handling" below). `GET /api/v1/accounts/{id}` still does not exist — no
-> task has been assigned it so far — so the public-vs-internal lookup
-> split described below is still only partially realized (see that
+> **Status: Phase 1 complete through Task 9.** Database layer (Task 2),
+> account creation (Task 3), deposits (Task 4), transfers (Task 5),
+> account balance/transaction-history reads (Task 6), global error
+> handling (Task 7), OpenAPI documentation (Task 8), and CI (Task 9) are
+> all implemented; only plain account lookup by id remains unimplemented
+> — no task has ever been assigned it. The `account` package has account
+> creation, deposit processing, and read-only account queries; the
+> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
+> repositories/enums; the `transfer` package has transfer processing. The
+> `common` package holds `PagedResponse<T>` (Task 6), `ApiError` and
+> `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
+> "API Documentation" below). Task 9 added `.github/workflows/ci.yml`
+> only — no application code, no new package, no behavior change (see
+> "Continuous Integration" at the end of this document). `GET
+> /api/v1/accounts/{id}` still does not exist, so the public-vs-internal
+> lookup split described below is still only partially realized (see that
 > section for exactly what deposits, transfers, and the read endpoints do
 > instead).
 
@@ -41,12 +43,13 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
 - `transfer` — **implemented (Task 5)**: `TransferController`,
   `TransferService`, `TransferRequest`/`TransferResponse` — the transfer
   use case, spanning `account` and `ledger` as planned.
-- `common` — **implemented (Tasks 5–7)**: `PagedResponse<T>` (Task 6),
+- `common` — **implemented (Tasks 5–8)**: `PagedResponse<T>` (Task 6),
   `ApiError` and `GlobalExceptionHandler` (Task 7, superseding the
-  narrower `AccountAndTransferExceptionHandler` introduced in Task 5) —
-  see "Error Handling" and "Account Balance and Transaction History"
-  below. `docs/API_SPEC.md`'s "Error Response Shape" is now fully
-  implemented, not just planned.
+  narrower `AccountAndTransferExceptionHandler` introduced in Task 5), and
+  `OpenApiConfig` (Task 8) — see "Error Handling", "Account Balance and
+  Transaction History", and "API Documentation" below.
+  `docs/API_SPEC.md`'s "Error Response Shape" and "OpenAPI/Swagger"
+  sections are now both fully implemented, not just planned.
 
 Packages named in `CLAUDE.md` for later phases (`idempotency`, `outbox`,
 `settlement`, `reconciliation`, `security`, `audit`) are **not** created in
@@ -472,3 +475,106 @@ time `GlobalExceptionHandler` runs, the database transaction has already
 been rolled back or never opened for the failed part of the request; the
 handler only builds a response describing what already happened, and
 never opens a new transaction or writes anything itself.
+
+## API Documentation (implemented, Task 8)
+
+`springdoc-openapi-starter-webmvc-ui:3.0.2` (the release vetted for Spring
+Boot 4.0.7 by start.spring.io) introspects the existing controllers,
+request/response DTOs, and Jakarta Validation annotations at runtime to
+generate the OpenAPI document — there is no hand-maintained YAML/JSON spec
+file to keep in sync, and no generated server stubs or client code. This
+is purely descriptive: it adds zero new endpoints, zero new business
+behavior, and reads no database state to build the document (the document
+describes the API's *shape*, which is fixed at compile time via
+reflection over annotations — it never queries `account`,
+`ledger_transaction`, or `ledger_entry`).
+
+- `common.OpenApiConfig` supplies the `Info` block (title, description,
+  version) — see `docs/API_SPEC.md`'s "OpenAPI/Swagger" section for the
+  exact values and why license/contact/server metadata were deliberately
+  omitted rather than filled with placeholders.
+- `@Operation`/`@ApiResponses`/`@Parameter` on `AccountController` and
+  `TransferController` document each endpoint's summary, description,
+  path/query parameters, and the exact status codes that endpoint's
+  `GlobalExceptionHandler`-routed failures actually produce (Task 7) —
+  these annotations describe existing behavior, they don't define new
+  behavior.
+- `@Schema` on the DTOs mostly just adds `example` values and
+  human-readable `description`s — Jakarta Validation annotations already
+  present (`@NotBlank`, `@NotNull`, `@Positive`, `@Digits`,
+  `@Pattern`, `@Size`) are enough for springdoc to infer accurate
+  `required`/`pattern`/`minLength` constraints without any OpenAPI-specific
+  annotation duplicating them. The one deliberate override is
+  `@Schema(type = "string")` on every `BigDecimal` field (`amount`,
+  `balance`, `newBalance`) — springdoc's default inference maps
+  `BigDecimal` to a bare JSON `number`, but every monetary value in this
+  API is documented and tested as a JSON *string* (e.g.
+  `"amount": "100.00"`, per every example throughout `docs/API_SPEC.md`);
+  the override makes the generated schema match the actual wire format
+  exactly, and doubles as an explicit signal that these are exact decimal
+  values, never floating-point.
+- The transaction-history endpoint's response schema
+  (`PagedResponseTransactionHistoryItem` — springdoc's generated name for
+  `PagedResponse<TransactionHistoryItem>`) must be left for springdoc to
+  infer directly from the controller method's actual return type.
+  Overriding it with an explicit `@Schema(implementation = PagedResponse.class)`
+  on the `@ApiResponse` — tried and reverted during Task 8 — erases the
+  generic type parameter and produces an empty `content` item schema; the
+  code has a comment at that exact spot explaining why it must stay
+  untouched. This is also what keeps the documented pagination envelope as
+  the project's own `{content, page, size, totalElements, totalPages}`
+  shape rather than Spring Data's `Page`/`PageImpl` JSON.
+- `springdoc.default-produces-media-type: application/json`
+  (`application.yml`) makes every response's documented content type
+  `application/json` instead of springdoc's own default wildcard `*/*` —
+  the one global configuration property Task 8 added, chosen over
+  scattering an explicit `mediaType` attribute across every
+  `@Content` annotation (which, worse, also turned out to suppress the
+  generic-type inference above whenever combined with an omitted
+  `schema`).
+- No security scheme is declared anywhere — Phase 1 has no authentication,
+  so documenting one would misrepresent these endpoints as protected.
+
+**Endpoints:** `GET /v3/api-docs` (the OpenAPI 3.1 JSON document) and
+`GET /swagger-ui/index.html` (interactive UI; `GET /swagger-ui.html`
+redirects there) — both springdoc defaults, both already the paths
+`docs/API_SPEC.md` referenced before Task 8 existed to implement them.
+
+## Continuous Integration (implemented, Task 9)
+
+`.github/workflows/ci.yml` is the only workflow in the repository. It runs
+one job (`ubuntu-latest`) on every push and pull request targeting
+`master`, and that job runs exactly one command:
+`./mvnw --batch-mode --no-transfer-progress verify` — the same `verify`
+lifecycle (compile → unit tests → PostgreSQL Testcontainers integration
+tests → every Maven plugin already bound to it) a developer runs locally,
+with no test-skipping flag and no CI-only profile that could make the
+workflow pass something a local run would fail. `--batch-mode` and
+`--no-transfer-progress` only suppress interactive/progress output
+appropriate for a non-interactive runner; neither changes what runs or
+how failures are reported.
+
+Docker is preinstalled and already running on GitHub-hosted `ubuntu-latest`
+runners, so Testcontainers reaches it the same way it does on a
+developer's machine (the default local Docker socket) — no
+`docker-compose.yml` service container is defined or needed in the
+workflow, and none of the eight Testcontainers-backed test classes needed
+any change to run in CI. Each one still starts its own fresh
+`postgres:16.4` container and runs the Flyway migration from an empty
+schema, exactly as documented throughout this file and
+`docs/TEST_STRATEGY.md`.
+
+The workflow requests `permissions: contents: read` only — it has no
+ability to write to the repository, and contains no deployment,
+publishing, or release step of any kind. No secret, credential, or
+environment-specific value is referenced anywhere in it. `concurrency`
+cancels a stale in-progress run for the same branch/PR (never touching
+unrelated branches); Maven's dependency cache (not build output) is keyed
+on `pom.xml` via `setup-java`'s `cache: maven`; Surefire/Failsafe reports
+upload as a build artifact only when the job fails, with a 7-day
+retention, and never block an otherwise-successful run if no report
+happens to exist.
+
+Task 9 changed no application code, no database object, and no test
+assertion — it only adds a workflow file that runs the pre-existing,
+already-passing verification suite automatically.

@@ -1,6 +1,7 @@
 package com.tarun.ledgerguard.account.dto;
 
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
+import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -16,10 +17,13 @@ import java.util.UUID;
  * are required by the approved contract.
  */
 public record TransactionHistoryItem(
+		@Schema(example = "b2f1d3d0-4a3e-4b2e-8b1e-2a7e6c1a9f10", description = "The id of the transaction this entry belongs to")
 		UUID transactionId,
+		@Schema(description = "DEBIT if this wallet sent funds (a transfer out); "
+				+ "CREDIT if this wallet received funds (a deposit, or a transfer in)")
 		LedgerEntryType entryType,
-		BigDecimal amount,
-		String currency,
+		@Schema(type = "string", example = "25.00") BigDecimal amount,
+		@Schema(example = "USD") String currency,
 		Instant createdAt
 ) {
 }
