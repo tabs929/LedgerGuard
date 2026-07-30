@@ -1,15 +1,13 @@
 # Data Model
 
-> **Status: schema implemented (Task 2); account creation (Task 3) and
-> deposits (Task 4) implemented.** The tables, constraints, indexes, and
-> triggers described below exist in the database via
-> `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
-> and are verified by `SchemaMigrationIntegrationTest`. `account` has a
-> matching JPA entity used by both account creation and deposits.
-> `ledger_transaction`/`ledger_entry` now have matching JPA entities too
-> (`LedgerTransaction`, `LedgerEntry`), written only by deposit processing
-> so far. Transfers, balance lookups, and transaction history remain
-> unimplemented (Tasks 5–6).
+> **Status: schema implemented (Task 2); account creation (Task 3),
+> deposits (Task 4), and transfers (Task 5) implemented.** The tables,
+> constraints, indexes, and triggers described below exist in the database
+> via `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
+> and are verified by `SchemaMigrationIntegrationTest`. `account`,
+> `ledger_transaction`, and `ledger_entry` all have matching JPA entities,
+> written by account creation, deposit, and now transfer processing.
+> Balance lookups and transaction history remain unimplemented (Task 6).
 
 ## Account Taxonomy
 
@@ -59,8 +57,17 @@ Balance direction depends on account class:
   system from outside increases what the platform holds (the funding
   asset) by the same amount it increases what the platform owes the
   customer (the wallet liability).
-- **Transfer** (not yet implemented): DEBIT sender (liability) / CREDIT
-  recipient (liability).
+- **Transfer** (implemented, Task 5): DEBIT source (liability) / CREDIT
+  destination (liability), both `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`
+  accounts. Both entries carry the same amount and currency and reference
+  the same `ledger_transaction` row (`transaction_type = TRANSFER`,
+  `status = COMPLETED`). The source's balance decreases and the
+  destination's increases by the transfer amount — both are liability
+  accounts, so a debit decreasing one and a credit increasing the other is
+  exactly what keeps the *combined* balance of the two accounts unchanged:
+  unlike a deposit, no money enters or leaves the ledger, it only moves
+  between two liabilities the platform already owed. `EXTERNAL_FUNDING` is
+  never involved.
 - **Withdrawal** (designed for, not implemented in Phase 1): DEBIT customer
   account (liability) / CREDIT `EXTERNAL_FUNDING` (asset).
 
@@ -153,14 +160,19 @@ types, positive entry amounts, required foreign keys, and immutability of
 
 **What the schema deliberately does not enforce** (left to the domain
 service layer, per `CLAUDE.md` and `docs/ARCHITECTURE.md`): USD-only
-account creation and deposits (the `CHECK` only validates currency
-*format*, not the specific code — see the migration's header comment), and
-the "total debits equal total credits per transaction" trial-balance
-invariant (no deferred constraint trigger exists for this; `DepositService`
-enforces it by construction — it always writes exactly one `DEBIT` and one
-`CREDIT` of the same amount and currency for every transaction it creates —
-and `DepositIntegrationTest` verifies the resulting rows are in fact
-balanced).
+account creation, deposits, and transfers (the `CHECK` only validates
+currency *format*, not the specific code — see the migration's header
+comment); insufficient-funds prevention beyond the blanket
+`chk_account_balance_nonneg >= 0` floor (a transfer service that skipped
+its own balance check would still be stopped by that constraint, but as a
+raw constraint-violation error, not the clean 422 `InsufficientFundsException`
+that `TransferService` produces by checking first); and the "total debits
+equal total credits per transaction" trial-balance invariant (no deferred
+constraint trigger exists for this; both `DepositService` and
+`TransferService` enforce it by construction — each always writes exactly
+one `DEBIT` and one `CREDIT` of the same amount and currency for every
+transaction it creates — and their integration tests verify the resulting
+rows are in fact balanced).
 
 Application-side `AccountCategory`, `AccountClass`, and `AccountPurpose`
 Java enums (Task 3) map 1:1 to the `account` table's string literals, via
@@ -197,3 +209,25 @@ ever runs, matching `ledger_entry.amount`'s and `account.balance`'s
 clean 400 rather than a database error. The destination account must
 already be `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` and `USD` — checked in
 `DepositService` against the locked row before any ledger write happens.
+
+## Transfer Enforcement (implemented, Task 5)
+
+`TransferRequest` has fields for `sourceAccountId`, `destinationAccountId`,
+`amount`, and `currency` only. `TransferService` constructs the
+`ledger_transaction`/`ledger_entry` rows directly:
+`transaction_type = TRANSFER`, `status = COMPLETED`, one `DEBIT` entry
+against the source account and one `CREDIT` entry against the destination
+account, both for the exact validated amount, both `currency = 'USD'`.
+Both accounts must already be `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` and
+`USD`, checked against the locked rows before any ledger write happens —
+same as deposits. `sourceAccountId == destinationAccountId` is rejected
+before either account is even looked up.
+
+Insufficient funds (`source.balance < amount`) is checked in
+`TransferService` immediately after both accounts are locked and validated,
+and before any `ledger_transaction`/`ledger_entry` row is written — so a
+rejected transfer never gets as far as constructing ledger rows it would
+then have to roll back. A transfer for exactly the source's current
+balance is allowed (`balance >= amount` including equality) and correctly
+leaves the source at exactly `0.0000`, still satisfying
+`chk_account_balance_nonneg`.

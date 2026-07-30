@@ -1,14 +1,15 @@
 # Test Strategy
 
 > **Status: planning document; schema-level (Task 2), account-creation
-> (Task 3), and deposit (Task 4) tests are now implemented.** As of Task 4,
-> the connectivity smoke test (Task 1), schema-verification tests (Task 2),
-> account creation's tests (Task 3), and deposit's ledger-balance,
-> rollback, and concurrency tests (Task 4) all exist (see "Currently
-> Implemented" below). Transfer invariant/concurrency tests and the
-> 404-for-SYSTEM-account tests for `GET /api/v1/accounts/{id}` and later
-> endpoints remain unwritten, since the code they would exercise doesn't
-> exist yet.
+> (Task 3), deposit (Task 4), and transfer (Task 5) tests are now
+> implemented.** As of Task 5, the connectivity smoke test (Task 1),
+> schema-verification tests (Task 2), account creation's tests (Task 3),
+> deposit's ledger-balance/rollback/concurrency tests (Task 4), and
+> transfer's ledger-balance/conservation/insufficient-funds/rollback/
+> deadlock-avoidance tests (Task 5) all exist (see "Currently Implemented"
+> below). The 404-for-SYSTEM-account tests for `GET /api/v1/accounts/{id}`
+> and later endpoints (balance, history) remain unwritten, since that code
+> doesn't exist yet.
 
 ## Split
 
@@ -112,22 +113,51 @@ JDBC), against a Testcontainers-provisioned `postgres:16.4` instance:
   proving PostgreSQL's row locking (not application code) serializes the
   concurrent balance updates correctly.
 
-## Planned Invariant Tests (transfers — require the future domain service, not yet written)
+## Transfer Tests (implemented, Task 5)
 
-- **Ledger-as-source-of-truth (general form):** after an arbitrary sequence
-  of deposits and transfers, recompute each account's balance by summing
-  its `ledger_entry` rows per the account's class formula, and assert
-  equality with the materialized `account.balance`. (Deposit-specific
-  balance correctness is already covered above; this generalized version is
-  most meaningful once transfers add a second write path.)
-- **Deterministic-locking / deadlock test:** simultaneous A→B and B→A
-  transfers between the same two accounts complete without deadlock.
-- **Validation/rejection tests:** self-transfer, currency mismatch,
-  insufficient funds.
-- **SYSTEM-account-as-404 tests:** every remaining public endpoint (`GET
-  /api/v1/accounts/{id}`, transfers as source/destination, balance,
-  history) returns 404 (not a distinct error) for a `SYSTEM` account id —
-  deposits already do this; the other endpoints don't exist yet.
+`TransferIntegrationTest` (28 tests) verifies transfer processing at the
+HTTP boundary (`TestRestTemplate`) and the persisted database state (direct
+JDBC), against a Testcontainers-provisioned `postgres:16.4` instance:
+
+- **Success + response shape, balanced double-entry proof, balance
+  correctness:** same shape of proof as deposits (one `TRANSFER`
+  transaction, two entries — source `DEBIT`, destination `CREDIT` — equal
+  positive amounts, same currency, same `transaction_id`), plus a
+  **conservation check** specific to transfers: the *combined* source +
+  destination balance is asserted unchanged before/after (money moved
+  internally, none entered or left the ledger). Sequential transfers
+  accumulate correctly; a transfer of the full source balance succeeds and
+  leaves it at exactly zero.
+- **Validation/rejection tests:** zero/negative/missing/malformed amount,
+  excess precision, an amount exceeding 15 integer digits, missing
+  source/destination id, a nonexistent source or destination account,
+  self-transfer, insufficient funds, `EXTERNAL_FUNDING` as source or as
+  destination, directly-inserted non-USD source and non-USD destination
+  wallets, and protected/unknown JSON fields — each rejected with the
+  documented status and persists nothing.
+- **Rollback proof:** the same real-database-overflow technique used for
+  deposits (pre-seed the destination near `NUMERIC(19,4)`'s ceiling via
+  direct SQL, then transfer an amount that overflows it), asserting no
+  transaction, no entries, and no balance change on either account survive.
+- **Immutability re-check:** `UPDATE`/`DELETE` against rows a real transfer
+  just created are still rejected.
+- **Regression:** a deposit followed by a transfer produces the expected
+  balances on both accounts, and the `EXTERNAL_FUNDING` balance is
+  unaffected by the transfer.
+- **Concurrency (real PostgreSQL locking, no mocks, no Java-only
+  synchronization, bounded timeouts so a real deadlock would fail the test
+  instead of hanging the build):**
+  - `concurrentTransfersFromOneSourceDoNotOverspend` — 20 concurrent
+    transfers of $10 each from a $100 source (only 10 are affordable);
+    asserts exactly 10 succeed (201) and exactly 10 are cleanly rejected
+    (422 insufficient funds, not lost/hung/silently-dropped requests), the
+    final source balance is never negative, and both final balances equal
+    the starting balances plus/minus exactly the successful transfers.
+  - `concurrentOppositeDirectionTransfersCompleteWithoutLostUpdatesOrDeadlock`
+    — 10 A→B and 10 B→A transfers fired concurrently between the same two
+    accounts; asserts all 20 complete (proving the deterministic
+    id-ordered locking prevents the deadlock that source-then-destination
+    locking would risk) and both balances return to their starting values.
 
 ## Currently Implemented
 
@@ -159,6 +189,8 @@ of the persisted `account` row, all against a Testcontainers-provisioned
   weaken the schema's guarantees.
 
 `DepositIntegrationTest` (Task 4) — see "Deposit Tests" above.
+
+`TransferIntegrationTest` (Task 5) — see "Transfer Tests" above.
 
 ## CI
 

@@ -1,13 +1,14 @@
 # API Specification
 
-> **Status: account creation (Task 3) and deposits (Task 4) implemented;
-> the rest is still a planning document.** `POST /api/v1/accounts` and
-> `POST /api/v1/accounts/{id}/deposits` exist and match the contracts below
-> exactly. Deposits are USD-only and always post a balanced double-entry
-> ledger transaction (DEBIT `EXTERNAL_FUNDING`, CREDIT the customer wallet)
-> in the same database transaction as the materialized balance updates.
-> `GET /api/v1/accounts/{id}` and everything below it remain unimplemented —
-> no controllers, services, or DTOs exist for them yet.
+> **Status: account creation (Task 3), deposits (Task 4), and transfers
+> (Task 5) implemented; the rest is still a planning document.** `POST
+> /api/v1/accounts`, `POST /api/v1/accounts/{id}/deposits`, and `POST
+> /api/v1/transfers` exist and match the contracts below exactly. Both
+> deposits and transfers are USD-only and always post a balanced
+> double-entry ledger transaction in the same database transaction as the
+> materialized balance updates. `GET /api/v1/accounts/{id}` and everything
+> below transfers remain unimplemented — no controllers, services, or DTOs
+> exist for them yet.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -76,15 +77,48 @@ Errors:
 - 422 currency mismatch — `currency` is a well-formed but non-`USD` code,
   or (in principle) the destination account's own currency is not `USD`.
 
-## POST /api/v1/transfers (not implemented)
+## POST /api/v1/transfers (implemented, Task 5)
 
 Request: `{ "sourceAccountId": uuid, "destinationAccountId": uuid, "amount": "50.00", "currency": "USD" }`
 
 Response 201: `{ "transactionId": uuid, "sourceAccountId": uuid, "destinationAccountId": uuid, "amount": "50.00", "currency": "USD", "createdAt": iso8601 }`
 
-Errors: 400 validation (amount <= 0), 404 account not found (either id being
-a `SYSTEM` account is treated identically to nonexistent), 422 insufficient
-funds, 422 currency mismatch, 422 source == destination.
+A transfer is a single atomic, balanced double-entry ledger transaction
+between two customer wallets: DEBIT the source
+`CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` account, CREDIT the destination
+account of the same taxonomy, both for the same amount and currency, both
+referencing the same new `ledger_transaction` row
+(`transaction_type = TRANSFER`, `status = COMPLETED`). The source's
+materialized balance decreases and the destination's increases by the
+transfer amount, in the same database transaction as the two ledger-entry
+inserts — the combined balance of the two accounts is unchanged by the
+operation. The `EXTERNAL_FUNDING` account is never involved in a transfer.
+Both accounts are row-locked in ascending account-id order (not
+source-then-destination), which is what lets two opposite-direction
+transfers between the same two accounts (A→B and B→A) proceed concurrently
+without deadlocking.
+
+The request has no field for transaction id/type/status, entry direction,
+ledger-entry ids, account balances, timestamps, or account taxonomy, so
+none of these can be supplied or overridden by the client; any
+unrecognized JSON property is rejected outright (400), not silently
+ignored. Unlike deposits, the response has no balance field. `amount`
+accepts up to 15 integer digits and exactly 4 decimal digits (matching
+`NUMERIC(19,4)`) — anything outside that shape is rejected as a validation
+error rather than silently rounded. A transfer for exactly the source's
+full balance is allowed and leaves it at exactly zero.
+
+Errors:
+- 400 validation — missing/non-positive/malformed `amount`, an amount with
+  unsupported precision or scale, missing source/destination id, missing
+  or malformed `currency`, or an unrecognized JSON property.
+- 404 account not found — either id being a `SYSTEM` account (treated
+  identically to a nonexistent id) or any account that is not a
+  `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`.
+- 422 insufficient funds — `source.balance < amount`.
+- 422 currency mismatch — `currency` is a well-formed but non-`USD` code,
+  or (in principle) either account's own currency is not `USD`.
+- 422 source == destination.
 
 ## GET /api/v1/accounts/{id}/balance (not implemented)
 
@@ -119,6 +153,7 @@ Implemented via a global `@ControllerAdvice` (planned for Task 7).
 
 - `POST /api/v1/accounts` (Task 3) — see above.
 - `POST /api/v1/accounts/{id}/deposits` (Task 4) — see above.
+- `POST /api/v1/transfers` (Task 5) — see above.
 - Spring Boot Actuator's built-in health check:
 
 ```

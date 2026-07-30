@@ -46,4 +46,18 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
 			@Param("destinationAccountId") UUID destinationAccountId,
 			@Param("currency") String currency);
 
+	/**
+	 * Locks a known set of account rows (e.g. a transfer's source and
+	 * destination) in one query, in ascending id order — regardless of
+	 * which one is semantically the source. Callers must pass the ids
+	 * pre-sorted (or rely on {@code ORDER BY a.id} alone; either way the
+	 * lock acquisition order is deterministic by id, never by role), which
+	 * is what prevents a deadlock between two concurrent transfers moving
+	 * money in opposite directions between the same two accounts (A→B and
+	 * B→A). See docs/ARCHITECTURE.md's "Deterministic Lock Ordering".
+	 */
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query("select a from Account a where a.id in :ids order by a.id")
+	List<Account> findByIdsForUpdate(@Param("ids") List<UUID> ids);
+
 }

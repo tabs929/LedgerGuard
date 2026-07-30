@@ -118,4 +118,18 @@ public class Account {
 		this.balance = this.balance.add(amount);
 	}
 
+	/**
+	 * Decreases the materialized balance in place. As with
+	 * {@link #increaseBalance}, the caller is responsible for locking and
+	 * for writing the matching ledger entries in the same transaction. The
+	 * database's {@code chk_account_balance_nonneg} constraint is the
+	 * final backstop against a negative balance, but callers performing a
+	 * debit (e.g. a transfer source) are expected to check sufficient
+	 * funds themselves first, so that insufficient funds is reported as a
+	 * clean domain error rather than a raw constraint violation.
+	 */
+	public void decreaseBalance(BigDecimal amount) {
+		this.balance = this.balance.subtract(amount);
+	}
+
 }

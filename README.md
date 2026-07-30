@@ -5,10 +5,11 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 4 — Deposits
+## Status: Phase 1, Task 5 — Transfers
 
 This repository contains the project foundation (Task 1), the initial
-database schema (Task 2), account creation (Task 3), and deposits (Task 4).
+database schema (Task 2), account creation (Task 3), deposits (Task 4), and
+transfers (Task 5).
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -22,15 +23,31 @@ it DEBITs the internal `EXTERNAL_FUNDING` asset account and CREDITs the
 destination wallet (a liability account), both for the same amount and
 currency, both referencing one new ledger transaction row — and it
 increases both accounts' materialized balances in the very same database
-transaction as those two ledger-entry writes. PostgreSQL row-level locks
-(acquired on both accounts, in a deterministic order) prevent lost updates
-under concurrent deposits. Ledger rows remain immutable — deposit
-processing only ever inserts into `ledger_transaction`/`ledger_entry`,
-never updates or deletes them, and the Task 2 immutability triggers are
-untouched.
+transaction as those two ledger-entry writes.
 
-**Transfers, balance lookups, transaction history, and account lookup by
-id (`GET /api/v1/accounts/{id}`) are not implemented.** There is also no
+`POST /api/v1/transfers` moves USD between two customer wallets. **Every
+transfer is also an atomic, balanced double-entry ledger transaction**: it
+DEBITs the source customer liability (decreasing its balance) and CREDITs
+the destination customer liability (increasing its balance), both for the
+same amount and currency, both referencing one new ledger transaction row.
+The *combined* balance of the two accounts is unchanged by a transfer — it
+moves money internally, unlike a deposit. `EXTERNAL_FUNDING` is never
+involved in a transfer. A transfer is rejected (422) if the source account
+doesn't have enough balance to cover it.
+
+Both accounts involved in a deposit or a transfer are row-locked in
+PostgreSQL, in deterministic ascending account-id order (never
+source-then-destination, never customer-then-funding) — this is what
+prevents lost updates under concurrent deposits to the same account, lets
+concurrent transfers from one source correctly allow only as many as the
+balance can cover, and lets two opposite-direction transfers between the
+same two accounts (A→B and B→A) complete concurrently without deadlocking.
+Ledger rows remain immutable — deposit and transfer processing only ever
+insert into `ledger_transaction`/`ledger_entry`, never update or delete
+them, and the Task 2 immutability triggers are untouched.
+
+**Balance lookups, transaction history, and account lookup by id (`GET
+/api/v1/accounts/{id}`) are not implemented.** There is also no
 authentication, no Kafka/event processing, and no reconciliation — those
 are explicitly out of scope until later tasks/phases per `docs/TASKS.md`
 and `CLAUDE.md`.
@@ -100,12 +117,16 @@ tests that each start an isolated PostgreSQL container (independent of the
 Docker Compose service above): a connectivity smoke test (`SELECT 1`
 against the datasource), a schema-verification test that confirms the
 Flyway migration applies and every table, constraint, index, and trigger
-behaves as designed, an account-creation test suite, and a deposit test
-suite that verifies balanced double-entry postings, balance correctness,
-a genuine database-failure rollback scenario, and real concurrent deposits
-against PostgreSQL row locking (no mocks, no Java-only synchronization).
-Each test's PostgreSQL container starts and stops automatically as part of
-the test run — no manually running database is required.
+behaves as designed, an account-creation test suite, a deposit test suite,
+and a transfer test suite. The deposit and transfer suites both verify
+balanced double-entry postings, balance correctness, a genuine
+database-failure rollback scenario, and real concurrency against
+PostgreSQL row locking (no mocks, no Java-only synchronization) — the
+transfer suite additionally proves concurrent transfers from one source
+never overspend it, and that concurrent opposite-direction transfers
+between the same two accounts complete without deadlocking. Each test's
+PostgreSQL container starts and stops automatically as part of the test
+run — no manually running database is required.
 
 ## Documentation
 
@@ -113,14 +134,15 @@ the test run — no manually running database is required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (database layer, account creation, and deposit processing are
-  implemented; the transfer section is forward-looking and not yet built)
+  (database layer, account creation, deposit, and transfer processing are
+  all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
-  The schema is implemented (Flyway V1); account creation and deposits
-  read/write `account`, `ledger_transaction`, and `ledger_entry`.
-- `docs/API_SPEC.md` — `POST /api/v1/accounts` and `POST
-  /api/v1/accounts/{id}/deposits` are implemented and documented exactly as
-  built; the remaining endpoints are still planned contracts.
+  The schema is implemented (Flyway V1); account creation, deposits, and
+  transfers all read/write `account`, `ledger_transaction`, and
+  `ledger_entry`.
+- `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
+  /api/v1/accounts/{id}/deposits`, and `POST /api/v1/transfers` are
+  implemented and documented exactly as built; the remaining endpoints are
+  still planned contracts.
 - `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level,
-  account-creation, and deposit tests are implemented, transfer
-  business-logic tests are planned
+  account-creation, deposit, and transfer tests are all implemented

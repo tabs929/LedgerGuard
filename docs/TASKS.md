@@ -49,12 +49,25 @@ Work one task at a time. Mark a task done only when its tests pass and
       parallel HTTP requests against PostgreSQL row locking) proving no lost
       updates. No transfers, balance/history endpoints, or account lookup by
       id were implemented.
-- [ ] 5. Transfers — `POST /api/v1/transfers`, double-entry ledger transaction
-      between two CUSTOMER/LIABILITY accounts, currency-match check,
-      rejection of self-transfers, SYSTEM account ids treated as 404
-      not-found, deterministic two-row locking (ascending id order),
-      overdraft prevention, full rollback on failure, concurrency tests
-      including simultaneous A→B and B→A transfers.
+- [x] 5. Transfers — `POST /api/v1/transfers` implemented: one balanced
+      DEBIT source / CREDIT destination double-entry transaction between two
+      CUSTOMER/LIABILITY/CUSTOMER_WALLET accounts, `TransferService` (new
+      `transfer` package, reusing `Account`/`LedgerTransaction`/`LedgerEntry`
+      from Tasks 3–4), `AccountRepository.findByIdsForUpdate` locks both
+      accounts in ascending id order in one query regardless of transfer
+      direction, insufficient-funds rejection before any write, SYSTEM
+      account ids and self-transfers rejected, full rollback on failure.
+      Shared minimal error handling extracted to
+      `common.AccountAndTransferExceptionHandler` (used by both
+      `AccountController` and `TransferController`; behavior-preserving
+      refactor, all Task 3/4 tests still pass unchanged). Verified by
+      `TransferIntegrationTest` (28 tests, PostgreSQL Testcontainers):
+      balanced double-entry correctness, conservation of combined balance,
+      insufficient-funds and full-balance-transfer edge cases, a genuine
+      database-level-failure rollback test, immutability-trigger checks,
+      concurrent same-source transfers that don't overspend, and concurrent
+      opposite-direction (A→B / B→A) transfers that complete without
+      deadlock. No balance/history endpoints were implemented.
 - [ ] 6. Balance & transaction history APIs — `GET /api/v1/accounts/{id}/balance`,
       `GET /api/v1/accounts/{id}/transactions` (paginated ledger history),
       DTOs that never expose JPA entities.
