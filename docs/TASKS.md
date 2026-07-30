@@ -85,10 +85,24 @@ Work one task at a time. Mark a task done only when its tests pass and
       **Scope note:** plain `GET /api/v1/accounts/{id}` was not
       implemented — this task's line above never included it, so it
       remains deferred, consistent with the Task 3 scope note.
-- [ ] 7. Global error handling & validation polish — `@ControllerAdvice`,
-      consistent error response shape, request validation annotations across
-      all endpoints, mapping of domain exceptions to HTTP status codes.
-      `docs/API_SPEC.md` finalized here.
+- [x] 7. Global error handling & validation polish — one centralized
+      `common.GlobalExceptionHandler` (`@RestControllerAdvice`) covers every
+      controller (`AccountController`, `TransferController`); replaces the
+      Task 5–6 `AccountAndTransferExceptionHandler`, preserving every
+      status code it already produced (behavior-preserving — all Task 3–6
+      tests pass unchanged). Produces the exact documented `ApiError`
+      envelope (`timestamp`/`status`/`error`/`message`/`path`) for every
+      handled failure: domain exceptions (404/422, reused from Tasks 3–5),
+      `@Valid @RequestBody` failures and unknown-JSON-property/malformed-
+      JSON rejections (400), `@Min`/`@Max` pagination violations (400), a
+      malformed path UUID (400), and a safe generic fallback for anything
+      unexpected including persistence-layer failures (500, logged
+      server-side only). `docs/API_SPEC.md`'s "Error Response Shape"
+      section finalized here. Verified by
+      `GlobalExceptionHandlingIntegrationTest` (37 tests, PostgreSQL
+      Testcontainers): envelope shape/consistency across every endpoint,
+      request-validation and domain-error mappings, internal-detail-leakage
+      checks, and atomicity/success regression.
 - [ ] 8. OpenAPI/Swagger — springdoc integration, annotations/descriptions on
       all Phase 1 endpoints.
 - [ ] 9. GitHub Actions CI — workflow running `./mvnw verify` (including

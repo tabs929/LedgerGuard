@@ -1,18 +1,22 @@
 # API Specification
 
 > **Status: account creation (Task 3), deposits (Task 4), transfers
-> (Task 5), and account balance/transaction-history reads (Task 6)
-> implemented; the rest is still a planning document.** `POST
-> /api/v1/accounts`, `POST /api/v1/accounts/{id}/deposits`, `POST
-> /api/v1/transfers`, `GET /api/v1/accounts/{id}/balance`, and `GET
+> (Task 5), account balance/transaction-history reads (Task 6), and
+> global error handling (Task 7) implemented; OpenAPI docs (Task 8) and CI
+> (Task 9) are still planning.** `POST /api/v1/accounts`, `POST
+> /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
+> /api/v1/accounts/{id}/balance`, and `GET
 > /api/v1/accounts/{id}/transactions` all exist and match the contracts
 > below exactly. Both deposits and transfers are USD-only and always post
 > a balanced double-entry ledger transaction in the same database
 > transaction as the materialized balance updates; the two read endpoints
-> never modify that state. Plain `GET /api/v1/accounts/{id}` remains
-> unimplemented — `docs/TASKS.md`'s Task 6 line scopes that task to
-> balance and history only, not general account lookup — no controller,
-> service, or DTO exists for it yet.
+> never modify that state. Every documented error response, from every
+> endpoint, now goes through one centralized `@RestControllerAdvice`
+> (`common.GlobalExceptionHandler`) and matches the "Error Response Shape"
+> section below exactly — see that section for the full, now-implemented
+> contract. Plain `GET /api/v1/accounts/{id}` remains unimplemented — no
+> task has been assigned it so far — no controller, service, or DTO exists
+> for it yet.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -196,9 +200,10 @@ malformed or out of bounds — regardless of whether `{id}` would otherwise
 resolve (malformed pagination parameters are rejected before the account
 is even looked up).
 
-## Error Response Shape
+## Error Response Shape (implemented, Task 7)
 
-All error responses share one shape:
+All error responses, from every endpoint above, share exactly one shape —
+no more, no fewer fields, and no per-endpoint variation:
 
 ```json
 {
@@ -210,8 +215,45 @@ All error responses share one shape:
 }
 ```
 
-No internal exception details (stack traces, SQL state) are ever exposed.
-Implemented via a global `@ControllerAdvice` (planned for Task 7).
+- `timestamp` — an ISO-8601 instant (e.g. `"2026-07-30T19:20:00.123456Z"`),
+  captured when the error is translated into a response, in UTC.
+- `status` — the numeric HTTP status code, matching the response's actual
+  status line exactly.
+- `error` — the HTTP reason phrase for that status (`"Not Found"`,
+  `"Bad Request"`, `"Unprocessable Content"`, `"Internal Server Error"`).
+- `message` — a human-readable, safe description of the failure. For a
+  request with multiple field-level validation problems, this is a single
+  string listing each one, deterministically ordered by field name (e.g.
+  `"amount: must be greater than 0; currency: currency must be a 3-letter
+  ISO 4217 code"`) — there is no separate structured field-error list or
+  error-code field; none is part of this contract.
+- `path` — the request URI that produced the error.
+
+No internal exception details are ever exposed: no Java class or package
+names, no stack traces, no SQL statements, no `SQLState` values, no
+database constraint/table/column names, no Hibernate messages, no
+filesystem paths, no credentials or environment variables. Implemented via
+one centralized `@RestControllerAdvice` (`common.GlobalExceptionHandler`)
+that every controller shares — see `docs/ARCHITECTURE.md`'s "Error
+Handling" section for the full failure-to-status mapping and the reasoning
+behind each one.
+
+**Status codes used across all endpoints:**
+- `400 Bad Request` — request-shape problems: missing/blank/malformed
+  request-body fields, unsupported monetary precision or scale, malformed
+  JSON syntax, an unrecognized (protected or unknown) JSON property, a
+  malformed path UUID, or malformed/out-of-bounds pagination parameters.
+- `404 Not Found` — the referenced account doesn't exist, is a `SYSTEM`
+  account, or has an incompatible taxonomy for the endpoint (see each
+  endpoint's own section above for exactly which cases apply).
+- `422 Unprocessable Content` — a well-formed request that fails a domain
+  rule: unsupported/mismatched currency, insufficient funds, or
+  source == destination on a transfer.
+- `500 Internal Server Error` — anything unexpected, including a
+  persistence-layer failure not caught by earlier validation. The response
+  body still uses the same envelope, with a generic, safe `message`; the
+  original exception is logged server-side only, never returned to the
+  client.
 
 ## Currently Available Endpoints
 

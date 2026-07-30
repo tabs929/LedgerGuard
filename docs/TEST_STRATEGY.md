@@ -1,17 +1,18 @@
 # Test Strategy
 
 > **Status: schema-level (Task 2), account-creation (Task 3), deposit
-> (Task 4), transfer (Task 5), and account balance/transaction-history
-> (Task 6) tests are all implemented — no Phase 1 test-writing tasks
-> remain planned.** The connectivity smoke test (Task 1),
-> schema-verification tests (Task 2), account creation's tests (Task 3),
-> deposit's ledger-balance/rollback/concurrency tests (Task 4), transfer's
+> (Task 4), transfer (Task 5), account balance/transaction-history
+> (Task 6), and global error handling (Task 7) tests are all implemented —
+> no Phase 1 test-writing tasks remain planned.** The connectivity smoke
+> test (Task 1), schema-verification tests (Task 2), account creation's
+> tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
+> (Task 4), transfer's
 > ledger-balance/conservation/insufficient-funds/rollback/
-> deadlock-avoidance tests (Task 5), and the balance/history read tests
-> (Task 6) all exist (see "Currently Implemented" below). The
-> 404-for-SYSTEM-account behavior itself remains untested only for `GET
-> /api/v1/accounts/{id}`, since that plain-lookup endpoint was never
-> assigned to any task and so still doesn't exist.
+> deadlock-avoidance tests (Task 5), the balance/history read tests
+> (Task 6), and the global error-envelope/validation/leakage tests
+> (Task 7) all exist (see "Currently Implemented" below). Only `GET
+> /api/v1/accounts/{id}` remains untested, since that plain-lookup
+> endpoint was never assigned to any task and so still doesn't exist.
 
 ## Split
 
@@ -204,6 +205,53 @@ the HTTP boundary (`TestRestTemplate`), against a Testcontainers-provisioned
   Task 6 read; the Task 2 immutability triggers still reject `UPDATE`/
   `DELETE` against rows a real deposit created.
 
+## Global Error Handling Tests (implemented, Task 7)
+
+`GlobalExceptionHandlingIntegrationTest` (37 tests) verifies the
+centralized error envelope at the HTTP boundary, against a
+Testcontainers-provisioned `postgres:16.4` instance:
+
+- **Envelope shape:** a representative error response contains exactly
+  the five documented fields (no more, no fewer); `status` matches the
+  actual HTTP status; `error` matches the HTTP reason phrase; `path`
+  matches the request URI; `timestamp` parses as a valid ISO-8601 instant;
+  the response `Content-Type` is `application/json`.
+- **Leakage:** across a 404, a 400, and a 422 response, the body is
+  checked against a list of forbidden substrings — Java/Jackson/Hibernate/
+  PostgreSQL/HikariCP class-name fragments, `SQLState`, `Caused by`,
+  stack-trace frames, and internal table/column/constraint-name fragments
+  (`ledger_entry`, `chk_`, `idx_`, raw SQL keywords) — none of which ever
+  appear.
+- **Request-shape validation (400):** missing/unknown/malformed fields and
+  malformed JSON on account creation; missing/zero/negative/malformed/
+  over-precision amounts and protected fields on deposits; missing
+  source/destination/amount, a malformed UUID, zero/negative/over-precision
+  amounts, and protected/unknown fields on transfers; a malformed path
+  UUID on both balance and history; malformed, negative, zero, and
+  over-100 pagination parameters.
+- **Domain errors:** a nonexistent account is 404 on every endpoint that
+  accepts an account id (balance, history, deposit, transfer); a `SYSTEM`
+  account (`EXTERNAL_FUNDING`) is likewise 404 everywhere; an unsupported
+  currency on account creation is 422; an invalid deposit/transfer
+  destination is 404; insufficient funds is 422.
+- **Consistency:** the same four endpoints' 404 responses (nonexistent
+  account, on balance/history/deposit/transfer) are each checked to have
+  the identical envelope field set and identical `status`/`error` —
+  proving one shared mechanism produces every one of them, not four
+  independently-coded ones that happen to agree today.
+- **Atomicity regression:** a rejected deposit and a rejected
+  (insufficient-funds) transfer both create no `ledger_transaction`/
+  `ledger_entry` rows and change no balance; a deliberately forced
+  mid-transaction database failure (the same `NUMERIC(19,4)`-overflow
+  technique from Tasks 4–5, re-run here to confirm the new global handler
+  didn't change the guarantee) still rolls back completely and still
+  leaks nothing in its 500 response.
+- **Success regression:** account creation, deposit, and transfer still
+  succeed and conserve funds; history ordering is still newest-first with
+  the `id` tie-break; pagination defaults/bounds are unchanged
+  (`page=0`/`size=20`, `1..100`); the Task 2 immutability triggers still
+  reject `UPDATE`/`DELETE`.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -239,6 +287,9 @@ of the persisted `account` row, all against a Testcontainers-provisioned
 
 `AccountQueryIntegrationTest` (Task 6) — see "Account Balance and
 Transaction History Tests" above.
+
+`GlobalExceptionHandlingIntegrationTest` (Task 7) — see "Global Error
+Handling Tests" above.
 
 ## CI
 

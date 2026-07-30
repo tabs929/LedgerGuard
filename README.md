@@ -5,12 +5,12 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1, Task 6 — Account Balance and Transaction History
+## Status: Phase 1, Task 7 — Global Error Handling and API Error Consistency
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
-transfers (Task 5), and read-only account balance/transaction-history APIs
-(Task 6).
+transfers (Task 5), read-only account balance/transaction-history APIs
+(Task 6), and centralized error handling (Task 7).
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -61,6 +61,17 @@ database reads — no row locking, no ledger writes, no balance changes —
 and both hide `SYSTEM` accounts (like `EXTERNAL_FUNDING`) exactly like the
 write endpoints already do: a `SYSTEM` account id is indistinguishable
 from a nonexistent one (404).
+
+**Every error response, from every endpoint above, shares one JSON shape**
+— `{timestamp, status, error, message, path}` — produced by a single
+centralized `@RestControllerAdvice`. This covers request-validation
+failures (missing/malformed fields, malformed JSON, unknown/protected
+properties, malformed pagination), domain failures (account not found,
+`SYSTEM` account access, unsupported currency, insufficient funds,
+same-account transfer), and unexpected failures (a safe generic 500, with
+the real exception logged server-side only). No internal detail is ever
+returned to a client: no Java class or package names, no stack traces, no
+SQL, no database constraint or table names.
 
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
 implemented** — no task has been assigned it so far. There is also no
@@ -134,19 +145,22 @@ Docker Compose service above): a connectivity smoke test (`SELECT 1`
 against the datasource), a schema-verification test that confirms the
 Flyway migration applies and every table, constraint, index, and trigger
 behaves as designed, an account-creation test suite, a deposit test suite,
-a transfer test suite, and an account balance/transaction-history test
-suite. The deposit and transfer suites both verify balanced double-entry
-postings, balance correctness, a genuine database-failure rollback
-scenario, and real concurrency against PostgreSQL row locking (no mocks,
-no Java-only synchronization) — the transfer suite additionally proves
-concurrent transfers from one source never overspend it, and that
-concurrent opposite-direction transfers between the same two accounts
-complete without deadlocking. The balance/history suite proves reads never
-create ledger rows or change balances, history ordering and pagination
-match the approved contract exactly, and no account's history ever leaks
-another account's entries. Each test's PostgreSQL container starts and
-stops automatically as part of the test run — no manually running
-database is required.
+a transfer test suite, an account balance/transaction-history test suite,
+and a global error-handling test suite. The deposit and transfer suites
+both verify balanced double-entry postings, balance correctness, a genuine
+database-failure rollback scenario, and real concurrency against
+PostgreSQL row locking (no mocks, no Java-only synchronization) — the
+transfer suite additionally proves concurrent transfers from one source
+never overspend it, and that concurrent opposite-direction transfers
+between the same two accounts complete without deadlocking. The
+balance/history suite proves reads never create ledger rows or change
+balances, history ordering and pagination match the approved contract
+exactly, and no account's history ever leaks another account's entries.
+The error-handling suite proves every endpoint's error responses share the
+one documented envelope, contain no internal implementation detail, and
+that every rejected write still leaves no partial financial state. Each
+test's PostgreSQL container starts and stops automatically as part of the
+test run — no manually running database is required.
 
 ## Documentation
 
@@ -154,8 +168,8 @@ database is required.
 - `docs/REQUIREMENTS.md` — Phase 1 scope, acceptance criteria, and current
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
-  (database layer, account creation, deposit, transfer, and account-query
-  processing are all implemented)
+  (database layer, account creation, deposit, transfer, account-query, and
+  error-handling processing are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The schema is implemented (Flyway V1); account creation, deposits, and
   transfers all read/write `account`, `ledger_transaction`, and
@@ -165,7 +179,8 @@ database is required.
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET
   /api/v1/accounts/{id}/transactions` are all implemented and documented
-  exactly as built; the remaining endpoints are still planned contracts.
+  exactly as built, including the now-finalized shared error-response
+  contract; the remaining endpoints are still planned contracts.
 - `docs/TEST_STRATEGY.md` — testing approach for Phase 1; schema-level,
-  account-creation, deposit, transfer, and account-query tests are all
-  implemented
+  account-creation, deposit, transfer, account-query, and error-handling
+  tests are all implemented

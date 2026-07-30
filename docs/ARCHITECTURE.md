@@ -1,19 +1,21 @@
 # Architecture
 
 > **Status: database layer (Task 2), account creation (Task 3), deposits
-> (Task 4), transfers (Task 5), and account balance/transaction-history
-> reads (Task 6) implemented; nothing in Phase 1 remains unimplemented
-> except plain account lookup by id.** The `account` package has account
-> creation, deposit processing, and now read-only account queries; the
-> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
-> repositories/enums; the `transfer` package has transfer processing. The
-> `common` package now also holds `PagedResponse<T>` (Task 6), alongside
-> the shared exception-handling class from Task 5. `GET
-> /api/v1/accounts/{id}` still does not exist — `docs/TASKS.md`'s Task 6
-> line scoped that task to balance and history only, not general account
-> lookup — so the public-vs-internal lookup split described below is still
-> only partially realized (see that section for exactly what deposits,
-> transfers, and the new read endpoints do instead).
+> (Task 4), transfers (Task 5), account balance/transaction-history reads
+> (Task 6), and global error handling (Task 7) implemented; only plain
+> account lookup by id, OpenAPI docs, and CI remain unimplemented in
+> Phase 1.** The `account` package has account creation, deposit
+> processing, and read-only account queries; the `ledger` package has
+> `LedgerTransaction`, `LedgerEntry`, and their repositories/enums; the
+> `transfer` package has transfer processing. The `common` package now
+> holds `PagedResponse<T>` (Task 6), `ApiError` (Task 7), and
+> `GlobalExceptionHandler` (Task 7, replacing the narrower
+> `AccountAndTransferExceptionHandler` from Tasks 5–6 — see "Error
+> Handling" below). `GET /api/v1/accounts/{id}` still does not exist — no
+> task has been assigned it so far — so the public-vs-internal lookup
+> split described below is still only partially realized (see that
+> section for exactly what deposits, transfers, and the read endpoints do
+> instead).
 
 ## Style
 
@@ -39,12 +41,12 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
 - `transfer` — **implemented (Task 5)**: `TransferController`,
   `TransferService`, `TransferRequest`/`TransferResponse` — the transfer
   use case, spanning `account` and `ledger` as planned.
-- `common` — **implemented (Tasks 5–6)**: `AccountAndTransferExceptionHandler`
-  (Task 5) and `PagedResponse<T>` (Task 6) — see "Error Handling" and
-  "Account Balance and Transaction History" below. Not the full
-  `ApiExceptionHandler`/`ApiError` envelope described in
-  `docs/API_SPEC.md`'s "Error Response Shape", which remains Task 7's
-  responsibility.
+- `common` — **implemented (Tasks 5–7)**: `PagedResponse<T>` (Task 6),
+  `ApiError` and `GlobalExceptionHandler` (Task 7, superseding the
+  narrower `AccountAndTransferExceptionHandler` introduced in Task 5) —
+  see "Error Handling" and "Account Balance and Transaction History"
+  below. `docs/API_SPEC.md`'s "Error Response Shape" is now fully
+  implemented, not just planned.
 
 Packages named in `CLAUDE.md` for later phases (`idempotency`, `outbox`,
 `settlement`, `reconciliation`, `security`, `audit`) are **not** created in
@@ -377,37 +379,96 @@ normalize accepted lowercase input (`"usd"` → `"USD"`) before validating;
 this is a value-preserving normalization, not a contract change, so it
 doesn't conflict with `docs/API_SPEC.md`.
 
-## Error Handling (implemented, Tasks 5–6)
+## Error Handling (implemented, Task 7)
 
-`common.AccountAndTransferExceptionHandler` (`@RestControllerAdvice`) maps
-`UnsupportedCurrencyException`/`CurrencyMismatchException`/
-`InsufficientFundsException`/`SameAccountTransferException` to 422,
-`AccountNotFoundException` to 404, and (since Task 6)
-`jakarta.validation.ConstraintViolationException` to 400 — for every
-controller in the application. This replaces the two `@ExceptionHandler`
-methods that used to live directly on `AccountController` (added in
-Task 3, extended in Task 4) — moved here in Task 5 once
-`TransferController` needed to map the same exception types and
-copy-pasting the same handler methods into a second controller was the
-alternative. This was a behavior-preserving refactor: response status
-codes and bodies were unchanged, and
-`AccountCreationIntegrationTest`/`DepositIntegrationTest` (which assert on
-exactly these statuses) still passed without modification.
+`common.GlobalExceptionHandler` (`@RestControllerAdvice`) is now the
+single point in the application that translates an exception into an HTTP
+response, for every controller. It replaces
+`common.AccountAndTransferExceptionHandler` (introduced in Task 5,
+extended in Task 6), which returned a bare `{message}` body — that shape
+never matched `docs/API_SPEC.md`'s documented `ApiError` envelope
+(`timestamp`/`status`/`error`/`message`/`path`); closing that gap is what
+Task 7 exists to do. The replacement was verified behavior-preserving for
+every status code the old handler already produced: `AccountCreationIntegrationTest`,
+`DepositIntegrationTest`, `TransferIntegrationTest`, and
+`AccountQueryIntegrationTest` (which between them assert dozens of exact
+status codes, but never the old handler's body shape — no test asserted on
+`{message}` specifically) all still pass unmodified.
 
-The `ConstraintViolationException` mapping was added in Task 6 because
-`@Validated`-driven method-parameter constraints (the transaction-history
-endpoint's `@Min`/`@Max` on `page`/`size`) go through Bean Validation's AOP
-method interceptor, which throws that JSR-380 exception type directly —
-distinct from `MethodArgumentNotValidException` (thrown for `@Valid
-@RequestBody` failures, e.g. deposit/transfer amount validation) and from
-`MethodArgumentTypeMismatchException` (thrown for a malformed path
-variable, e.g. a non-UUID `{id}`), both of which Spring MVC already maps
-to 400 automatically without any handler here. Without the added mapping,
-an out-of-range `page`/`size` would have surfaced as an unmapped 500.
+**What's actually thrown, and why each handler exists** (each one verified
+against this application's real controller signatures, not assumed from
+the Spring Framework's full exception catalog):
 
-Bean-validation failures on request bodies and unknown-JSON-property
-rejections are still left to Spring's own default exception resolution
-(400), unchanged since Task 3. This is still not the complete Task 7
-framework: there is no unified `{timestamp, status, error, message, path}`
-envelope yet (see `docs/API_SPEC.md`'s "Error Response Shape") — just a
-consistent, minimal `{message}` body and the correct status code.
+- `AccountNotFoundException` → 404. `UnsupportedCurrencyException`/
+  `CurrencyMismatchException`/`InsufficientFundsException`/
+  `SameAccountTransferException` → 422 (`HttpStatus.UNPROCESSABLE_CONTENT`
+  — the non-deprecated RFC 9110 name; its reason phrase is
+  `"Unprocessable Content"`, not the older `"Unprocessable Entity"` text).
+  Unchanged from Tasks 3–5.
+- `MethodArgumentNotValidException` → 400. Thrown for `@Valid
+  @RequestBody` failures (blank `ownerName`, non-positive/over-precision
+  `amount`, malformed `currency` pattern, missing `sourceAccountId`, etc.)
+  across `CreateAccountRequest`/`DepositRequest`/`TransferRequest`. Field
+  errors are sorted by field name before being joined into `message`, so
+  a request with multiple problems always produces the same message text
+  regardless of Spring's internal validation-traversal order.
+- `jakarta.validation.ConstraintViolationException` → 400. The
+  transaction-history endpoint's `@Min`/`@Max` on `page`/`size` are
+  `@Validated`-driven method-parameter constraints, enforced via Bean
+  Validation's AOP method interceptor, which throws this JSR-380 exception
+  type directly — distinct from the two exception types above. Violations
+  are likewise sorted (by property path) before joining into `message`.
+- `HttpMessageNotReadableException` → 400. Covers malformed JSON syntax,
+  an unrecognized (protected or unknown) JSON property (Jackson's
+  `fail-on-unknown-properties`), and a value that fails to coerce into its
+  declared type (a non-numeric `amount`, a malformed UUID embedded in a
+  request body). The message is a fixed, generic string
+  (`"Malformed request body."`) — the underlying cause is never inspected
+  or echoed, since it can contain Jackson/Hibernate class names.
+- `MethodArgumentTypeMismatchException` → 400. A path variable that fails
+  to convert to its declared type — a non-UUID `{id}`. The message
+  includes the parameter name (`"id"`, public API surface) but never the
+  rejected value itself.
+- `Exception` (catch-all) → 500. Anything not explicitly handled above,
+  including a persistence-layer failure not caught by earlier
+  application-level validation (e.g. a `DataIntegrityViolationException`
+  from a real database constraint). No dedicated handler exists for
+  persistence exceptions specifically — `docs/API_SPEC.md` defines no
+  distinct status for a database-level conflict, and none of Tasks 3–6's
+  write paths can currently produce one through normal API use (the one
+  scenario that can, a `NUMERIC(19,4)` overflow, requires directly
+  corrupting a balance via raw SQL first — see the deposit/transfer/Task 7
+  rollback tests), so routing it to the same generic fallback as any other
+  unexpected failure is the only interpretation the approved contract
+  actually supports. The original exception is logged once, server-side,
+  at `ERROR` level (via SLF4J/Logback, the framework's existing logging
+  stack — no new logging dependency), with the request method and path for
+  context; the client only ever receives the generic `message`
+  `"An unexpected error occurred."`.
+
+**Types deliberately not handled**, because this application's controllers
+never actually throw them: `HandlerMethodValidationException` (Spring
+6.1's newer web-layer method-validation exception — our
+`@Validated`+`@RequestParam` combination goes through the AOP
+`ConstraintViolationException` path instead, confirmed empirically in
+Task 6), `MissingServletRequestParameterException` (`page`/`size` both
+have `defaultValue`s, so they can never be reported "missing"),
+`MissingPathVariableException` (no route declares a path variable it
+doesn't also bind), and `BindException` (its only production use in this
+app, `MethodArgumentNotValidException`, is a subtype already handled
+explicitly and takes precedence). Adding handlers for types that can never
+fire would be untested, misleading surface area, not genuine coverage.
+
+**Why translating at the HTTP boundary doesn't interfere with
+transactional rollback:** `GlobalExceptionHandler` methods run only after
+Spring's `DispatcherServlet` has already caught the exception propagating
+out of the controller — which itself only happens after the exception has
+already propagated out of the `@Transactional` service method
+(`DepositService.deposit`, `TransferService.transfer`), which is what
+triggers Spring's transactional rollback in the first place. Nothing in
+any service `catch`es an exception to convert it to a response — every
+domain and persistence exception is left to propagate naturally. By the
+time `GlobalExceptionHandler` runs, the database transaction has already
+been rolled back or never opened for the failed part of the request; the
+handler only builds a response describing what already happened, and
+never opens a new transaction or writes anything itself.
