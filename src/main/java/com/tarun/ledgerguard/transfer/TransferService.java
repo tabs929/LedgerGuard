@@ -12,6 +12,7 @@ import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
 import com.tarun.ledgerguard.idempotency.IdempotencyCommand;
 import com.tarun.ledgerguard.idempotency.IdempotencyService;
+import com.tarun.ledgerguard.outbox.OutboxEventFactory;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
@@ -58,17 +59,20 @@ public class TransferService {
 	private final LedgerEntryRepository ledgerEntryRepository;
 	private final EntityManager entityManager;
 	private final IdempotencyService idempotencyService;
+	private final OutboxEventFactory outboxEventFactory;
 
 	public TransferService(AccountRepository accountRepository,
 			LedgerTransactionRepository ledgerTransactionRepository,
 			LedgerEntryRepository ledgerEntryRepository,
 			EntityManager entityManager,
-			IdempotencyService idempotencyService) {
+			IdempotencyService idempotencyService,
+			OutboxEventFactory outboxEventFactory) {
 		this.accountRepository = accountRepository;
 		this.ledgerTransactionRepository = ledgerTransactionRepository;
 		this.ledgerEntryRepository = ledgerEntryRepository;
 		this.entityManager = entityManager;
 		this.idempotencyService = idempotencyService;
+		this.outboxEventFactory = outboxEventFactory;
 	}
 
 	@Transactional
@@ -138,6 +142,9 @@ public class TransferService {
 		// transaction, rather than silently at a later, unrelated flush point.
 		ledgerTransactionRepository.flush();
 		entityManager.refresh(transaction);
+
+		outboxEventFactory.recordTransferCompleted(transaction.getId(), source.getId(), destination.getId(), amount,
+				normalizedCurrency, transaction.getCreatedAt());
 
 		return new TransferResponse(
 				transaction.getId(),

@@ -5,16 +5,17 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Task 10 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–11 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
 transfers (Task 5), read-only account balance/transaction-history APIs
 (Task 6), centralized error handling (Task 7), OpenAPI/Swagger
-documentation (Task 8), continuous integration (Task 9), and idempotency
-for deposits and transfers (Task 10 — the first Phase 2 task). Kafka, an
-outbox, settlement/reconciliation, and authentication remain unimplemented
-— see `docs/TASKS.md`.
+documentation (Task 8), continuous integration (Task 9), idempotency for
+deposits and transfers (Task 10), and a transactional outbox for durable
+event persistence (Task 11). Kafka, an event publisher/consumer,
+settlement/reconciliation, and authentication remain unimplemented — see
+`docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -175,13 +176,45 @@ run against a live server as part of this task; behavior is verified by
 instead. You can also exercise the header interactively via Swagger UI
 (see below), which documents it as a required parameter on both endpoints.
 
+## Transactional Outbox
+
+Every newly committed deposit or transfer durably records exactly one
+domain event — `DEPOSIT_COMPLETED` or `TRANSFER_COMPLETED` — in an
+`outbox_event` table, in the **same PostgreSQL transaction** as the
+ledger transaction, its two ledger entries, both accounts' balance
+updates, and the Idempotency-Key record above. All of it commits together
+or none of it does; there is no separate step and no way for one part to
+succeed while another fails.
+
+This is internal, durable persistence only — **no Kafka, publisher,
+consumer, or scheduler exists in this repository**, and no event has ever
+been published or delivered anywhere. `outbox_event.published_at` is
+reserved for a future task's publisher to mark rows with; every row this
+project writes today has `published_at = NULL`. A Task 10 replay of an
+already-completed deposit or transfer never inserts a second event for
+the same transaction — the insertion point is only reachable when a
+genuinely new financial write happens. Event rows are immutable (enforced
+by database triggers, not just application code): they can never be
+updated or deleted, except for the one future transition of
+`published_at` from `NULL` to a timestamp.
+
+The event payload never includes the internal `EXTERNAL_FUNDING` account
+id, the raw `Idempotency-Key`, account balances, or any internal
+implementation detail — only the same kind of public fields already
+visible in the deposit/transfer response (transaction id, account id(s),
+amount as a four-decimal string, uppercase currency, and an ISO-8601 UTC
+timestamp matching the ledger transaction's own `createdAt`). See
+`docs/API_SPEC.md`'s note on Task 11 and `docs/ARCHITECTURE.md`'s
+"Transactional Outbox" section for the full mechanism and the exact
+version-1 payload schemas.
+
 ## Technology Stack
 
 - Java 21
 - Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL (via Docker Compose for local development)
-- Flyway (V1 migration: account and ledger schema)
+- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox)
 - Spring Data JPA
 - JUnit 5, Mockito, Testcontainers
 - Spring Boot Actuator
@@ -255,21 +288,29 @@ the shared error-response schema. No authentication scheme is declared.
 ./mvnw verify
 ```
 
-This runs the full test suite (186 tests), including Testcontainers-backed
+This runs the full test suite (221 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
-confirms both Flyway migrations apply and every table, constraint, index,
-and trigger behaves as designed, an account-creation test suite, a deposit
-test suite, a transfer test suite, an account balance/transaction-history
-test suite, a global error-handling test suite, an OpenAPI documentation
-test suite, and an idempotency test suite (Task 10). The idempotency suite
-verifies header validation, exact response replay, same- and
-cross-operation conflict detection, that a failed attempt never consumes
-the key, and — against real PostgreSQL advisory locking, never mocks or
-Java-only synchronization, with bounded timeouts rather than
-`Thread.sleep` — that concurrent requests sharing a key produce exactly one
-financial write. The deposit and transfer suites both verify balanced double-entry
+confirms the `V1` Flyway migration applies and every table, constraint,
+index, and trigger behaves as designed, an account-creation test suite, a
+deposit test suite, a transfer test suite, an account
+balance/transaction-history test suite, a global error-handling test
+suite, an OpenAPI documentation test suite, an idempotency test suite
+(Task 10), and an outbox test suite plus a small unit-test suite
+(Task 11). The idempotency suite verifies header validation, exact
+response replay, same- and cross-operation conflict detection, that a
+failed attempt never consumes the key, and — against real PostgreSQL
+advisory locking, never mocks or Java-only synchronization, with bounded
+timeouts rather than `Thread.sleep` — that concurrent requests sharing a
+key produce exactly one financial write. The outbox suite verifies exactly
+one event row per new deposit/transfer with the approved payload shape, no
+duplicate event on any idempotent replay (including concurrently), full
+rollback of the event alongside the ledger/idempotency state on any
+failure — including a forced, genuine outbox-insertion failure — and that
+every database-level constraint, immutability trigger, and the `V1`–`V3`
+migration sequence all behave exactly as documented. The deposit and
+transfer suites both verify balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
 no Java-only synchronization) — the transfer suite additionally proves
@@ -314,13 +355,14 @@ reports are uploaded as a short-retention build artifact for diagnosis.
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
-  error-handling, API-documentation, CI, and idempotency are all
-  implemented)
+  error-handling, API-documentation, CI, idempotency, and the
+  transactional outbox are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
   (Flyway V1); account creation, deposits, and transfers all read/write
   them; the balance/history endpoints read all three but write none of
-  them. `idempotency_key` (Flyway V2, Task 10) is a separate table.
+  them. `idempotency_key` (Flyway V2, Task 10) and `outbox_event`
+  (Flyway V3, Task 11) are both separate tables.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET

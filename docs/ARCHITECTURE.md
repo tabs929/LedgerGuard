@@ -1,27 +1,33 @@
 # Architecture
 
-> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Task 10 (idempotency)
-> implemented.** Database layer (Task 2), account creation (Task 3),
-> deposits (Task 4), transfers (Task 5), account balance/transaction-history
-> reads (Task 6), global error handling (Task 7), OpenAPI documentation
-> (Task 8), CI (Task 9), and idempotency for deposits/transfers (Task 10)
-> are all implemented; only plain account lookup by id remains
-> unimplemented — no task has ever been assigned it. The `account` package
-> has account creation, deposit processing, and read-only account queries;
-> the `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
+> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency)
+> and 11 (transactional outbox) implemented.** Database layer (Task 2),
+> account creation (Task 3), deposits (Task 4), transfers (Task 5), account
+> balance/transaction-history reads (Task 6), global error handling
+> (Task 7), OpenAPI documentation (Task 8), CI (Task 9), idempotency for
+> deposits/transfers (Task 10), and the transactional outbox (Task 11) are
+> all implemented; only plain account lookup by id remains unimplemented —
+> no task has ever been assigned it. The `account` package has account
+> creation, deposit processing, and read-only account queries; the
+> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
 > repositories/enums; the `transfer` package has transfer processing; the
-> new `idempotency` package (Task 10) has the idempotency key record,
+> `idempotency` package (Task 10) has the idempotency key record,
 > repository, command, service, and conflict exception — see "Idempotency"
-> below. The `common` package holds `PagedResponse<T>` (Task 6), `ApiError`
-> and `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
+> below; the new `outbox` package (Task 11) has the outbox event record,
+> repository, event-type enums, the two version-1 event payload records,
+> and the event factory — see "Transactional Outbox" below. The `common`
+> package holds `PagedResponse<T>` (Task 6), `ApiError` and
+> `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
 > "API Documentation" below). Task 9 added `.github/workflows/ci.yml`
 > only — no application code, no new package, no behavior change (see
 > "Continuous Integration" at the end of this document). `GET
 > /api/v1/accounts/{id}` still does not exist, so the public-vs-internal
 > lookup split described below is still only partially realized (see that
 > section for exactly what deposits, transfers, and the read endpoints do
-> instead). Kafka, an outbox, settlement/reconciliation, and authentication
-> remain unimplemented — see `docs/TASKS.md` for what Tasks 11+ still cover.
+> instead). Kafka, a publisher/consumer, settlement/reconciliation, and
+> authentication remain unimplemented — see `docs/TASKS.md` for what
+> Tasks 12+ still cover; Task 11 is durable event persistence only, no
+> event has ever been published or delivered.
 
 ## Style
 
@@ -63,9 +69,18 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
   from inside `DepositService`/`TransferService`), and
   `IdempotencyConflictException` — see "Idempotency" below.
 
-Packages named in `CLAUDE.md` for later phases (`outbox`, `settlement`,
-`reconciliation`, `security`, `audit`) are **not yet created** — `idempotency`
-was the first of the Phase 2/3 packages to be added, in Task 10.
+- `outbox` — **implemented (Task 11)**: `OutboxAggregateType`/
+  `OutboxEventType` enums, `OutboxEvent` (JPA entity mapping the
+  `outbox_event` table) and `OutboxEventRepository`,
+  `DepositCompletedEvent`/`TransferCompletedEvent` (the version-1 event
+  envelope records), and `OutboxEventFactory` (the single insertion point
+  `DepositService`/`TransferService` call) — see "Transactional Outbox"
+  below.
+
+Packages named in `CLAUDE.md` for later phases (`settlement`,
+`reconciliation`, `security`, `audit`) are **not yet created** —
+`idempotency` (Task 10) and `outbox` (Task 11) are the two Phase 2/3
+packages added so far.
 
 ## Account Creation (implemented, Task 3)
 
@@ -444,6 +459,118 @@ the resulting `ledger_transaction_id` (`NOT NULL`, foreign key), and the
 indefinite in Phase 2 — no TTL column, no cleanup job, no delete endpoint;
 see `docs/DATA_MODEL.md` for the full schema and `docs/API_SPEC.md` for
 the client-facing contract.
+
+## Transactional Outbox (implemented, Task 11)
+
+Every newly committed deposit or transfer durably records exactly one
+domain event — `DEPOSIT_COMPLETED` or `TRANSFER_COMPLETED` — in
+`outbox_event`, in the same PostgreSQL transaction as the
+`ledger_transaction`, its two `ledger_entry` rows, both accounts'
+materialized balance updates, and the Task 10 `idempotency_key` row. This
+is persistence only: nothing in this project reads `outbox_event` yet — no
+publisher, no consumer, no Kafka dependency of any kind. `outbox_event`
+exists precisely so a later task can poll it and publish without ever
+risking the classic dual-write problem (a financial write succeeding while
+the corresponding event write fails, or vice versa).
+
+**Insertion point.** `OutboxEventFactory.recordDepositCompleted`/
+`recordTransferCompleted` is called from inside the private
+`doDeposit`/`doTransfer` methods, immediately after
+`entityManager.refresh(transaction)` — the same point that already made
+`transaction.getId()`/`transaction.getCreatedAt()` available for the
+response DTO (see "Deposit Processing"/"Transfer Processing" above) — and
+before either method returns. This is still inside the one ambient
+`@Transactional` method (`DepositService.deposit`/`TransferService.transfer`,
+default `REQUIRES` propagation, the same method `IdempotencyService.execute`
+is itself called from); nothing here opens a `REQUIRES_NEW` transaction,
+registers an after-commit callback, or publishes anything asynchronously.
+`OutboxEventFactory` calls `repository.save(...)` then `repository.flush()`
+immediately, so a constraint violation on `outbox_event` surfaces here,
+inside the transaction, exactly like the existing explicit-flush pattern
+`DepositService`/`TransferService` already use for their own ledger writes.
+
+**Why this is atomic with the financial write and the idempotency
+record.** If anything after this point throws — or if the outbox insert
+itself fails its flush — the exception propagates out of the whole
+`@Transactional` method uninterrupted (nothing catches and suppresses it),
+so Spring rolls back everything: the `ledger_transaction`, both
+`ledger_entry` rows, both balance updates, the `outbox_event` row, and
+(since the outbox insert happens before `IdempotencyService`'s own final
+`save()+flush()` of the `idempotency_key` row, which only runs after the
+whole `operation.get()` supplier — including this outbox insert — returns
+successfully) the `idempotency_key` row as well. There is exactly one
+commit point for the entire operation; nothing here can commit
+independently of anything else.
+
+**Why a Task 10 replay or conflict never creates a duplicate event.**
+`OutboxEventFactory` is only ever called from inside `doDeposit`/
+`doTransfer`, which are only ever reached via the `Supplier<T> operation`
+argument to `IdempotencyService.execute` — and that supplier is only
+invoked on the "no existing row found" branch (see "Idempotency" above).
+A replay (canonical match) returns the stored response directly, without
+ever calling the supplier; a conflict (mismatch) throws before the
+supplier is ever considered. Structurally, there is no code path from a
+replay or a conflict into `OutboxEventFactory` — this required no special
+handling in `IdempotencyService` itself, since it falls straight out of
+where Task 11's insertion point sits. `uq_outbox_event_identity`
+(`UNIQUE (aggregate_type, aggregate_id, event_type)`, Flyway
+`V3__add_transactional_outbox.sql`) is a database-level backstop for the
+same guarantee, exercised directly (a raw duplicate `INSERT` against an
+existing transaction id is rejected) by `OutboxIntegrationTest`.
+
+**Event envelope and payload.** Each `outbox_event.payload` is a
+version-1 JSON object serialized from an explicit typed record —
+`DepositCompletedEvent` or `TransferCompletedEvent` — never a JPA entity,
+a request DTO, a response DTO, or an untyped map. `eventId` is a fresh
+`UUID.randomUUID()` generated once per event (never derived from a hash,
+a timestamp, or any mutable value) and is also the entity's own `id`
+(explicitly assigned in Java, not database-generated, so the payload's
+`eventId` and the row's `id` are guaranteed identical by construction, not
+by a later lookup). `amount` is pre-formatted via `BigDecimal.toPlainString()`
+on the already-normalized, already-4-decimal-scaled amount `DepositService`/
+`TransferService` compute for the ledger write itself — a JSON string like
+`"100.0000"`, never a bare JSON number, regardless of how the app's
+Jackson `ObjectMapper` might otherwise serialize a raw `BigDecimal` field.
+`occurredAt` is similarly pre-formatted with `DateTimeFormatter.ISO_INSTANT`
+against the exact same `transaction.getCreatedAt()` `Instant` stored in
+the row's own `occurred_at` column — not an independently generated
+application timestamp. Both choices make the wire format deterministic and
+locale-independent, per the Task 11 contract, rather than depending on
+Jackson's default `BigDecimal`/`Instant` handling. Serialization uses the
+application's actual `tools.jackson.databind.ObjectMapper` bean (Jackson
+3 — see the note on this project's Jackson stack in the "Idempotency"
+section above); a serialization failure is not caught — it propagates
+like any other exception in `doDeposit`/`doTransfer`, triggering the same
+whole-operation rollback described above. The deposit payload never
+includes the internal `SYSTEM`/`EXTERNAL_FUNDING` account id — only the
+public destination account id the caller already knows.
+
+**Immutability.** `outbox_event` rows are never updated or deleted by
+application code — `OutboxEvent` exposes no setters. Two triggers in
+`V3__add_transactional_outbox.sql` enforce this at the database level
+too: `trg_outbox_event_no_delete` unconditionally rejects `DELETE`;
+`trg_outbox_event_immutable` rejects any `UPDATE` that changes `id`,
+`aggregate_type`, `aggregate_id`, `event_type`, `schema_version`,
+`payload`, `occurred_at`, or `created_at`, and separately rejects any
+attempt to change `published_at` once it is already non-null — the only
+transition ever permitted is `published_at` moving from `NULL` to a
+non-null value, exactly once, for a future publisher to claim a row with.
+`OutboxIntegrationTest` proves each of these directly: `DELETE` is
+rejected, an `UPDATE` of `event_type` or `payload` is rejected, setting
+`published_at` from `NULL` to `now()` succeeds, and a further `UPDATE` of
+`published_at` (to `NULL` or to a new timestamp) is rejected.
+
+**`published_at` and the future publisher boundary.** `published_at` is
+`NULL` for every row Task 11 ever creates — nothing in this codebase sets
+it. It exists purely so a later task's publisher can poll
+`idx_outbox_event_pending` (a partial index, `WHERE published_at IS NULL`,
+ordered `(created_at, id)` for a deterministic, oldest-first scan) and
+mark a row as published after a successful send. Task 11 deliberately adds
+no attempt counts, retry timestamps, Kafka offsets, consumer state,
+broker/partition/topic metadata, background thread, or scheduler — those
+belong to the task that actually builds the publisher. No claim of
+delivery, publication, or exactly-once Kafka semantics is made anywhere in
+this project yet.
 
 ## Ledger Immutability (implemented, Task 2)
 

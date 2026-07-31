@@ -4,6 +4,7 @@ import com.tarun.ledgerguard.account.dto.DepositRequest;
 import com.tarun.ledgerguard.account.dto.DepositResponse;
 import com.tarun.ledgerguard.idempotency.IdempotencyCommand;
 import com.tarun.ledgerguard.idempotency.IdempotencyService;
+import com.tarun.ledgerguard.outbox.OutboxEventFactory;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
@@ -46,17 +47,20 @@ public class DepositService {
 	private final LedgerEntryRepository ledgerEntryRepository;
 	private final EntityManager entityManager;
 	private final IdempotencyService idempotencyService;
+	private final OutboxEventFactory outboxEventFactory;
 
 	public DepositService(AccountRepository accountRepository,
 			LedgerTransactionRepository ledgerTransactionRepository,
 			LedgerEntryRepository ledgerEntryRepository,
 			EntityManager entityManager,
-			IdempotencyService idempotencyService) {
+			IdempotencyService idempotencyService,
+			OutboxEventFactory outboxEventFactory) {
 		this.accountRepository = accountRepository;
 		this.ledgerTransactionRepository = ledgerTransactionRepository;
 		this.ledgerEntryRepository = ledgerEntryRepository;
 		this.entityManager = entityManager;
 		this.idempotencyService = idempotencyService;
+		this.outboxEventFactory = outboxEventFactory;
 	}
 
 	@Transactional
@@ -124,6 +128,9 @@ public class DepositService {
 		// at a later, unrelated flush point.
 		ledgerTransactionRepository.flush();
 		entityManager.refresh(transaction);
+
+		outboxEventFactory.recordDepositCompleted(transaction.getId(), destinationAccount.getId(), amount,
+				normalizedCurrency, transaction.getCreatedAt());
 
 		return new DepositResponse(
 				transaction.getId(),

@@ -1,16 +1,17 @@
 # Test Strategy
 
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
-> (idempotency), and every test runs automatically in CI (Task 9) on
-> every push/PR.** The connectivity smoke test (Task 1), schema-verification
-> tests (Task 2), account creation's tests (Task 3), deposit's
-> ledger-balance/rollback/concurrency tests (Task 4), transfer's
-> ledger-balance/conservation/insufficient-funds/rollback/
-> deadlock-avoidance tests (Task 5), the balance/history read tests
-> (Task 6), the global error-envelope/validation/leakage tests (Task 7),
-> the OpenAPI document/schema-accuracy tests (Task 8), and the idempotency
-> header/replay/conflict/rollback/concurrency tests (Task 10) all exist
-> (see "Currently Implemented" below) and all run in
+> (idempotency) and Task 11 (transactional outbox), and every test runs
+> automatically in CI (Task 9) on every push/PR.** The connectivity smoke
+> test (Task 1), schema-verification tests (Task 2), account creation's
+> tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
+> (Task 4), transfer's ledger-balance/conservation/insufficient-funds/
+> rollback/deadlock-avoidance tests (Task 5), the balance/history read
+> tests (Task 6), the global error-envelope/validation/leakage tests
+> (Task 7), the OpenAPI document/schema-accuracy tests (Task 8), the
+> idempotency header/replay/conflict/rollback/concurrency tests (Task 10),
+> and the outbox event/replay/rollback/constraint/immutability tests
+> (Task 11) all exist (see "Currently Implemented" below) and all run in
 > `.github/workflows/ci.yml` (see "CI" below). Only `GET
 > /api/v1/accounts/{id}` remains untested, since that plain-lookup
 > endpoint was never assigned to any task and so still doesn't exist.
@@ -359,6 +360,71 @@ deadlock or hang fails the test instead of blocking the build indefinitely.
     balance reflects exactly one of the two candidate amounts, never both
     and never neither.
 
+## Outbox Tests (implemented, Task 11)
+
+`OutboxIntegrationTest` (29 tests) verifies the transactional outbox at
+the HTTP boundary (`TestRestTemplate`) and the persisted database state
+(direct JDBC), against a Testcontainers-provisioned `postgres:16.4`
+instance. No PostgreSQL behavior is mocked; concurrency assertions use
+`ExecutorService.invokeAll`/`Future.get` with bounded timeouts, never
+`Thread.sleep`, as the correctness mechanism.
+
+- **Deposit/transfer success:** a successful deposit (and, separately, a
+  successful transfer) creates exactly one `outbox_event` row keyed by the
+  new `ledger_transaction.id`, with the correct `event_type`/
+  `aggregate_type`/`schema_version`/`published_at IS NULL`, and a payload
+  containing exactly the approved fields — `amount` as a four-decimal JSON
+  string, `currency` uppercase, `occurredAt` matching the ledger
+  transaction's own `created_at`, and (for deposits) no occurrence of the
+  internal `EXTERNAL_FUNDING` account id anywhere in the stored payload.
+- **Idempotent behavior:** an identical retry (including
+  numerically-equivalent amount formatting) leaves exactly one row for the
+  same transaction; a conflicting retry (different amount/account, or the
+  same key reused against the other endpoint) creates no additional row
+  and returns 409; concurrent identical requests sharing one key create
+  exactly one row; concurrent requests sharing one key but split across
+  two different amounts create a row only for whichever single command
+  actually won (the other requests all receive 409).
+- **Rollback behavior:** validation failures, a nonexistent account,
+  insufficient funds, and a forced genuine database-level failure (the
+  same `NUMERIC(19,4)`-overflow technique used in Tasks 4/5/10) all leave
+  no outbox row. A forced outbox-insertion failure —
+  `forcedOutboxInsertionFailureRollsBackTheWholeOperationAndKeySucceedsAfterCorrection`
+  adds a real `CHECK (1 = 0) NOT VALID` constraint directly to
+  `outbox_event` for the duration of the test (a genuine, deterministic
+  PostgreSQL-level failure, not a mock — chosen because the outbox row's
+  own `aggregate_id` is a randomly-generated UUID that can't be predicted
+  in advance to engineer a natural unique-constraint collision) — proves
+  the ledger transaction, its entries, both balance changes, and the
+  Task 10 idempotency record all roll back together with the outbox
+  insert; after the constraint is dropped, the same `Idempotency-Key`
+  succeeds and creates exactly one outbox row.
+- **Constraint behavior:** a direct duplicate `INSERT` against an existing
+  transaction id/event type is rejected by `uq_outbox_event_identity`; an
+  invalid `aggregate_type`, an invalid `event_type`, a non-positive
+  `schema_version`, and a non-object JSON payload are each rejected by
+  their respective `CHECK` constraint; an `aggregate_id` with no matching
+  `ledger_transaction` row is rejected by the foreign key; a direct
+  `UPDATE` of `event_type` or `payload` is rejected (immutability); a
+  direct `DELETE` is rejected; `published_at` can move from `NULL` to
+  `now()` exactly once, and any further change to it (clearing it or
+  overwriting it again) is rejected.
+- **Migration behavior:** `V1`, `V2`, and `V3` all apply successfully from
+  an empty schema; `outbox_event`'s constraints, the pending-event partial
+  index, and both immutability triggers all exist; `V1`/`V2` objects
+  (`chk_account_taxonomy_combination`, `uq_idempotency_key`) are still
+  present and unchanged.
+
+`OutboxEventFactoryTest` (6 unit tests, Mockito — `OutboxEventRepository`
+mocked, a real Jackson 3 `JsonMapper` used for actual serialization) covers
+what doesn't need a database: the deposit and transfer payloads contain
+exactly the approved fields, `amount` always serializes as a fixed
+four-decimal JSON string (never a bare number, even for a whole-number
+amount), `occurredAt` serializes as ISO-8601 UTC and matches the `Instant`
+passed in, `schemaVersion` is `1` for both event types, and two events
+built from identical inputs still get independently random `eventId`s
+(never derived from a hash or a mutable value).
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -404,9 +470,12 @@ Handling Tests" above.
 
 `IdempotencyIntegrationTest` (Task 10) — see "Idempotency Tests" above.
 
-Total: 186 tests (163 from Phase 1 Tasks 1–9, plus 21 in the new
-`IdempotencyIntegrationTest` and 2 new tests added to
-`OpenApiDocumentationIntegrationTest`, all introduced by Task 10).
+`OutboxIntegrationTest` and `OutboxEventFactoryTest` (Task 11) — see
+"Outbox Tests" above.
+
+Total: 221 tests (186 from Phase 1 + Task 10, plus 29 in the new
+`OutboxIntegrationTest` and 6 in the new `OutboxEventFactoryTest`, all
+introduced by Task 11).
 
 ## CI (implemented, Task 9)
 

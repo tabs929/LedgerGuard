@@ -183,3 +183,55 @@ the approved plan (see project history / plan file) and will be captured in
       gained 2 tests for the header contract and the 409 schema. No Kafka,
       outbox, settlement, reconciliation, or authentication were introduced
       — those remain for later Phase 2/3 tasks.
+- [x] 11. Transactional outbox — one `outbox_event` row is written for
+      every newly committed deposit or transfer, in the same PostgreSQL
+      transaction as the `ledger_transaction`, its two `ledger_entry`
+      rows, the balance updates, and the Task 10 `idempotency_key` row —
+      all commit or roll back together. New `outbox` package:
+      `OutboxAggregateType`/`OutboxEventType`, `OutboxEvent`/
+      `OutboxEventRepository` (new `outbox_event` table,
+      `V3__add_transactional_outbox.sql` — `V1`/`V2` unmodified),
+      `DepositCompletedEvent`/`TransferCompletedEvent` (the version-1
+      envelope records), and `OutboxEventFactory` (the single insertion
+      point both `DepositService`/`TransferService` call, right after
+      `entityManager.refresh(transaction)` picks up the ledger
+      transaction's real `createdAt`, still inside the same
+      `@Transactional` method — no `REQUIRES_NEW`, no after-commit hook).
+      Because the insertion point sits inside the private
+      `doDeposit`/`doTransfer` methods — reachable only from
+      `IdempotencyService`'s "not found, perform the operation" branch —
+      a Task 10 replay or conflict structurally never reaches it, so no
+      duplicate event is possible; `uq_outbox_event_identity` is a
+      database-level backstop for the same guarantee. Event content
+      (`id`/`aggregate_type`/`aggregate_id`/`event_type`/`schema_version`/
+      `payload`/`occurred_at`/`created_at`) is immutable — two triggers
+      reject `DELETE` outright and reject `UPDATE` of anything except the
+      one permitted `published_at` `NULL` → non-null transition. No
+      Kafka, publisher, consumer, scheduler, or background worker was
+      added — `published_at` is reserved for a later task. Verified by
+      `OutboxIntegrationTest` (29 tests, PostgreSQL Testcontainers):
+      deposit/transfer success and exact payload shape, idempotent replay
+      (including numerically-equivalent formatting) leaving exactly one
+      row, same- and cross-operation conflict creating no row, bounded-
+      timeout concurrency (identical requests commit one row; conflicting
+      requests create a row only for the winning command), rollback
+      (validation/domain/nonexistent-account failures and a forced
+      ledger-level database failure leave no row; a forced outbox-insertion
+      failure — a real, deterministic `CHECK (1=0) NOT VALID` constraint
+      added and dropped around the test — rolls back the ledger
+      transaction, entries, balances, and idempotency record together,
+      and the same key succeeds with exactly one event after the
+      constraint is removed), constraint checks (duplicate identity,
+      invalid aggregate/event type, non-positive schema version,
+      non-object payload, nonexistent aggregate id, immutability, no
+      delete, `published_at` transition rules), and migration checks
+      (V1/V2/V3 all apply from an empty schema, V1/V2 objects still
+      exist unchanged). `OutboxEventFactoryTest` (6 unit tests, Mockito)
+      covers payload construction, four-decimal monetary string
+      serialization, ISO-8601 `occurredAt` formatting, schema-version
+      constants, and that event ids are independently random per call.
+- [ ] 12. Kafka infrastructure and outbox publishing
+- [ ] 13. Kafka consumption and duplicate-event protection
+- [ ] 14. Settlement CSV import
+- [ ] 15. Reconciliation
+- [ ] 16. Phase 2 reliability, failure, and concurrency hardening

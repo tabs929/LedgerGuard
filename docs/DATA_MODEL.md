@@ -3,9 +3,10 @@
 > **Status: `account`/`ledger_transaction`/`ledger_entry` schema
 > implemented (Task 2, Flyway V1); account creation (Task 3), deposits
 > (Task 4), transfers (Task 5), account balance/transaction-history reads
-> (Task 6), and idempotency for deposits/transfers (Task 10, Flyway V2)
-> implemented.** The `V1` tables, constraints, indexes, and triggers
-> described below exist in the database via
+> (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), and
+> the transactional outbox (Task 11, Flyway V3) implemented.** The `V1`
+> tables, constraints, indexes, and triggers described below exist in the
+> database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
 > (unmodified since Task 2) and are verified by
 > `SchemaMigrationIntegrationTest`. `account`, `ledger_transaction`, and
@@ -16,8 +17,10 @@
 > it returns are two distinct things: the former is a cached number kept in
 > lockstep with the latter by every write path; the latter is the immutable
 > record those numbers are derived from. `idempotency_key`
-> (`V2__add_idempotency_key.sql`, Task 10) is a new, separate table — see
-> "Idempotency Key Table" below.
+> (`V2__add_idempotency_key.sql`, Task 10) and `outbox_event`
+> (`V3__add_transactional_outbox.sql`, Task 11) are both new, separate
+> tables — see "Idempotency Key Table" and "Outbox Event Table" below. `V1`
+> and `V2` are unmodified by Task 11.
 
 ## Account Taxonomy
 
@@ -251,6 +254,146 @@ already returned to the original caller.
 once per key, as the last statement of the same `@Transactional` deposit/
 transfer method that produced `ledger_transaction_id` — never updated
 afterward.
+
+## Outbox Event Table (Flyway V3, Task 11)
+
+A new, separate table — `V1` and `V2` are untouched. One row per
+completed deposit or transfer ledger transaction:
+
+```sql
+CREATE TABLE outbox_event (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type    VARCHAR(30) NOT NULL,
+    aggregate_id      UUID NOT NULL REFERENCES ledger_transaction(id),
+    event_type        VARCHAR(30) NOT NULL,
+    schema_version    INTEGER NOT NULL,
+    payload           JSONB NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at      TIMESTAMPTZ,
+
+    CONSTRAINT chk_outbox_aggregate_type CHECK (aggregate_type IN ('LEDGER_TRANSACTION')),
+    CONSTRAINT chk_outbox_event_type CHECK (event_type IN ('DEPOSIT_COMPLETED', 'TRANSFER_COMPLETED')),
+    CONSTRAINT chk_outbox_schema_version_positive CHECK (schema_version > 0),
+    CONSTRAINT chk_outbox_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT uq_outbox_event_identity UNIQUE (aggregate_type, aggregate_id, event_type)
+);
+
+CREATE INDEX idx_outbox_event_pending ON outbox_event (created_at, id)
+    WHERE published_at IS NULL;
+```
+
+- `id` — the event id. Assigned in Java (`UUID.randomUUID()`, via
+  `outbox.OutboxEventFactory`), not database-generated, so it is
+  guaranteed identical to the `eventId` field inside `payload`.
+- `aggregate_type`/`aggregate_id` — always `LEDGER_TRANSACTION` and the
+  `ledger_transaction.id` the event describes in Task 11 (no `ON DELETE
+  CASCADE` — an outbox row never silently disappears if its ledger
+  transaction were ever deleted, which the Task 2 immutability trigger
+  already prevents in practice).
+- `event_type` — `DEPOSIT_COMPLETED` or `TRANSFER_COMPLETED`.
+- `schema_version` — `1` for every event Task 11 produces; exists so a
+  future payload shape change can be introduced as version `2` without
+  breaking a reader of version `1` events already on the table.
+- `payload` — the full version-1 event envelope, stored as native
+  PostgreSQL `jsonb` (Hibernate's built-in `@JdbcTypeCode(SqlTypes.JSON)`,
+  no additional dependency), constrained to always be a JSON *object*
+  (`chk_outbox_payload_is_object`) — see "Version-1 Event Payloads" below
+  for the exact field set.
+- `occurred_at` — the same `Instant` as the referenced
+  `ledger_transaction.created_at` (read back via
+  `entityManager.refresh(transaction)` before the event is built — see
+  `docs/ARCHITECTURE.md`'s "Transactional Outbox" section) — when the
+  financial transaction actually happened, not when this row was written.
+- `created_at` — UTC, database-assigned (`DEFAULT now()`), when this
+  outbox row itself was persisted.
+- `published_at` — `NULL` for every row Task 11 ever writes. Reserved for
+  a future publisher task; the only mutation ever permitted on this table
+  is this one column moving from `NULL` to non-null, enforced by
+  `trg_outbox_event_immutable` (see "Outbox Event Immutability" below) —
+  never cleared, never overwritten once set.
+- `uq_outbox_event_identity` (`UNIQUE (aggregate_type, aggregate_id,
+  event_type)`) — at most one event of a given type per ledger
+  transaction. A defense-in-depth database backstop; the primary guarantee
+  that a Task 10 replay/conflict never creates a duplicate is structural
+  (the insertion point is unreachable from those code paths — see
+  `docs/ARCHITECTURE.md`).
+- `idx_outbox_event_pending` — a partial index over unpublished rows only,
+  ordered `(created_at, id)` for a deterministic, oldest-first scan —
+  sized and shaped for a future publisher's poll, not used by anything in
+  Task 11 itself. No attempt counts, retry timestamps, Kafka offsets,
+  consumer state, or broker/partition/topic metadata are added — those
+  belong to the task that actually publishes.
+
+### Version-1 Event Payloads
+
+`DEPOSIT_COMPLETED` (schema version 1):
+
+```json
+{
+  "eventId": "uuid",
+  "eventType": "DEPOSIT_COMPLETED",
+  "schemaVersion": 1,
+  "occurredAt": "2026-07-31T18:45:30.500000Z",
+  "transactionId": "uuid",
+  "destinationAccountId": "uuid",
+  "amount": "100.0000",
+  "currency": "USD"
+}
+```
+
+`TRANSFER_COMPLETED` (schema version 1):
+
+```json
+{
+  "eventId": "uuid",
+  "eventType": "TRANSFER_COMPLETED",
+  "schemaVersion": 1,
+  "occurredAt": "2026-07-31T18:45:30.500000Z",
+  "transactionId": "uuid",
+  "sourceAccountId": "uuid",
+  "destinationAccountId": "uuid",
+  "amount": "30.0000",
+  "currency": "USD"
+}
+```
+
+Exactly these fields, no more — never the raw `Idempotency-Key`, a
+password/token/credential/header, an account balance, a JPA entity, an
+exception detail, a Java class name, a stack trace, or a database
+constraint name. The deposit payload never includes the internal
+`SYSTEM`/`EXTERNAL_FUNDING` account id. `amount` is always a JSON string
+at the same four-decimal scale `DepositService`/`TransferService` already
+normalize to for the ledger write itself — never a bare JSON number.
+`occurredAt` is always an ISO-8601 UTC string. Both are built explicitly
+by `outbox.OutboxEventFactory` rather than left to the application's
+Jackson `ObjectMapper`'s default `BigDecimal`/`Instant` handling, so the
+wire format is deterministic regardless of Jackson configuration.
+
+### Outbox Event Immutability
+
+`outbox_event` rows are part of the durable event record and are treated
+the same way `ledger_entry`/`ledger_transaction` are (see "Ledger
+Immutability" below), with one deliberate difference: a single narrow
+mutation is permitted for the one column that exists specifically to
+record a future state transition.
+
+- `trg_outbox_event_no_delete` — a `BEFORE DELETE` trigger that
+  unconditionally rejects deletion, unconditionally, just like the Task 2
+  ledger triggers.
+- `trg_outbox_event_immutable` — a `BEFORE UPDATE` trigger that rejects
+  any change to `id`, `aggregate_type`, `aggregate_id`, `event_type`,
+  `schema_version`, `payload`, `occurred_at`, or `created_at`; separately
+  rejects any change to `published_at` once it is already non-null (no
+  clearing, no overwriting). The only update this trigger ever allows is
+  `published_at` moving from `NULL` to a non-null value, exactly once.
+
+No application code path can even attempt an edit — `OutboxEvent` (the
+JPA entity) exposes no setters — so these triggers are a database-level
+guarantee on top of an application-level one, the same reasoning
+`docs/ARCHITECTURE.md`'s "Ledger Immutability" section already gives for
+why a trigger is used instead of relying on differentiated database role
+grants (a single application database role in this project).
 
 ## Account Creation Enforcement (implemented, Task 3)
 
