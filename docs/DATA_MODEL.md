@@ -3,8 +3,13 @@
 > **Status: `account`/`ledger_transaction`/`ledger_entry` schema
 > implemented (Task 2, Flyway V1); account creation (Task 3), deposits
 > (Task 4), transfers (Task 5), account balance/transaction-history reads
-> (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), and
-> the transactional outbox (Task 11, Flyway V3) implemented.** The `V1`
+> (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), the
+> transactional outbox (Task 11, Flyway V3), and Kafka publishing of
+> pending outbox events (Task 12) implemented.** Task 12 added no new
+> migration — `V3`'s `published_at` column, its one-way-transition
+> trigger, and its pending partial index were already exactly what safe
+> publishing needed; see "Outbox Event Table" below for how `published_at`
+> is now actually used. The `V1`
 > tables, constraints, indexes, and triggers described below exist in the
 > database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
@@ -307,11 +312,17 @@ CREATE INDEX idx_outbox_event_pending ON outbox_event (created_at, id)
   financial transaction actually happened, not when this row was written.
 - `created_at` — UTC, database-assigned (`DEFAULT now()`), when this
   outbox row itself was persisted.
-- `published_at` — `NULL` for every row Task 11 ever writes. Reserved for
-  a future publisher task; the only mutation ever permitted on this table
-  is this one column moving from `NULL` to non-null, enforced by
-  `trg_outbox_event_immutable` (see "Outbox Event Immutability" below) —
-  never cleared, never overwritten once set.
+- `published_at` — `NULL` until Task 12's `OutboxPublisher` successfully
+  publishes the row to Kafka and receives a broker acknowledgement; set to
+  that moment's instant immediately afterward, and never before. The only
+  mutation ever permitted on this table is this one column moving from
+  `NULL` to non-null, enforced by `trg_outbox_event_immutable` (see
+  "Outbox Event Immutability" below) — never cleared, never overwritten
+  once set. `outbox.OutboxEventRepository.lockPendingById` (`SELECT ...
+  FOR UPDATE SKIP LOCKED WHERE published_at IS NULL`) is what makes
+  claiming a pending row safe across concurrent publishers, in one
+  instance or across many — see `docs/ARCHITECTURE.md`'s "Kafka
+  Publishing" section for the full mechanism.
 - `uq_outbox_event_identity` (`UNIQUE (aggregate_type, aggregate_id,
   event_type)`) — at most one event of a given type per ledger
   transaction. A defense-in-depth database backstop; the primary guarantee

@@ -5,17 +5,17 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–11 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–12 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
 transfers (Task 5), read-only account balance/transaction-history APIs
 (Task 6), centralized error handling (Task 7), OpenAPI/Swagger
 documentation (Task 8), continuous integration (Task 9), idempotency for
-deposits and transfers (Task 10), and a transactional outbox for durable
-event persistence (Task 11). Kafka, an event publisher/consumer,
-settlement/reconciliation, and authentication remain unimplemented — see
-`docs/TASKS.md`.
+deposits and transfers (Task 10), a transactional outbox for durable
+event persistence (Task 11), and publishing pending outbox events to
+Kafka (Task 12). A Kafka consumer, settlement/reconciliation, and
+authentication remain unimplemented — see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -186,17 +186,18 @@ updates, and the Idempotency-Key record above. All of it commits together
 or none of it does; there is no separate step and no way for one part to
 succeed while another fails.
 
-This is internal, durable persistence only — **no Kafka, publisher,
-consumer, or scheduler exists in this repository**, and no event has ever
-been published or delivered anywhere. `outbox_event.published_at` is
-reserved for a future task's publisher to mark rows with; every row this
-project writes today has `published_at = NULL`. A Task 10 replay of an
+A background publisher (Task 12 — see "Kafka Publishing" below) later
+sends each pending row to Kafka independently, without the deposit or
+transfer request ever depending on Kafka's availability.
+
+`outbox_event.published_at` is `NULL` until that publisher gets a
+successful broker acknowledgement for the row. A Task 10 replay of an
 already-completed deposit or transfer never inserts a second event for
 the same transaction — the insertion point is only reachable when a
 genuinely new financial write happens. Event rows are immutable (enforced
 by database triggers, not just application code): they can never be
-updated or deleted, except for the one future transition of
-`published_at` from `NULL` to a timestamp.
+updated or deleted, except for the one permitted transition of
+`published_at` from `NULL` to a timestamp, exactly once.
 
 The event payload never includes the internal `EXTERNAL_FUNDING` account
 id, the raw `Idempotency-Key`, account balances, or any internal
@@ -204,9 +205,36 @@ implementation detail — only the same kind of public fields already
 visible in the deposit/transfer response (transaction id, account id(s),
 amount as a four-decimal string, uppercase currency, and an ISO-8601 UTC
 timestamp matching the ledger transaction's own `createdAt`). See
-`docs/API_SPEC.md`'s note on Task 11 and `docs/ARCHITECTURE.md`'s
+`docs/API_SPEC.md`'s note on Tasks 11–12 and `docs/ARCHITECTURE.md`'s
 "Transactional Outbox" section for the full mechanism and the exact
 version-1 payload schemas.
+
+## Kafka Publishing
+
+A background poller (`OutboxPublisherScheduler`) periodically selects a
+bounded, deterministic batch of still-pending `outbox_event` rows
+(oldest first) and hands each one to a per-event publisher
+(`OutboxPublisher`) that, inside its own PostgreSQL transaction: claims
+the row with `SELECT ... FOR UPDATE SKIP LOCKED` (safe across any number
+of concurrent publisher threads or application instances — a row already
+claimed elsewhere is simply skipped, never blocked on), sends the stored
+payload to Kafka topic `ledger.transaction-events.v1` (configurable) with
+the ledger transaction id as the record key, waits synchronously for the
+broker's acknowledgement (`acks=all`, producer idempotence enabled), and
+**only after that acknowledgement** sets `published_at` and commits. A
+send failure leaves the row pending for a later polling cycle — it never
+fails the original deposit/transfer request, since publishing happens
+entirely after and independently of that request's own transaction.
+
+**This is at-least-once publication, not exactly-once delivery.** A crash
+between a successful Kafka acknowledgement and the `published_at` commit
+can cause the same event to be published again on a later retry — this
+window is real and is not hidden with Kafka transactions, `REQUIRES_NEW`,
+or two-phase commit (see `docs/ARCHITECTURE.md`'s "Kafka Publishing"
+section for exactly why). Every event's stable `eventId` is what will let
+a future consumer (Task 13) detect and discard such a duplicate. **No
+Kafka consumer exists in this repository yet** — Task 12 is publishing
+only.
 
 ## Technology Stack
 
@@ -216,15 +244,16 @@ version-1 payload schemas.
 - PostgreSQL (via Docker Compose for local development)
 - Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox)
 - Spring Data JPA
-- JUnit 5, Mockito, Testcontainers
+- Spring Kafka (Task 12 — publishing only, no consumer)
+- JUnit 5, Mockito, Testcontainers (including a Kafka Testcontainer)
 - Spring Boot Actuator
 - springdoc-openapi (OpenAPI 3 + Swagger UI)
 
 ## Prerequisites
 
 - Java 21 (Maven Wrapper handles Maven itself)
-- Docker (for PostgreSQL via Docker Compose, and for Testcontainers-based
-  integration tests)
+- Docker (for PostgreSQL and Kafka via Docker Compose, and for
+  Testcontainers-based integration tests)
 
 ## Environment Setup
 
@@ -233,17 +262,20 @@ version-1 payload schemas.
    cp .env.example .env
    ```
 2. Edit `.env` and set a real `POSTGRES_PASSWORD` (and optionally override
-   `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PORT`). `.env` is gitignored —
-   never commit it.
+   `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PORT`, `KAFKA_PORT`). `.env`
+   is gitignored — never commit it.
 
-## Running PostgreSQL
+## Running PostgreSQL and Kafka
 
 The application uses Spring Boot's Docker Compose support: when you run the
-application locally, it automatically starts the `postgres` service defined
-in `docker-compose.yml` using the values from `.env`. You do not need to run
-`docker compose up` manually — starting the application is enough.
+application locally, it automatically starts the `postgres` and `kafka`
+services defined in `docker-compose.yml` using the values from `.env`. You
+do not need to run `docker compose up` manually — starting the application
+is enough. Kafka runs as a single-node KRaft broker (no ZooKeeper),
+reachable at `localhost:${KAFKA_PORT:-9092}` — the same host:port
+`spring.kafka.bootstrap-servers` defaults to (see `application.yml`).
 
-If you want to start the database independently:
+If you want to start both independently:
 ```
 docker compose up -d
 ```
@@ -282,13 +314,54 @@ hand-maintained file, and covers exactly the five implemented endpoints
 (account creation, deposit, transfer, balance, transaction history) plus
 the shared error-response schema. No authentication scheme is declared.
 
+## Manually Verifying Kafka Publishing
+
+The steps below describe how to verify Task 12 end to end locally; they
+were not run as part of writing this documentation — treat them as
+instructions, not a claim that this exact sequence was executed.
+
+1. Start PostgreSQL and Kafka: `docker compose up -d` (or just start the
+   application — see "Running PostgreSQL and Kafka" above).
+2. Start the application with publisher scheduling enabled (the default):
+   `./mvnw spring-boot:run`.
+3. Submit a deposit with an Idempotency-Key:
+   ```
+   curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
+     -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
+     -d '{"amount": "100.00", "currency": "USD"}'
+   ```
+4. Inspect the topic with a console consumer:
+   ```
+   docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+     --bootstrap-server localhost:9092 \
+     --topic ledger.transaction-events.v1 \
+     --from-beginning --property print.key=true
+   ```
+5. Confirm the printed record's key is the deposit response's
+   `transactionId` (a plain UUID string).
+6. Confirm the printed JSON value matches the stored outbox payload —
+   `eventType: "DEPOSIT_COMPLETED"`, the same `transactionId`,
+   `destinationAccountId`, `amount` (four decimals), and `currency`.
+7. Confirm `published_at` is populated (non-null) for that row once the
+   next poll cycle runs (`ledgerguard.outbox.publisher.poll-delay-millis`,
+   default 2000ms).
+8. Retry the same deposit (same Idempotency-Key, same body).
+9. Confirm no second outbox row and no second Kafka record are produced —
+   the retry returns the identical original response.
+10. Stop Kafka (`docker compose stop kafka`), submit a new deposit with a
+    fresh Idempotency-Key, and confirm the request still succeeds (201)
+    and its `outbox_event` row's `published_at` remains `NULL`.
+11. Restart Kafka (`docker compose start kafka`) and confirm that pending
+    event is published on a later poll, without resubmitting the request.
+
 ## Running Tests
 
 ```
 ./mvnw verify
 ```
 
-This runs the full test suite (221 tests), including Testcontainers-backed
+This runs the full test suite (245 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
@@ -297,20 +370,32 @@ index, and trigger behaves as designed, an account-creation test suite, a
 deposit test suite, a transfer test suite, an account
 balance/transaction-history test suite, a global error-handling test
 suite, an OpenAPI documentation test suite, an idempotency test suite
-(Task 10), and an outbox test suite plus a small unit-test suite
-(Task 11). The idempotency suite verifies header validation, exact
-response replay, same- and cross-operation conflict detection, that a
-failed attempt never consumes the key, and — against real PostgreSQL
-advisory locking, never mocks or Java-only synchronization, with bounded
-timeouts rather than `Thread.sleep` — that concurrent requests sharing a
-key produce exactly one financial write. The outbox suite verifies exactly
-one event row per new deposit/transfer with the approved payload shape, no
-duplicate event on any idempotent replay (including concurrently), full
-rollback of the event alongside the ledger/idempotency state on any
-failure — including a forced, genuine outbox-insertion failure — and that
-every database-level constraint, immutability trigger, and the `V1`–`V3`
-migration sequence all behave exactly as documented. The deposit and
-transfer suites both verify balanced double-entry
+(Task 10), an outbox test suite plus a small unit-test suite (Task 11),
+and a Kafka publisher test suite plus a small configuration-validation
+unit-test suite (Task 12). The idempotency suite verifies header
+validation, exact response replay, same- and cross-operation conflict
+detection, that a failed attempt never consumes the key, and — against
+real PostgreSQL advisory locking, never mocks or Java-only
+synchronization, with bounded timeouts rather than `Thread.sleep` — that
+concurrent requests sharing a key produce exactly one financial write.
+The outbox suite verifies exactly one event row per new deposit/transfer
+with the approved payload shape, no duplicate event on any idempotent
+replay (including concurrently), full rollback of the event alongside
+the ledger/idempotency state on any failure — including a forced,
+genuine outbox-insertion failure — and that every database-level
+constraint, immutability trigger, and the `V1`–`V3` migration sequence
+all behave exactly as documented. The Kafka publisher suite runs against
+a **real Kafka Testcontainer** (never a mocked broker): it verifies topic/
+partition creation, exact key/value publication for both deposits and
+transfers, that idempotent replays and conflicts never produce a second
+record, that a genuine broker-connection failure leaves `published_at`
+unset without touching financial or idempotency state (and that the same
+event publishes successfully once retried against a working broker), that
+one failed candidate never blocks a later one, safe concurrent publishing
+of both the same event and distinct events, deterministic candidate
+ordering/bounded batching, and that the V3 immutability triggers remain
+fully effective after a real publish. The deposit and transfer suites
+both verify balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
 no Java-only synchronization) — the transfer suite additionally proves
@@ -355,14 +440,15 @@ reports are uploaded as a short-retention build artifact for diagnosis.
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
-  error-handling, API-documentation, CI, idempotency, and the
-  transactional outbox are all implemented)
+  error-handling, API-documentation, CI, idempotency, the transactional
+  outbox, and Kafka publishing are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
   (Flyway V1); account creation, deposits, and transfers all read/write
   them; the balance/history endpoints read all three but write none of
   them. `idempotency_key` (Flyway V2, Task 10) and `outbox_event`
-  (Flyway V3, Task 11) are both separate tables.
+  (Flyway V3, Task 11) are both separate tables; Task 12 added no new
+  migration.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET

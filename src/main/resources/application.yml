@@ -7,9 +7,42 @@ spring:
   jackson:
     deserialization:
       fail-on-unknown-properties: true
+  kafka:
+    # Overridable via the KAFKA_BOOTSTRAP_SERVERS environment variable in
+    # any environment where localhost:9092 (the local Compose broker,
+    # see docker-compose.yml) is not correct -- never hardcoded elsewhere.
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Durable acknowledgement (Task 12): the broker only acks after the
+      # record is written to every in-sync replica. Producer idempotence
+      # suppresses duplicate broker-retry sends within one producer
+      # session -- it does not close the PostgreSQL/Kafka crash window
+      # documented in docs/ARCHITECTURE.md's "Kafka Publishing" section,
+      # and it is not end-to-end exactly-once delivery.
+      acks: all
+      properties:
+        enable.idempotence: true
 
 springdoc:
   # Every endpoint in this application only ever produces application/json;
   # without this, springdoc documents responses as the generic "*/*"
   # wildcard instead of the actual, single content type the app returns.
   default-produces-media-type: application/json
+
+ledgerguard:
+  outbox:
+    publisher:
+      # Every PostgreSQL-only integration test overrides this to false via
+      # application-test.yml, specifically so it never attempts a Kafka
+      # connection. True here is the normal application default.
+      enabled: true
+      topic: ${LEDGER_EVENTS_TOPIC:ledger.transaction-events.v1}
+      partitions: 3
+      # Local/Testcontainers default only -- production should normally
+      # use a replication factor greater than 1.
+      replication-factor: 1
+      poll-delay-millis: 2000
+      batch-size: 20
+      send-timeout-millis: 5000

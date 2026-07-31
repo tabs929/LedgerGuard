@@ -1,9 +1,9 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
 > **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
-> has begun — Task 10 (idempotency for deposits and transfers) and Task 11
-> (transactional outbox) are also implemented. See `docs/TASKS.md` for the
-> per-task breakdown and what each one covered.
+> has begun — Task 10 (idempotency), Task 11 (transactional outbox), and
+> Task 12 (Kafka publishing of outbox events) are also implemented. See
+> `docs/TASKS.md` for the per-task breakdown and what each one covered.
 
 ## Scope
 
@@ -41,7 +41,12 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
 - Every newly committed deposit or transfer durably records exactly one
   domain event in a PostgreSQL transactional outbox, atomically with the
   financial write and the idempotency record (Phase 2, Task 11 — see
-  below); no event is published or delivered anywhere yet.
+  below).
+- Every pending outbox event is eventually published to Kafka, at least
+  once, by a polling publisher independent of the deposit/transfer
+  request itself — Kafka downtime never fails a financial request (Phase
+  2, Task 12 — see below). This is at-least-once publication, not
+  exactly-once delivery.
 - JPA entities are never returned directly from API endpoints.
 - PostgreSQL (via Testcontainers) is used for all persistence and
   transaction integration tests — H2 is never used as a substitute.
@@ -54,16 +59,26 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   currencies to match exactly.
 - **No authentication or authorization:** Spring Security and JWT are
   introduced in Phase 3. All Phase 1/2 endpoints are unauthenticated.
-- **No Kafka / event processing:** the outbox table exists and is written
-  atomically (Task 11), but nothing reads it — no publisher, no consumer,
-  no Kafka dependency of any kind. `outbox_event.published_at` exists and
-  is reserved for whichever future task adds the publisher.
+- **No Kafka consumer or business reaction to events:** Task 12 publishes
+  pending outbox events to Kafka; nothing in this project consumes them
+  yet — no `@KafkaListener`, no consumer group, no downstream business
+  logic, no settlement or reconciliation reaction. Task 13 adds
+  consumption and duplicate-event protection (keyed by the stable
+  `eventId`, since Task 12 is at-least-once, not exactly-once).
 - **No withdrawals:** only deposits (money entering via the internal
   `EXTERNAL_FUNDING` account) and transfers between customer accounts exist
   in Phase 1/2. A withdrawal operation is designed for structurally (see
   `docs/DATA_MODEL.md`) but not implemented.
 - **No reconciliation or settlement import:** still to come later in
   Phase 2.
+- **No exactly-once delivery:** Task 12 is at-least-once publication.
+  Kafka producer idempotence (enabled) suppresses duplicate broker-retry
+  sends within one producer session — it does not close the window
+  between a successful broker acknowledgement and the `published_at`
+  database commit. A crash in that window can cause the same event to be
+  published again on a later retry. No Kafka transactions, `REQUIRES_NEW`,
+  or two-phase commit are used to hide this — see
+  `docs/ARCHITECTURE.md`'s "Kafka Publishing" section.
 
 ## Phase 2 Progress
 
@@ -83,9 +98,16 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   exists yet — this is durable persistence only. See
   `docs/ARCHITECTURE.md`'s "Transactional Outbox" section and
   `docs/DATA_MODEL.md`'s "Outbox Event Table" section.
-- Kafka publishing/consumption, settlement CSV import, and reconciliation
-  are the remaining Phase 2 scope per `CLAUDE.md`; idempotency (Task 10)
-  and the transactional outbox (Task 11) are done so far.
+- **Task 12 — Kafka publishing (implemented):** pending `outbox_event` rows
+  are published to topic `ledger.transaction-events.v1` by a scheduled
+  poller, one PostgreSQL transaction per event, `FOR UPDATE SKIP LOCKED`
+  row-claiming for multi-instance safety, `published_at` set only after a
+  successful broker acknowledgement. At-least-once, not exactly-once. See
+  `docs/ARCHITECTURE.md`'s "Kafka Publishing" section.
+- Kafka consumption, settlement CSV import, and reconciliation are the
+  remaining Phase 2 scope per `CLAUDE.md`; idempotency (Task 10), the
+  transactional outbox (Task 11), and Kafka publishing (Task 12) are done
+  so far.
 
 ## Non-Goals
 

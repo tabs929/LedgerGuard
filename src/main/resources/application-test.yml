@@ -2,3 +2,13 @@ spring:
   docker:
     compose:
       enabled: false
+
+ledgerguard:
+  outbox:
+    publisher:
+      # Every PostgreSQL-only integration test runs under this "test"
+      # profile and never starts a Kafka broker -- disabling the
+      # publisher here is what keeps those tests from ever attempting a
+      # Kafka connection. OutboxPublisherIntegrationTest overrides this
+      # back to true alongside a real Kafka Testcontainer.
+      enabled: false

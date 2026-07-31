@@ -1,11 +1,13 @@
 # API Specification
 
 > **Status: Phase 1 (Tasks 1–9) complete. Phase 2, Task 10 (idempotency
-> for deposits and transfers) and Task 11 (transactional outbox)
-> implemented.** Task 11 adds no new endpoint, request field, response
-> field, status code, or header — the outbox is an internal persistence
-> detail (see `docs/ARCHITECTURE.md`'s "Transactional Outbox" section);
-> every contract below is unchanged from Task 10. `POST /api/v1/accounts`,
+> for deposits and transfers), Task 11 (transactional outbox), and Task 12
+> (Kafka publishing of outbox events) implemented.** Neither Task 11 nor
+> Task 12 adds any new endpoint, request field, response field, status
+> code, or header — the outbox and its Kafka publisher are both internal
+> persistence/background-processing details (see `docs/ARCHITECTURE.md`'s
+> "Transactional Outbox" and "Kafka Publishing" sections); every contract
+> below is unchanged from Task 10. `POST /api/v1/accounts`,
 > `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
 > /api/v1/accounts/{id}/balance`, and `GET
 > /api/v1/accounts/{id}/transactions` all exist and match the contracts
@@ -24,9 +26,8 @@
 > `GET /swagger-ui/index.html` — see "OpenAPI/Swagger" below. Plain
 > `GET /api/v1/accounts/{id}` remains unimplemented — no task has been
 > assigned it so far — no controller, service, or DTO exists for it yet.
-> Kafka, an event publisher/consumer, settlement/reconciliation, and
-> authentication remain unimplemented — see `docs/TASKS.md` for what
-> Tasks 12+ still cover.
+> A Kafka consumer, settlement/reconciliation, and authentication remain
+> unimplemented — see `docs/TASKS.md` for what Tasks 13+ still cover.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).

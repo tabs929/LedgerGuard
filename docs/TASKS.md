@@ -230,7 +230,74 @@ the approved plan (see project history / plan file) and will be captured in
       covers payload construction, four-decimal monetary string
       serialization, ISO-8601 `occurredAt` formatting, schema-version
       constants, and that event ids are independently random per call.
-- [ ] 12. Kafka infrastructure and outbox publishing
+- [x] 12. Kafka infrastructure and outbox publishing — pending
+      `outbox_event` rows (Task 11) are now published to Kafka topic
+      `ledger.transaction-events.v1` (configurable, 3 partitions,
+      replication factor 1 for local/Testcontainers use, application-managed
+      via a `NewTopic` bean). Each record: key = `aggregate_id` as a
+      standard UUID string, value = the exact stored `payload` JSON text
+      (never reconstructed or re-serialized), both UTF-8 strings. Producer:
+      `acks=all`, `enable.idempotence=true`, string key/value serializers —
+      durable acknowledgement, not end-to-end exactly-once. New `outbox`
+      classes: `OutboxPublisherProperties` (validated
+      `ledgerguard.outbox.publisher.*` config: `enabled`, `topic`,
+      `partitions`, `replication-factor`, `poll-delay-millis`,
+      `batch-size`, `send-timeout-millis`), `OutboxKafkaTopicConfig` (the
+      `NewTopic` bean, conditional on `enabled=true`),
+      `OutboxPublisherScheduler` (a `@Scheduled` poller, also conditional
+      on `enabled=true`, that selects a bounded, deterministic
+      `created_at ASC, id ASC` batch of pending event ids via the existing
+      V3 partial index and hands each to `OutboxPublisher` one at a time,
+      catching and logging one candidate's failure so later candidates in
+      the same pass are still attempted), and `OutboxPublisher` (a
+      separate `@Transactional` bean — self-invocation would bypass the
+      proxy — that per candidate: `SELECT ... FOR UPDATE SKIP LOCKED`
+      claims the still-pending row, sends synchronously to Kafka and
+      blocks for the broker acknowledgement, and only then calls
+      `OutboxEvent.markPublished(Instant)` — the one narrow mutator this
+      task adds to the otherwise-immutable entity — and commits; a
+      send/acknowledgement failure throws, rolling back that one
+      candidate's transaction alone, leaving `published_at` untouched for
+      a later polling cycle to retry). `SKIP LOCKED` is what lets multiple
+      publishers (in one instance or across many) safely race the same
+      row with no JVM-local locking: the loser's lock attempt returns
+      empty immediately rather than blocking, so only the winner ever
+      calls Kafka for that attempt. No batch-wide transaction — each event
+      commits independently, so one later failure can never roll back an
+      earlier already-acknowledged send back into "pending" (which would
+      itself manufacture an avoidable duplicate). Deposits/transfers are
+      completely unchanged — they still only ever write the outbox row;
+      Kafka downtime cannot fail a financial request. This provides
+      **at-least-once** publication only: a crash between a successful
+      Kafka acknowledgement and the `published_at` commit can cause the
+      same event to be republished later — never hidden via Kafka
+      transactions, `REQUIRES_NEW`, or marking published before sending.
+      `outbox_event.eventId` is what a future Task 13 consumer will use to
+      detect that duplicate. `V1`/`V2`/`V3` are unmodified; no `V4` was
+      needed — V3's `published_at` column, its one-way-transition trigger,
+      and its partial pending index were already exactly what safe
+      publishing needed. Every PostgreSQL-only integration suite disables
+      the publisher via `application-test.yml`
+      (`ledgerguard.outbox.publisher.enabled=false`) so it never attempts
+      a Kafka connection; local development gets a single-node KRaft
+      broker (`apache/kafka:3.8.0`, no ZooKeeper) added to
+      `docker-compose.yml`. Verified by `OutboxPublisherIntegrationTest`
+      (17 tests, real PostgreSQL 16.4 **and** real Kafka Testcontainers,
+      `apache/kafka:3.8.0`, no broker behavior mocked): topic/partition
+      creation, deposit/transfer publication with exact key/value/payload
+      matching, idempotent replay/conflict producing no extra record,
+      broker-failure leaving `published_at` null with financial/idempotency
+      state unchanged and the same event publishable after recovery, one
+      failed candidate not blocking a later one, two simultaneous workers
+      on one event producing exactly one record, multiple distinct events
+      publishing concurrently without deadlock, deterministic
+      candidate ordering/bounded batching, and that the V3 immutability
+      triggers remain fully effective after a real publish.
+      `OutboxPublisherPropertiesValidationTest` (7 unit tests) covers the
+      Jakarta Bean Validation constraints on every publisher property. No
+      `@KafkaListener`, consumer, or business reaction to an event was
+      added — Task 13 will add Kafka consumption and duplicate-event
+      protection.
 - [ ] 13. Kafka consumption and duplicate-event protection
 - [ ] 14. Settlement CSV import
 - [ ] 15. Reconciliation

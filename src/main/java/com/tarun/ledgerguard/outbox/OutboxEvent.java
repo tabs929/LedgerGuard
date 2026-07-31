@@ -23,8 +23,10 @@ import java.util.UUID;
  * {@code ledger_transaction} row — never independently of it. Immutable
  * once written except for the one future transition
  * {@code published_at NULL -> non-null}, enforced by the database
- * triggers in the V3 migration; this entity itself exposes no setters, so
- * there is no application code path that could even attempt an edit.
+ * triggers in the V3 migration and, on the application side, by exposing
+ * exactly one narrow mutator ({@link #markPublished(Instant)}) rather than
+ * a general setter — see {@code outbox.OutboxPublisher} (Task 12), the
+ * only caller.
  */
 @Entity
 @Table(name = "outbox_event")
@@ -62,7 +64,9 @@ public class OutboxEvent {
 	@Column(name = "created_at", nullable = false, updatable = false, insertable = false)
 	private Instant createdAt;
 
-	@Column(name = "published_at", updatable = false)
+	// The one column this entity permits mutating -- see markPublished()
+	// below. Every other field above stays updatable = false.
+	@Column(name = "published_at")
 	private Instant publishedAt;
 
 	protected OutboxEvent() {
@@ -114,6 +118,19 @@ public class OutboxEvent {
 
 	public Instant getPublishedAt() {
 		return publishedAt;
+	}
+
+	/**
+	 * Records a successful Kafka broker acknowledgement. Callers must only
+	 * invoke this after {@code kafkaTemplate.send(...)} has actually
+	 * completed successfully — never before sending, never speculatively.
+	 * The database trigger independently enforces that this can only ever
+	 * move {@code published_at} from {@code NULL} to non-null, exactly
+	 * once; this method does not attempt to duplicate that check
+	 * client-side, since the trigger is the actual source of truth.
+	 */
+	public void markPublished(Instant publishedAt) {
+		this.publishedAt = publishedAt;
 	}
 
 }

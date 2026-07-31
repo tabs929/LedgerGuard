@@ -1,18 +1,20 @@
 # Test Strategy
 
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
-> (idempotency) and Task 11 (transactional outbox), and every test runs
-> automatically in CI (Task 9) on every push/PR.** The connectivity smoke
-> test (Task 1), schema-verification tests (Task 2), account creation's
-> tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
-> (Task 4), transfer's ledger-balance/conservation/insufficient-funds/
-> rollback/deadlock-avoidance tests (Task 5), the balance/history read
-> tests (Task 6), the global error-envelope/validation/leakage tests
-> (Task 7), the OpenAPI document/schema-accuracy tests (Task 8), the
-> idempotency header/replay/conflict/rollback/concurrency tests (Task 10),
-> and the outbox event/replay/rollback/constraint/immutability tests
-> (Task 11) all exist (see "Currently Implemented" below) and all run in
-> `.github/workflows/ci.yml` (see "CI" below). Only `GET
+> (idempotency), Task 11 (transactional outbox), and Task 12 (Kafka
+> publishing), and every test runs automatically in CI (Task 9) on every
+> push/PR.** The connectivity smoke test (Task 1), schema-verification
+> tests (Task 2), account creation's tests (Task 3), deposit's
+> ledger-balance/rollback/concurrency tests (Task 4), transfer's
+> ledger-balance/conservation/insufficient-funds/rollback/
+> deadlock-avoidance tests (Task 5), the balance/history read tests
+> (Task 6), the global error-envelope/validation/leakage tests (Task 7),
+> the OpenAPI document/schema-accuracy tests (Task 8), the idempotency
+> header/replay/conflict/rollback/concurrency tests (Task 10), the outbox
+> event/replay/rollback/constraint/immutability tests (Task 11), and the
+> Kafka publisher tests (Task 12, real PostgreSQL **and** real Kafka
+> Testcontainers) all exist (see "Currently Implemented" below) and all
+> run in `.github/workflows/ci.yml` (see "CI" below). Only `GET
 > /api/v1/accounts/{id}` remains untested, since that plain-lookup
 > endpoint was never assigned to any task and so still doesn't exist.
 
@@ -36,6 +38,16 @@ service used for local development — the two are never conflated. The
 (`spring.docker.compose.enabled: false`) precisely so tests never
 accidentally depend on, or fight with, a developer's locally running
 Docker Compose Postgres.
+
+`OutboxPublisherIntegrationTest` (Task 12) additionally starts an
+isolated `apache/kafka:3.8.0` container (KRaft, no ZooKeeper) the same
+way, also via `@ServiceConnection`. Every other integration test suite
+disables the Kafka publisher entirely
+(`ledgerguard.outbox.publisher.enabled=false`, set once in the shared
+`application-test.yml`) specifically so it never attempts a Kafka
+connection — no `NewTopic` bean and no `@Scheduled` poller are even
+registered in those suites' contexts. No Kafka broker behavior is ever
+mocked in the one suite that does start Kafka.
 
 ## Schema-Level Tests (implemented, Task 2)
 
@@ -425,6 +437,73 @@ passed in, `schemaVersion` is `1` for both event types, and two events
 built from identical inputs still get independently random `eventId`s
 (never derived from a hash or a mutable value).
 
+## Outbox Publisher Tests (implemented, Task 12)
+
+`OutboxPublisherIntegrationTest` (17 tests) verifies Kafka publishing of
+pending `outbox_event` rows against **both** a real PostgreSQL 16.4
+Testcontainer and a real `apache/kafka:3.8.0` Testcontainer (KRaft, no
+ZooKeeper) — no Kafka broker acknowledgement is ever mocked. The shared
+`application-test.yml` publisher-disabled default is overridden back to
+`enabled=true` for this class only, alongside a deliberately long
+`poll-delay-millis` (an hour): almost every test calls
+`OutboxPublisher.publishIfPending(eventId)` directly for deterministic,
+immediate behavior, rather than racing a live wall-clock scheduler against
+its own assertions — exactly one test exercises the scheduler's own
+polling method directly to prove its candidate-selection-and-delegation
+logic, without depending on `@Scheduled` actually firing on a timer
+(Spring's own scheduling infrastructure is not this project's to
+re-prove). All waits that do remain (draining the real Kafka consumer
+used to inspect produced records) are bounded via Awaitility, never
+`Thread.sleep` as the correctness mechanism.
+
+- **Topic and producer configuration:** the configured topic exists with
+  the configured partition count (verified via a real `Admin` client); a
+  published record's key equals the ledger transaction id, the value is
+  valid JSON matching the stored payload field-for-field, and neither the
+  key, the value, nor any header ever contains the request's raw
+  `Idempotency-Key`.
+- **Deposit/transfer publication:** a successful deposit (and,
+  separately, a transfer) yields exactly one Kafka record with the
+  correct `eventType`, key, and payload fields (four-decimal `amount`,
+  uppercase `currency`), and `published_at` becomes non-null only after
+  that record is produced; financial and idempotency state are unchanged
+  by publication.
+- **Idempotency behavior:** an identical retry (including
+  numerically-equivalent formatting), a same-operation conflict, and a
+  cross-operation conflict all still produce exactly the one record the
+  original successful request's single outbox row accounts for — never a
+  second one.
+- **Failure behavior:** a real, unreachable-broker `OutboxPublisher`
+  instance (a genuine `KafkaTemplate` pointed at an address nothing
+  listens on — a real network-level failure, not a stub) leaves
+  `published_at` `NULL` and changes no financial or idempotency state; the
+  same event then publishes successfully once a working publisher is used
+  instead; a failing candidate immediately followed by a different,
+  healthy candidate in the same catch-and-continue shape
+  `OutboxPublisherScheduler` itself uses proves one failure never blocks
+  a later candidate.
+- **Multi-instance/concurrency behavior:** two publisher calls racing the
+  same pending event (via an `ExecutorService`, bounded `invokeAll`/
+  `get` timeouts) produce exactly one Kafka record and one `published_at`
+  transition; six distinct pending events published concurrently all
+  succeed with no deadlock.
+- **Ordering and batching:** `findPendingCandidateIds` returns
+  `outbox_event`'s own ids (never the ledger transaction id) in
+  `created_at ASC, id ASC` order, respects a small requested limit, and
+  excludes an already-published row.
+- **Database trigger behavior:** after a real publish, the stored payload
+  is byte-for-byte unchanged, and the same immutability/no-delete/
+  `published_at`-transition triggers `OutboxIntegrationTest` (Task 11)
+  already proved remain fully effective — a real publish is not a
+  privileged path around them.
+
+`OutboxPublisherPropertiesValidationTest` (7 unit tests, no Spring
+context) covers the Jakarta Bean Validation constraints on every
+`ledgerguard.outbox.publisher.*` property directly: the default
+configuration is valid, and a blank topic or a non-positive partitions/
+replication-factor/poll-delay/batch-size/send-timeout each produce a
+violation.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -473,9 +552,12 @@ Handling Tests" above.
 `OutboxIntegrationTest` and `OutboxEventFactoryTest` (Task 11) — see
 "Outbox Tests" above.
 
-Total: 221 tests (186 from Phase 1 + Task 10, plus 29 in the new
-`OutboxIntegrationTest` and 6 in the new `OutboxEventFactoryTest`, all
-introduced by Task 11).
+`OutboxPublisherIntegrationTest` and `OutboxPublisherPropertiesValidationTest`
+(Task 12) — see "Outbox Publisher Tests" above.
+
+Total: 245 tests (221 from Phase 1 + Tasks 10–11, plus 17 in the new
+`OutboxPublisherIntegrationTest` and 7 in the new
+`OutboxPublisherPropertiesValidationTest`, all introduced by Task 12).
 
 ## CI (implemented, Task 9)
 
@@ -491,6 +573,10 @@ no altered profiles. GitHub-hosted runners come with a Docker daemon
 already running, so Testcontainers starts real `postgres:16.4` containers
 on the runner exactly as it does on a developer's machine — no
 `docker-compose.yml` service container, no shared or long-lived database.
+The workflow file itself required no change for Task 12: the same runner
+Docker daemon also starts the real `apache/kafka:3.8.0` Testcontainer
+`OutboxPublisherIntegrationTest` needs, with no additional CI
+configuration.
 A failure at any stage (compilation, a unit test, an integration test,
 Spring context startup, a Flyway migration, an immutability-trigger check,
 a concurrency test, an OpenAPI schema-accuracy check — anything `verify`

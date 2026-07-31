@@ -55,6 +55,13 @@
 			<artifactId>flyway-database-postgresql</artifactId>
 		</dependency>
 		<dependency>
+			<!-- Task 12: publishes Task 11 outbox_event rows to Kafka. Spring
+			     Boot's dependency management aligns the spring-kafka and
+			     kafka-clients versions with 4.0.7, so no explicit version. -->
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-kafka</artifactId>
+		</dependency>
+		<dependency>
 			<!-- Generates the OpenAPI 3 document (/v3/api-docs) and serves
 			     Swagger UI (/swagger-ui/index.html) from the existing Spring
 			     MVC controllers/DTOs, no second web framework, no server
@@ -128,6 +135,13 @@
 		<dependency>
 			<groupId>org.testcontainers</groupId>
 			<artifactId>testcontainers-postgresql</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<!-- Real Kafka broker (KRaft, no ZooKeeper) for
+			     OutboxPublisherIntegrationTest, never mocked. -->
+			<groupId>org.testcontainers</groupId>
+			<artifactId>testcontainers-kafka</artifactId>
 			<scope>test</scope>
 		</dependency>
 	</dependencies>

@@ -1,33 +1,37 @@
 # Architecture
 
-> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency)
-> and 11 (transactional outbox) implemented.** Database layer (Task 2),
-> account creation (Task 3), deposits (Task 4), transfers (Task 5), account
-> balance/transaction-history reads (Task 6), global error handling
-> (Task 7), OpenAPI documentation (Task 8), CI (Task 9), idempotency for
-> deposits/transfers (Task 10), and the transactional outbox (Task 11) are
-> all implemented; only plain account lookup by id remains unimplemented —
-> no task has ever been assigned it. The `account` package has account
-> creation, deposit processing, and read-only account queries; the
-> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
+> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency),
+> 11 (transactional outbox), and 12 (Kafka publishing) implemented.**
+> Database layer (Task 2), account creation (Task 3), deposits (Task 4),
+> transfers (Task 5), account balance/transaction-history reads (Task 6),
+> global error handling (Task 7), OpenAPI documentation (Task 8), CI
+> (Task 9), idempotency for deposits/transfers (Task 10), the transactional
+> outbox (Task 11), and publishing pending outbox events to Kafka
+> (Task 12) are all implemented; only plain account lookup by id remains
+> unimplemented — no task has ever been assigned it. The `account` package
+> has account creation, deposit processing, and read-only account queries;
+> the `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
 > repositories/enums; the `transfer` package has transfer processing; the
 > `idempotency` package (Task 10) has the idempotency key record,
 > repository, command, service, and conflict exception — see "Idempotency"
-> below; the new `outbox` package (Task 11) has the outbox event record,
+> below; the `outbox` package (Task 11) has the outbox event record,
 > repository, event-type enums, the two version-1 event payload records,
-> and the event factory — see "Transactional Outbox" below. The `common`
-> package holds `PagedResponse<T>` (Task 6), `ApiError` and
-> `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
-> "API Documentation" below). Task 9 added `.github/workflows/ci.yml`
-> only — no application code, no new package, no behavior change (see
-> "Continuous Integration" at the end of this document). `GET
-> /api/v1/accounts/{id}` still does not exist, so the public-vs-internal
-> lookup split described below is still only partially realized (see that
-> section for exactly what deposits, transfers, and the read endpoints do
-> instead). Kafka, a publisher/consumer, settlement/reconciliation, and
-> authentication remain unimplemented — see `docs/TASKS.md` for what
-> Tasks 12+ still cover; Task 11 is durable event persistence only, no
-> event has ever been published or delivered.
+> and the event factory, and (Task 12) now also the publisher scheduler,
+> the per-event transactional publisher, the Kafka topic configuration,
+> and validated publisher properties — see "Transactional Outbox" and
+> "Kafka Publishing" below. The `common` package holds `PagedResponse<T>`
+> (Task 6), `ApiError` and `GlobalExceptionHandler` (Task 7), and
+> `OpenApiConfig` (Task 8 — see "API Documentation" below). Task 9 added
+> `.github/workflows/ci.yml` only — no application code, no new package,
+> no behavior change (see "Continuous Integration" at the end of this
+> document). `GET /api/v1/accounts/{id}` still does not exist, so the
+> public-vs-internal lookup split described below is still only partially
+> realized (see that section for exactly what deposits, transfers, and the
+> read endpoints do instead). A Kafka consumer, settlement/reconciliation,
+> and authentication remain unimplemented — see `docs/TASKS.md` for what
+> Tasks 13+ still cover; Task 12 provides **at-least-once** publication
+> only, never exactly-once, and adds no consumer or business reaction to
+> an event.
 
 ## Style
 
@@ -69,13 +73,16 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
   from inside `DepositService`/`TransferService`), and
   `IdempotencyConflictException` — see "Idempotency" below.
 
-- `outbox` — **implemented (Task 11)**: `OutboxAggregateType`/
+- `outbox` — **implemented (Tasks 11–12)**: `OutboxAggregateType`/
   `OutboxEventType` enums, `OutboxEvent` (JPA entity mapping the
   `outbox_event` table) and `OutboxEventRepository`,
   `DepositCompletedEvent`/`TransferCompletedEvent` (the version-1 event
   envelope records), and `OutboxEventFactory` (the single insertion point
-  `DepositService`/`TransferService` call) — see "Transactional Outbox"
-  below.
+  `DepositService`/`TransferService` call) from Task 11; `OutboxPublisherProperties`
+  (validated configuration), `OutboxKafkaTopicConfig` (the managed Kafka
+  topic), `OutboxPublisherScheduler` (candidate polling), and
+  `OutboxPublisher` (the per-event transactional publish) from Task 12 —
+  see "Transactional Outbox" and "Kafka Publishing" below.
 
 Packages named in `CLAUDE.md` for later phases (`settlement`,
 `reconciliation`, `security`, `audit`) are **not yet created** —
@@ -560,17 +567,274 @@ rejected, an `UPDATE` of `event_type` or `payload` is rejected, setting
 `published_at` from `NULL` to `now()` succeeds, and a further `UPDATE` of
 `published_at` (to `NULL` or to a new timestamp) is rejected.
 
-**`published_at` and the future publisher boundary.** `published_at` is
-`NULL` for every row Task 11 ever creates — nothing in this codebase sets
-it. It exists purely so a later task's publisher can poll
-`idx_outbox_event_pending` (a partial index, `WHERE published_at IS NULL`,
-ordered `(created_at, id)` for a deterministic, oldest-first scan) and
-mark a row as published after a successful send. Task 11 deliberately adds
-no attempt counts, retry timestamps, Kafka offsets, consumer state,
-broker/partition/topic metadata, background thread, or scheduler — those
-belong to the task that actually builds the publisher. No claim of
-delivery, publication, or exactly-once Kafka semantics is made anywhere in
-this project yet.
+**`published_at` and the publisher boundary.** `published_at` is `NULL`
+for every row until Task 12's publisher successfully sends it — nothing
+in Task 11 itself ever sets it. `idx_outbox_event_pending` (a partial
+index, `WHERE published_at IS NULL`, ordered `(created_at, id)` for a
+deterministic, oldest-first scan) exists precisely for that publisher's
+poll — see "Kafka Publishing" below for how Task 12 uses it. Task 11
+itself still adds no attempt counts, retry timestamps, Kafka offsets,
+consumer state, or broker/partition/topic metadata — Task 12 doesn't add
+any of those either (see below); this remains deliberately minimal retry
+state (`published_at` `NULL` vs. non-null only).
+
+## Kafka Publishing (implemented, Task 12)
+
+Publishes pending `outbox_event` rows (Task 11) to Kafka — durable,
+at-least-once persistence becomes durable, at-least-once *delivery*. This
+section covers only publication; nothing in this codebase consumes a
+published event yet (see `docs/TASKS.md`'s Task 13 entry).
+
+### Topic and record contract
+
+One topic, `ledger.transaction-events.v1` (configurable via
+`ledgerguard.outbox.publisher.topic`), managed by the application itself
+via a Spring Kafka `NewTopic` bean (`outbox.OutboxKafkaTopicConfig`) —
+never relying on broker auto-creation, so partition count and replication
+factor are explicit and reviewable rather than whatever a broker's
+defaults happen to be. Defaults: 3 partitions, replication factor 1 (a
+local/Testcontainers-only value — a real deployment should normally use a
+replication factor greater than 1, since 1 means no broker redundancy at
+all).
+
+Each Kafka record:
+- **key** — `outbox_event.aggregate_id` (the ledger transaction id) as a
+  standard UUID string. Every event for the same transaction — in
+  practice exactly one, per Task 11's `uq_outbox_event_identity` — lands
+  on the same partition, so a future consumer processing one partition at
+  a time never sees that transaction's events out of order relative to
+  each other.
+- **value** — `outbox_event.payload` *exactly as stored*, read straight
+  off the entity's `payload` field and handed to `KafkaTemplate.send(...)`
+  unchanged. Never deserialized and reserialized, never reconstructed
+  from `LedgerTransaction`/`LedgerEntry`, a request DTO, a response DTO,
+  or a fresh map — the Kafka value is provably identical to what
+  `OutboxIntegrationTest` (Task 11) already proved matches the version-1
+  envelope schema.
+- Both UTF-8 strings (`StringSerializer` for key and value —
+  `spring.kafka.producer.key-serializer`/`value-serializer` in
+  `application.yml`).
+- **No custom headers.** The key and JSON value are sufficient; nothing
+  is duplicated into a header, and in particular the raw `Idempotency-Key`
+  is never present anywhere in the key, value, or headers — it was never
+  part of the stored payload to begin with (see "Transactional Outbox"
+  above), and `OutboxPublisherIntegrationTest` asserts its absence
+  directly against a real consumed record.
+
+### Producer configuration
+
+`spring.kafka.producer`: `acks: all` (the broker only acknowledges after
+every in-sync replica has the record — the strongest durability the
+protocol offers) and `properties.enable.idempotence: true` (suppresses
+duplicate records from the *producer's own* broker-level retries within
+one send). Neither setting, together or apart, is end-to-end
+exactly-once delivery — see "At-least-once and the acknowledgement
+window" below for exactly why.
+
+### Publisher activation and scheduling
+
+`ledgerguard.outbox.publisher.*` (`OutboxPublisherProperties`, Jakarta
+Bean Validation-checked at startup — a blank topic, or a non-positive
+partition count/replication factor/poll delay/batch size/send timeout,
+fails application startup clearly rather than behaving unpredictably
+later): `enabled` (default `true`), `topic`, `partitions`,
+`replication-factor`, `poll-delay-millis`, `batch-size`,
+`send-timeout-millis`.
+
+`OutboxPublisherScheduler` (`@Scheduled(fixedDelayString = "${ledgerguard.outbox.publisher.poll-delay-millis}")`,
+`@EnableScheduling` added to `LedgerGuardApplication`) reads a bounded,
+deterministic batch of pending event **ids only** — never payloads —
+via `OutboxEventRepository.findPendingCandidateIds`, ordered
+`created_at ASC, id ASC` and backed directly by `idx_outbox_event_pending`,
+capped at `batch-size` (`LIMIT`, so a large backlog is never loaded
+entirely into memory). It then hands each candidate id, one at a time, to
+`OutboxPublisher.publishIfPending`, catching and logging any single
+candidate's failure so every later candidate in the same pass still gets
+its own attempt — one bad event never blocks the rest of the batch.
+
+Both `OutboxKafkaTopicConfig` and `OutboxPublisherScheduler` are
+`@ConditionalOnProperty(..., havingValue = "true")` on
+`ledgerguard.outbox.publisher.enabled`. Every PostgreSQL-only integration
+test suite sets this to `false` in the shared `application-test.yml`
+specifically so it never creates the `NewTopic` bean or registers the
+scheduled poll — meaning it never attempts a Kafka connection at all.
+Only `OutboxPublisherIntegrationTest` overrides it back to `true`,
+alongside a real Kafka Testcontainer.
+
+### Per-event transaction boundary and row-lock coordination
+
+`OutboxPublisherScheduler` and `OutboxPublisher` are deliberately two
+separate Spring beans — `OutboxPublisher.publishIfPending` is
+`@Transactional`, and calling it through self-invocation from within the
+same bean would silently bypass Spring's transactional AOP proxy, so the
+scheduler must call it on the *other* bean for that boundary to be real.
+There is no batch-wide transaction: each candidate gets its own
+independent PostgreSQL transaction, deliberately, because wrapping an
+entire batch in one transaction would mean a later candidate's send
+failure rolls back every earlier candidate's already-broker-acknowledged
+send back to "pending" too — manufacturing exactly the kind of avoidable
+duplicate this design otherwise goes out of its way to minimize.
+
+Per candidate, inside its own transaction (`OutboxEventRepository.lockPendingById`):
+
+```sql
+SELECT * FROM outbox_event WHERE id = :id AND published_at IS NULL
+FOR UPDATE SKIP LOCKED
+```
+
+1. **What concurrent publishers race on:** the same `outbox_event` row —
+   whether two threads in one instance, or two separate application
+   instances entirely, both attempting to claim the same still-pending
+   candidate at nearly the same moment.
+2. **Why only the row-lock owner sends the record:** `FOR UPDATE` is a
+   real PostgreSQL row lock; only one transaction can hold it on a given
+   row at a time. `OutboxPublisher` only calls `kafkaTemplate.send(...)`
+   *after* successfully obtaining that lock (i.e., after this query
+   returns a non-empty result) — a transaction that doesn't hold the lock
+   structurally never reaches the send call at all.
+3. **Why `SKIP LOCKED` avoids unnecessary blocking:** without it, a
+   second transaction racing for the same row would simply wait
+   (block) until the first releases its lock via commit/rollback — wasted
+   time for a row that transaction was never going to be allowed to claim
+   anyway. `SKIP LOCKED` instead excludes any already-locked row from the
+   result set immediately, so the loser's query returns empty right away.
+4. **Why a second publisher skips an owned row:** an empty result from
+   `lockPendingById` is treated as a plain no-op in `publishIfPending` —
+   no exception, no Kafka call, nothing logged as a failure, since
+   nothing actually went wrong; another transaction simply owns this
+   candidate right now.
+5. **Why an already-published row cannot be sent again during normal
+   operation:** `lockPendingById`'s own `WHERE ... published_at IS NULL`
+   excludes it from the lock attempt in the first place — a committed,
+   published row is never even a match.
+6. **Why no JVM-local lock is required, and why this works across
+   multiple application instances:** the coordination is entirely a
+   PostgreSQL row lock, held and released by the database itself for the
+   lifetime of one SQL transaction — there is no in-memory map, no
+   `synchronized` block, and nothing that assumes a single JVM. Any number
+   of application instances connected to the same PostgreSQL database
+   race on the exact same row-level lock, exactly as if they were threads
+   within one process; the database, not application code, is the single
+   source of coordination truth — the same principle every other
+   concurrency guarantee in this project (account-row locking, the Task 10
+   advisory lock) already relies on.
+
+### Successful publication and where `published_at` is set
+
+`OutboxPublisher.publishIfPending`, once the row is locked: calls
+`kafkaTemplate.send(topic, aggregateId.toString(), payload)` and blocks —
+via `CompletableFuture.get(sendTimeoutMillis, MILLISECONDS)` — for the
+broker's acknowledgement, synchronously, before doing anything else. Only
+*after* that call returns successfully does it call
+`OutboxEvent.markPublished(Instant.now())` — the one narrow mutator this
+task adds to the entity (previously fully immutable after Task 11) — and
+`repository.flush()`, surfacing any trigger/constraint problem inside
+this same transaction rather than at a later, unrelated flush point. The
+method then returns normally, and Spring commits the transaction,
+releasing the row lock. `published_at` is therefore never set before a
+real, successful acknowledgement, and the V3 `published_at NULL ->
+non-null` trigger remains the actual source of truth for what mutation is
+permitted — the entity's one mutator does not attempt to duplicate that
+check client-side.
+
+### Publication failure and retry
+
+If `send(...).get(...)` throws (a network failure, a broker-side
+rejection, or the bounded timeout expiring), `OutboxPublisher` wraps it in
+`OutboxPublishException` (unchecked) and lets it propagate — never
+caught and suppressed. Spring's default rollback-on-unchecked-exception
+behavior rolls back the whole per-event transaction: the row lock
+releases, `published_at` stays `NULL` (the `markPublished` call is never
+reached), and nothing about the event, the ledger, or the Task 10
+idempotency record changes. A concise, safe diagnostic is logged — the
+event id, its event type, and the exception's class name — never the full
+payload, never a stack trace at high frequency, never anything from the
+original HTTP request. The row remains a normal pending candidate for the
+next polling cycle (or the next candidate discovery call) to attempt
+again, with no special "retry" state beyond `published_at` still being
+`NULL` — exactly the minimal retry model `docs/TASKS.md`'s Task 12 entry
+describes.
+
+### Why financial requests never depend on Kafka
+
+`DepositService`/`TransferService` are completely unchanged by Task 12 —
+they still only ever write the `outbox_event` row (Task 11), inside the
+same transaction as the financial write, and return. No deposit or
+transfer request thread ever calls `OutboxPublisher` or touches
+`KafkaTemplate`. Publication happens later, independently, driven by
+`OutboxPublisherScheduler`'s own poll — so Kafka being completely down at
+the moment a deposit or transfer is submitted has no effect on that
+request's success; the event simply stays pending until the broker (or
+network) recovers and a later poll publishes it.
+
+### Why a Task 10 replay produces no duplicate record
+
+Unchanged from Task 11's own reasoning (see "Transactional Outbox"
+above): `OutboxEventFactory` — the only code that ever inserts a new
+`outbox_event` row — is reachable only from the `IdempotencyService`
+branch that performs a genuinely new financial write. A replay or
+conflict never reaches it, so there is never a second row for Task 12 to
+publish in the first place; `uq_outbox_event_identity` remains the
+database-level backstop for the same guarantee.
+
+### At-least-once and the acknowledgement window
+
+Exact semantics, matching `docs/TASKS.md`'s Task 12 entry and
+`docs/REQUIREMENTS.md`:
+
+- **Before Kafka acknowledgement:** `published_at` is `NULL`. If the
+  process crashes, the send never completed, or the timeout expires, the
+  row is untouched and a later poll retries it from scratch.
+- **After Kafka acknowledgement but before the PostgreSQL `published_at`
+  commit:** Kafka already durably has the record. If the process crashes,
+  or the `UPDATE`/commit itself fails, the row is still `published_at IS
+  NULL` — a later poll will claim it again and publish it *again*,
+  producing a second, distinct Kafka record for the same event.
+- **After the PostgreSQL commit:** `lockPendingById`'s `WHERE published_at
+  IS NULL` excludes the row from every future candidate selection —
+  normal polling never revisits it.
+
+This is why Task 12 provides **at-least-once** publication, never
+exactly-once: the second window above is a real, unavoidable gap without
+a distributed (two-phase) transaction spanning PostgreSQL and Kafka, which
+this task deliberately does not add (see below). The stable `eventId`
+already present in every payload (Task 11) is exactly what lets a future
+Task 13 consumer detect and discard that duplicate.
+
+**Why Kafka producer idempotence does not close this window.**
+`enable.idempotence=true` makes the *producer* de-duplicate its own
+retried sends within one broker session (e.g. a retried send after a
+transient network blip, before this call returns) — it says nothing about
+what happens *after* this call already returned successfully. It is
+scoped to one producer instance's in-flight requests, not to surviving a
+process crash or restart; a brand new publish attempt after a crash is,
+from the idempotent producer's perspective, an entirely new, legitimate
+send, not a retry it would suppress.
+
+**Why this is not hidden with Kafka transactions, `REQUIRES_NEW`, or
+two-phase commit.** A Kafka transaction can make a *set of Kafka writes*
+atomic with each other, but it cannot make a single PostgreSQL commit and
+a single Kafka send atomic with *each other* — that would require a
+genuine distributed transaction (e.g. XA) spanning both systems, which
+this task does not introduce (per the Task 12 contract). `REQUIRES_NEW`
+would only create a second, independent PostgreSQL transaction — it does
+nothing to link that transaction's fate to the Kafka call's outcome, and
+was explicitly rejected for the same reason Task 10/11 rejected it
+elsewhere in this project. Marking `published_at` *before* sending, or
+deleting the outbox row after sending, would each trade the current
+"maybe published twice" risk for a strictly worse "maybe never published
+at all" risk — never done here.
+
+### No Kafka dependency beyond publishing
+
+`spring-boot-starter-kafka` (production) and `testcontainers-kafka` (test
+only) are the only two dependencies this task adds. No Kafka Streams, no
+Spring Cloud Stream, no Avro, no Schema Registry, no Kafka Connect, no
+Debezium, no ZooKeeper (the Testcontainers broker and the local Compose
+broker are both single-node KRaft), and no external outbox library. No
+`@KafkaListener`, no consumer factory, no consumer group business logic,
+and no settlement/reconciliation code exist anywhere in this codebase —
+Task 13 is the first task that will add consumption.
 
 ## Ledger Immutability (implemented, Task 2)
 
