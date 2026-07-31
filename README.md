@@ -5,19 +5,30 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9)
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Task 10 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
 transfers (Task 5), read-only account balance/transaction-history APIs
 (Task 6), centralized error handling (Task 7), OpenAPI/Swagger
-documentation (Task 8), and continuous integration (Task 9).
+documentation (Task 8), continuous integration (Task 9), and idempotency
+for deposits and transfers (Task 10 — the first Phase 2 task). Kafka, an
+outbox, settlement/reconciliation, and authentication remain unimplemented
+— see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
 and the server-assigned `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET` taxonomy —
 a client cannot choose the account category, class, purpose, currency
 (other than USD), initial balance, id, or creation timestamp.
+
+`POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
+**require an `Idempotency-Key` request header** (1–128 characters,
+`[A-Za-z0-9._:-]`). A retry with the same key and the same amount/currency/
+account(s) replays the exact original response instead of creating a new
+transaction; a retry with the same key but *different* request data —
+including reusing a deposit's key against `/transfers` or vice versa —
+returns `409 Conflict`. See "Idempotency" below.
 
 `POST /api/v1/accounts/{id}/deposits` deposits USD into a customer wallet.
 **Every deposit is an atomic, balanced double-entry ledger transaction**:
@@ -89,9 +100,80 @@ Testcontainers, with no tests skipped. See "Continuous Integration" below.
 
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
 implemented** — no task has been assigned it so far. There is also no
-authentication, no Kafka/event processing, and no reconciliation — those
-are explicitly out of scope until later phases per `docs/TASKS.md` and
-`CLAUDE.md`.
+authentication, no Kafka/event processing/outbox, and no
+settlement/reconciliation — those are explicitly out of scope until later
+Phase 2/3 tasks per `docs/TASKS.md` and `CLAUDE.md`.
+
+## Idempotency
+
+`POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` are the
+only two endpoints that require an `Idempotency-Key` header — account
+creation and both read endpoints do not. The key makes each operation safe
+to retry (e.g. after a network timeout):
+
+- **Replay:** the same key with the same amount/currency/account(s) always
+  returns the exact original response (same status, same body) — no new
+  `ledger_transaction`, no new `ledger_entry` rows, no balance change,
+  however many times it's retried.
+- **Conflict:** the same key with *different* request data — a different
+  amount, currency, account, or the other endpoint entirely (a deposit key
+  replayed against `/transfers`, or vice versa) — returns `409 Conflict`.
+- **Failed attempts don't consume the key:** if the underlying request
+  fails (validation, insufficient funds, account not found, or a database
+  error), no key is claimed — the same key can be retried once the problem
+  is fixed.
+- **Concurrency is PostgreSQL-native, not in-memory:** concurrent requests
+  sharing the same key are serialized by a PostgreSQL transaction-scoped
+  advisory lock, so exactly one financial write ever happens per key — this
+  holds even across multiple application instances, since the lock lives
+  in the database, not the JVM. See `docs/ARCHITECTURE.md`'s "Idempotency"
+  section for the full mechanism.
+- **Retention is indefinite** in Phase 2 — no expiry, no cleanup job, no
+  delete endpoint.
+
+Example (curl):
+
+```
+curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
+  -d '{"amount": "100.00", "currency": "USD"}'
+
+# Retrying with the same key and body replays the first response exactly:
+curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
+  -d '{"amount": "100.00", "currency": "USD"}'
+
+# Same key, different amount -> 409 Conflict:
+curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
+  -d '{"amount": "200.00", "currency": "USD"}'
+
+curl -i -X POST http://localhost:8080/api/v1/transfers \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
+  -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<destination-id>", "amount": "40.00", "currency": "USD"}'
+
+# Retrying with the same key and body replays the first response exactly:
+curl -i -X POST http://localhost:8080/api/v1/transfers \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
+  -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<destination-id>", "amount": "40.00", "currency": "USD"}'
+
+# Same key, different destination -> 409 Conflict:
+curl -i -X POST http://localhost:8080/api/v1/transfers \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
+  -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<other-destination-id>", "amount": "40.00", "currency": "USD"}'
+```
+
+These examples are illustrative (placeholder account ids) — they were not
+run against a live server as part of this task; behavior is verified by
+`IdempotencyIntegrationTest` against real PostgreSQL Testcontainers
+instead. You can also exercise the header interactively via Swagger UI
+(see below), which documents it as a required parameter on both endpoints.
 
 ## Technology Stack
 
@@ -173,15 +255,21 @@ the shared error-response schema. No authentication scheme is declared.
 ./mvnw verify
 ```
 
-This runs the full test suite, including Testcontainers-backed integration
-tests that each start an isolated PostgreSQL container (independent of the
-Docker Compose service above): a connectivity smoke test (`SELECT 1`
-against the datasource), a schema-verification test that confirms the
-Flyway migration applies and every table, constraint, index, and trigger
-behaves as designed, an account-creation test suite, a deposit test suite,
-a transfer test suite, an account balance/transaction-history test suite,
-a global error-handling test suite, and an OpenAPI documentation test
-suite. The deposit and transfer suites both verify balanced double-entry
+This runs the full test suite (186 tests), including Testcontainers-backed
+integration tests that each start an isolated PostgreSQL container
+(independent of the Docker Compose service above): a connectivity smoke
+test (`SELECT 1` against the datasource), a schema-verification test that
+confirms both Flyway migrations apply and every table, constraint, index,
+and trigger behaves as designed, an account-creation test suite, a deposit
+test suite, a transfer test suite, an account balance/transaction-history
+test suite, a global error-handling test suite, an OpenAPI documentation
+test suite, and an idempotency test suite (Task 10). The idempotency suite
+verifies header validation, exact response replay, same- and
+cross-operation conflict detection, that a failed attempt never consumes
+the key, and — against real PostgreSQL advisory locking, never mocks or
+Java-only synchronization, with bounded timeouts rather than
+`Thread.sleep` — that concurrent requests sharing a key produce exactly one
+financial write. The deposit and transfer suites both verify balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
 no Java-only synchronization) — the transfer suite additionally proves
@@ -226,18 +314,19 @@ reports are uploaded as a short-retention build artifact for diagnosis.
   limitations
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
-  error-handling, API-documentation, and CI are all implemented)
+  error-handling, API-documentation, CI, and idempotency are all
+  implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
-  The schema is implemented (Flyway V1); account creation, deposits, and
-  transfers all read/write `account`, `ledger_transaction`, and
-  `ledger_entry`; the balance/history endpoints read all three but write
-  none of them.
+  The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
+  (Flyway V1); account creation, deposits, and transfers all read/write
+  them; the balance/history endpoints read all three but write none of
+  them. `idempotency_key` (Flyway V2, Task 10) is a separate table.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET
   /api/v1/accounts/{id}/transactions` are all implemented and documented
-  exactly as built, including the shared error-response contract and the
-  now-implemented OpenAPI/Swagger endpoints; the remaining endpoints are
-  still planned contracts.
-- `docs/TEST_STRATEGY.md` — testing approach for Phase 1; every test suite
-  is implemented and all of them now run automatically in CI (Task 9)
+  exactly as built, including the shared error-response contract, the
+  OpenAPI/Swagger endpoints, and the `Idempotency-Key` contract (Task 10);
+  the remaining endpoints are still planned contracts.
+- `docs/TEST_STRATEGY.md` — testing approach for Phase 1/2; every test
+  suite is implemented and all of them run automatically in CI (Task 9)

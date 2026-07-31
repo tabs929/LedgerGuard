@@ -18,12 +18,14 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.Pattern;
 import org.springframework.http.HttpStatus;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -103,13 +105,30 @@ public class AccountController {
 					+ "CUSTOMER/LIABILITY/CUSTOMER_WALLET, treated identically to a nonexistent id",
 					content = @Content(schema = @Schema(implementation = ApiError.class))),
 			@ApiResponse(responseCode = "422", description = "currency is well-formed but not USD",
+					content = @Content(schema = @Schema(implementation = ApiError.class))),
+			@ApiResponse(responseCode = "409", description = "The Idempotency-Key was already used for a "
+					+ "different deposit or transfer command",
 					content = @Content(schema = @Schema(implementation = ApiError.class)))
 	})
 	public DepositResponse deposit(
 			@Parameter(description = "Customer wallet account id", required = true)
 			@PathVariable("id") UUID accountId,
-			@Valid @RequestBody DepositRequest request) {
-		return depositService.deposit(accountId, request);
+			@Valid @RequestBody DepositRequest request,
+			@Parameter(description = "Client-supplied key that makes this deposit safe to retry. The first "
+					+ "request for a given key executes it and stores the response; every later request "
+					+ "with the same key and the same amount/currency/account replays that exact original "
+					+ "response instead of creating a new transaction. Reusing the key with a different "
+					+ "amount, currency, account, or against the other endpoint (deposit vs. transfer) is a "
+					+ "409 conflict.",
+					required = true,
+					example = "8f14e45f-ceea-467e-bd48-9ffb2f9d1a30",
+					schema = @Schema(type = "string", minLength = 1, maxLength = 128,
+							pattern = "^[A-Za-z0-9._:-]{1,128}$"))
+			@RequestHeader("Idempotency-Key")
+			@Pattern(regexp = "^[A-Za-z0-9._:-]{1,128}$",
+					message = "must be 1-128 characters from [A-Za-z0-9._:-]")
+			String idempotencyKey) {
+		return depositService.deposit(accountId, request, idempotencyKey);
 	}
 
 	@GetMapping("/{id}/balance")

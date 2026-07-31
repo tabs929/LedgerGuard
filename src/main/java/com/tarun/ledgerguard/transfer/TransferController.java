@@ -4,15 +4,19 @@ import com.tarun.ledgerguard.common.ApiError;
 import com.tarun.ledgerguard.transfer.dto.TransferRequest;
 import com.tarun.ledgerguard.transfer.dto.TransferResponse;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
 import org.springframework.http.HttpStatus;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
@@ -28,6 +32,7 @@ import org.springframework.web.bind.annotation.RestController;
  * docs/ARCHITECTURE.md's "Error Handling" section for the complete
  * mapping (Task 7).
  */
+@Validated
 @RestController
 @RequestMapping("/api/v1/transfers")
 @Tag(name = "Transfers", description = "Customer-to-customer USD transfers.")
@@ -61,10 +66,28 @@ public class TransferController {
 					content = @Content(schema = @Schema(implementation = ApiError.class))),
 			@ApiResponse(responseCode = "422", description = "Insufficient funds, currency is well-formed "
 					+ "but not USD, or sourceAccountId == destinationAccountId",
+					content = @Content(schema = @Schema(implementation = ApiError.class))),
+			@ApiResponse(responseCode = "409", description = "The Idempotency-Key was already used for a "
+					+ "different deposit or transfer command",
 					content = @Content(schema = @Schema(implementation = ApiError.class)))
 	})
-	public TransferResponse transfer(@Valid @RequestBody TransferRequest request) {
-		return transferService.transfer(request);
+	public TransferResponse transfer(
+			@Valid @RequestBody TransferRequest request,
+			@Parameter(description = "Client-supplied key that makes this transfer safe to retry. The first "
+					+ "request for a given key executes it and stores the response; every later request "
+					+ "with the same key and the same amount/currency/accounts replays that exact original "
+					+ "response instead of creating a new transaction. Reusing the key with a different "
+					+ "amount, currency, account, or against the other endpoint (deposit vs. transfer) is a "
+					+ "409 conflict.",
+					required = true,
+					example = "8f14e45f-ceea-467e-bd48-9ffb2f9d1a30",
+					schema = @Schema(type = "string", minLength = 1, maxLength = 128,
+							pattern = "^[A-Za-z0-9._:-]{1,128}$"))
+			@RequestHeader("Idempotency-Key")
+			@Pattern(regexp = "^[A-Za-z0-9._:-]{1,128}$",
+					message = "must be 1-128 characters from [A-Za-z0-9._:-]")
+			String idempotencyKey) {
+		return transferService.transfer(request, idempotencyKey);
 	}
 
 }

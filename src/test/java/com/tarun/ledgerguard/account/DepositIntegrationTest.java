@@ -351,6 +351,7 @@ class DepositIntegrationTest {
 	private ResponseEntity<DepositResponse> postDeposit(UUID accountId, Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(body, headers), DepositResponse.class);
 	}
@@ -358,6 +359,7 @@ class DepositIntegrationTest {
 	private ResponseEntity<String> postDepositRaw(UUID accountId, Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		try {
 			String json = JSON.writeValueAsString(body);
 			return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",

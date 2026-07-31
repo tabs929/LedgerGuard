@@ -532,6 +532,7 @@ class GlobalExceptionHandlingIntegrationTest {
 		try {
 			HttpHeaders headers = new HttpHeaders();
 			headers.setContentType(MediaType.APPLICATION_JSON);
+			headers.set("Idempotency-Key", UUID.randomUUID().toString());
 			String json = JSON.writeValueAsString(body);
 			return restTemplate.postForEntity(path, new HttpEntity<>(json, headers), String.class);
 		}
@@ -543,6 +544,7 @@ class GlobalExceptionHandlingIntegrationTest {
 	private HttpEntity<Map<String, Object>> entity(Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return new HttpEntity<>(body, headers);
 	}
 

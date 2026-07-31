@@ -5,6 +5,7 @@ import com.tarun.ledgerguard.account.CurrencyMismatchException;
 import com.tarun.ledgerguard.account.InsufficientFundsException;
 import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
+import com.tarun.ledgerguard.idempotency.IdempotencyConflictException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
@@ -15,6 +16,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
@@ -64,7 +66,26 @@ public class GlobalExceptionHandler {
 		return build(HttpStatus.UNPROCESSABLE_CONTENT, ex.getMessage(), request);
 	}
 
+	// -- idempotency (Task 10) --------------------------------------------
+
+	// Idempotency-Key reused for a command that does not canonically match
+	// the one it was first claimed for (including reuse across deposit vs.
+	// transfer). ex.getMessage() is safe to return here -- it never
+	// contains anything beyond the key itself.
+	@ExceptionHandler(IdempotencyConflictException.class)
+	public ResponseEntity<ApiError> handleIdempotencyConflict(IdempotencyConflictException ex, HttpServletRequest request) {
+		return build(HttpStatus.CONFLICT, ex.getMessage(), request);
+	}
+
 	// -- request-shape validation (400) ----------------------------------
+
+	// The required Idempotency-Key header (deposits, transfers) is absent
+	// entirely. A blank/too-long/invalid-character value is instead caught
+	// by @Pattern below (ConstraintViolationException).
+	@ExceptionHandler(MissingRequestHeaderException.class)
+	public ResponseEntity<ApiError> handleMissingHeader(MissingRequestHeaderException ex, HttpServletRequest request) {
+		return build(HttpStatus.BAD_REQUEST, ex.getHeaderName() + ": header is required.", request);
+	}
 
 	// @Valid @RequestBody failures: blank/missing fields, non-positive or
 	// out-of-precision amounts, malformed currency pattern, etc. Multiple

@@ -1,24 +1,27 @@
 # API Specification
 
-> **Status: account creation (Task 3), deposits (Task 4), transfers
-> (Task 5), account balance/transaction-history reads (Task 6), global
-> error handling (Task 7), and OpenAPI documentation (Task 8) implemented;
-> CI (Task 9) is still planning.** `POST /api/v1/accounts`, `POST
-> /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
+> **Status: Phase 1 (Tasks 1–9) complete. Phase 2, Task 10 (idempotency
+> for deposits and transfers) implemented.** `POST /api/v1/accounts`,
+> `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
 > /api/v1/accounts/{id}/balance`, and `GET
 > /api/v1/accounts/{id}/transactions` all exist and match the contracts
 > below exactly. Both deposits and transfers are USD-only and always post
 > a balanced double-entry ledger transaction in the same database
 > transaction as the materialized balance updates; the two read endpoints
-> never modify that state. Every documented error response, from every
+> never modify that state. `POST /api/v1/accounts/{id}/deposits` and
+> `POST /api/v1/transfers` additionally require an `Idempotency-Key`
+> request header (Task 10) — see each endpoint's section below and
+> "Idempotency" further down. Every documented error response, from every
 > endpoint, goes through one centralized `@RestControllerAdvice`
 > (`common.GlobalExceptionHandler`) and matches the "Error Response Shape"
 > section below exactly. All five endpoints, every request/response
-> schema, and this exact error envelope are now also machine-readable at
+> schema, and this exact error envelope are also machine-readable at
 > `GET /v3/api-docs` (OpenAPI 3.1 JSON) and browsable at
 > `GET /swagger-ui/index.html` — see "OpenAPI/Swagger" below. Plain
 > `GET /api/v1/accounts/{id}` remains unimplemented — no task has been
 > assigned it so far — no controller, service, or DTO exists for it yet.
+> Kafka, an outbox, settlement/reconciliation, and authentication remain
+> unimplemented — see `docs/TASKS.md` for what Tasks 11+ still cover.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -56,7 +59,9 @@ Response 404: not found — including when `{id}` is a `SYSTEM` account, which
 is treated identically to a nonexistent id (see `docs/ARCHITECTURE.md` on
 public vs. internal account lookup).
 
-## POST /api/v1/accounts/{id}/deposits (implemented, Task 4)
+## POST /api/v1/accounts/{id}/deposits (implemented, Task 4; idempotent, Task 10)
+
+Required header: `Idempotency-Key: <1-128 chars from [A-Za-z0-9._:-]>`
 
 Request: `{ "amount": "100.00", "currency": "USD" }`
 
@@ -78,16 +83,22 @@ digits (matching `NUMERIC(19,4)`) — anything outside that shape is
 rejected as a validation error rather than silently rounded.
 
 Errors:
-- 400 validation — missing/non-positive/malformed `amount`, an amount with
-  unsupported precision or scale, missing or malformed `currency`, or an
-  unrecognized JSON property.
+- 400 validation — missing/blank/too-long/invalid-character
+  `Idempotency-Key` header, missing/non-positive/malformed `amount`, an
+  amount with unsupported precision or scale, missing or malformed
+  `currency`, or an unrecognized JSON property.
 - 404 account not found — including when `{id}` is a `SYSTEM` account
   (treated identically to a nonexistent id) or any account that is not a
   `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`.
+- 409 idempotency conflict — `Idempotency-Key` was already used for a
+  command with a different amount, currency, or account, or was already
+  used against `POST /api/v1/transfers`. See "Idempotency" below.
 - 422 currency mismatch — `currency` is a well-formed but non-`USD` code,
   or (in principle) the destination account's own currency is not `USD`.
 
-## POST /api/v1/transfers (implemented, Task 5)
+## POST /api/v1/transfers (implemented, Task 5; idempotent, Task 10)
+
+Required header: `Idempotency-Key: <1-128 chars from [A-Za-z0-9._:-]>`
 
 Request: `{ "sourceAccountId": uuid, "destinationAccountId": uuid, "amount": "50.00", "currency": "USD" }`
 
@@ -119,12 +130,17 @@ error rather than silently rounded. A transfer for exactly the source's
 full balance is allowed and leaves it at exactly zero.
 
 Errors:
-- 400 validation — missing/non-positive/malformed `amount`, an amount with
-  unsupported precision or scale, missing source/destination id, missing
-  or malformed `currency`, or an unrecognized JSON property.
+- 400 validation — missing/blank/too-long/invalid-character
+  `Idempotency-Key` header, missing/non-positive/malformed `amount`, an
+  amount with unsupported precision or scale, missing source/destination
+  id, missing or malformed `currency`, or an unrecognized JSON property.
 - 404 account not found — either id being a `SYSTEM` account (treated
   identically to a nonexistent id) or any account that is not a
   `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`.
+- 409 idempotency conflict — `Idempotency-Key` was already used for a
+  command with a different amount, currency, or account, or was already
+  used against `POST /api/v1/accounts/{id}/deposits`. See "Idempotency"
+  below.
 - 422 insufficient funds — `source.balance < amount`.
 - 422 currency mismatch — `currency` is a well-formed but non-`USD` code,
   or (in principle) either account's own currency is not `USD`.
@@ -202,6 +218,44 @@ malformed or out of bounds — regardless of whether `{id}` would otherwise
 resolve (malformed pagination parameters are rejected before the account
 is even looked up).
 
+## Idempotency (implemented, Task 10)
+
+`POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
+require an `Idempotency-Key` request header — the only two write endpoints
+in Phase 1/2, and the only two this applies to. Account creation and both
+read endpoints do not accept or document this header.
+
+- **Format:** 1–128 characters, matching `^[A-Za-z0-9._:-]{1,128}$`.
+  Missing, blank, too long, or containing a disallowed character all
+  return `400`.
+- **Scope:** a key is scoped to the exact command it was first used for —
+  operation type (deposit vs. transfer), account(s), amount, and currency.
+  Amount comparison is numeric (`"100"`, `"100.0"`, and `"100.00"` are the
+  same command), not a string match; currency comparison is
+  case-insensitive (normalized the same way the endpoints themselves
+  normalize it).
+- **Replay:** a request with a key that exactly matches an already-claimed
+  command returns the *exact original* response — same status code, same
+  body, byte-for-byte — without creating a new `ledger_transaction`, new
+  `ledger_entry` rows, or any balance change. Safe to retry any number of
+  times.
+- **Conflict:** a request with a key that was already claimed by a
+  *different* command (different amount, currency, account, or operation
+  type — including a deposit key reused against `/transfers` or vice
+  versa) returns `409 Conflict` using the shared `ApiError` envelope, and
+  performs no financial write.
+- **Failed attempts don't consume the key:** if the underlying deposit or
+  transfer fails for any reason (validation, insufficient funds, account
+  not found, or a persistence-layer failure), no idempotency record is
+  ever committed — the same key can be retried, including with corrected
+  request data, and will be treated as new.
+- **Retention:** claimed keys are kept indefinitely in Phase 2 — there is
+  no expiry, cleanup job, or delete endpoint.
+
+See `docs/ARCHITECTURE.md`'s "Idempotency" section for the transactional
+and concurrency mechanics, and `docs/DATA_MODEL.md` for the `idempotency_key`
+table.
+
 ## Error Response Shape (implemented, Task 7)
 
 All error responses, from every endpoint above, share exactly one shape —
@@ -248,6 +302,10 @@ behind each one.
 - `404 Not Found` — the referenced account doesn't exist, is a `SYSTEM`
   account, or has an incompatible taxonomy for the endpoint (see each
   endpoint's own section above for exactly which cases apply).
+- `409 Conflict` — an `Idempotency-Key` was reused for a command that
+  doesn't canonically match the one it was first claimed for, including
+  reuse across the deposit and transfer endpoints (Task 10 only —
+  deposits and transfers).
 - `422 Unprocessable Content` — a well-formed request that fails a domain
   rule: unsupported/mismatched currency, insufficient funds, or
   source == destination on a transfer.

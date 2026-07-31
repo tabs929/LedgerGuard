@@ -1,7 +1,9 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
-> **Status: Phase 1 complete.** All 9 tasks below are implemented. See
-> `docs/TASKS.md` for the per-task breakdown and what each one covered.
+> **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
+> has begun — Task 10 (idempotency for deposits and transfers) is also
+> implemented. See `docs/TASKS.md` for the per-task breakdown and what
+> each one covered.
 
 ## Scope
 
@@ -32,8 +34,10 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
 - Transfers execute inside a single database transaction; a failed transfer
   leaves no partial writes.
 - Accounts cannot spend more than their available balance.
-- Duplicate requests are not expected to be idempotency-protected in Phase 1
-  (idempotency is explicitly deferred to Phase 2 — see Limitations).
+- Duplicate requests to `POST /api/v1/accounts/{id}/deposits` and
+  `POST /api/v1/transfers` are idempotency-protected via a required
+  `Idempotency-Key` header (Phase 2, Task 10 — see below). Account creation
+  and both read endpoints do not require or accept this header.
 - JPA entities are never returned directly from API endpoints.
 - PostgreSQL (via Testcontainers) is used for all persistence and
   transaction integration tests — H2 is never used as a substitute.
@@ -44,18 +48,30 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   other currency code.
 - **No FX conversion:** transfers require the source and destination
   currencies to match exactly.
-- **No idempotency:** idempotency keys and duplicate-request protection are
-  explicitly a Phase 2 concern per `CLAUDE.md`. Phase 1 relies on database
-  transactionality (all-or-nothing commits) for correctness, not on
-  deduplication of retried requests.
 - **No authentication or authorization:** Spring Security and JWT are
-  introduced in Phase 3. All Phase 1 endpoints are unauthenticated.
-- **No Kafka / event processing:** introduced in Phase 2.
+  introduced in Phase 3. All Phase 1/2 endpoints are unauthenticated.
+- **No Kafka / event processing:** still introduced later in Phase 2 — not
+  part of Task 10.
 - **No withdrawals:** only deposits (money entering via the internal
   `EXTERNAL_FUNDING` account) and transfers between customer accounts exist
-  in Phase 1. A withdrawal operation is designed for structurally (see
+  in Phase 1/2. A withdrawal operation is designed for structurally (see
   `docs/DATA_MODEL.md`) but not implemented.
-- **No reconciliation or settlement import:** introduced in Phase 2.
+- **No reconciliation or settlement import:** still to come later in
+  Phase 2 — not part of Task 10.
+
+## Phase 2 Progress
+
+- **Task 10 — Idempotency (implemented):** `Idempotency-Key` header
+  required on deposits and transfers, PostgreSQL-native concurrency
+  (transaction-scoped advisory lock — not in-memory), exact replay of the
+  original response, 409 on conflicting reuse (including across deposit
+  vs. transfer), and indefinite key retention (no TTL/cleanup in Phase 2).
+  See `docs/API_SPEC.md`'s "Idempotency" section and
+  `docs/ARCHITECTURE.md`'s "Idempotency" section for the full contract and
+  mechanism.
+- Idempotency, an outbox, Kafka publishing/consumption, settlement CSV
+  import, and reconciliation are the remaining Phase 2 scope per
+  `CLAUDE.md`; only idempotency (Task 10) is done so far.
 
 ## Non-Goals
 

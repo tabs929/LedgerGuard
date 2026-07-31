@@ -1,23 +1,27 @@
 # Architecture
 
-> **Status: Phase 1 complete through Task 9.** Database layer (Task 2),
-> account creation (Task 3), deposits (Task 4), transfers (Task 5),
-> account balance/transaction-history reads (Task 6), global error
-> handling (Task 7), OpenAPI documentation (Task 8), and CI (Task 9) are
-> all implemented; only plain account lookup by id remains unimplemented
-> — no task has ever been assigned it. The `account` package has account
-> creation, deposit processing, and read-only account queries; the
-> `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
-> repositories/enums; the `transfer` package has transfer processing. The
-> `common` package holds `PagedResponse<T>` (Task 6), `ApiError` and
-> `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
+> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Task 10 (idempotency)
+> implemented.** Database layer (Task 2), account creation (Task 3),
+> deposits (Task 4), transfers (Task 5), account balance/transaction-history
+> reads (Task 6), global error handling (Task 7), OpenAPI documentation
+> (Task 8), CI (Task 9), and idempotency for deposits/transfers (Task 10)
+> are all implemented; only plain account lookup by id remains
+> unimplemented — no task has ever been assigned it. The `account` package
+> has account creation, deposit processing, and read-only account queries;
+> the `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
+> repositories/enums; the `transfer` package has transfer processing; the
+> new `idempotency` package (Task 10) has the idempotency key record,
+> repository, command, service, and conflict exception — see "Idempotency"
+> below. The `common` package holds `PagedResponse<T>` (Task 6), `ApiError`
+> and `GlobalExceptionHandler` (Task 7), and `OpenApiConfig` (Task 8 — see
 > "API Documentation" below). Task 9 added `.github/workflows/ci.yml`
 > only — no application code, no new package, no behavior change (see
 > "Continuous Integration" at the end of this document). `GET
 > /api/v1/accounts/{id}` still does not exist, so the public-vs-internal
 > lookup split described below is still only partially realized (see that
 > section for exactly what deposits, transfers, and the read endpoints do
-> instead).
+> instead). Kafka, an outbox, settlement/reconciliation, and authentication
+> remain unimplemented — see `docs/TASKS.md` for what Tasks 11+ still cover.
 
 ## Style
 
@@ -51,9 +55,17 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
   `docs/API_SPEC.md`'s "Error Response Shape" and "OpenAPI/Swagger"
   sections are now both fully implemented, not just planned.
 
-Packages named in `CLAUDE.md` for later phases (`idempotency`, `outbox`,
-`settlement`, `reconciliation`, `security`, `audit`) are **not** created in
-Phase 1.
+- `idempotency` — **implemented (Task 10)**: `IdempotencyKeyRecord` (JPA
+  entity mapping the `idempotency_key` table) and `IdempotencyKeyRepository`,
+  `IdempotencyOperationType`, `IdempotencyCommand` (the canonical,
+  normalized deposit/transfer command used for conflict/replay comparison),
+  `IdempotencyService` (the claim/replay/conflict orchestration, called
+  from inside `DepositService`/`TransferService`), and
+  `IdempotencyConflictException` — see "Idempotency" below.
+
+Packages named in `CLAUDE.md` for later phases (`outbox`, `settlement`,
+`reconciliation`, `security`, `audit`) are **not yet created** — `idempotency`
+was the first of the Phase 2/3 packages to be added, in Task 10.
 
 ## Account Creation (implemented, Task 3)
 
@@ -310,6 +322,128 @@ accounts and asserts every one of the 20 completes (none times out, none
 deadlocks) and both balances return to their starting values. All three
 run against real PostgreSQL row locking — no Java-only synchronization, no
 mocks.
+
+## Idempotency (implemented, Task 10)
+
+`POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
+require an `Idempotency-Key` header (`@RequestHeader` + `@Pattern` on the
+controller method parameter, validated the same way `page`/`size` already
+are — a missing header is a new `MissingRequestHeaderException` mapping in
+`GlobalExceptionHandler`, an invalid one is the pre-existing
+`ConstraintViolationException` mapping, both 400). Controllers stay thin:
+they receive and validate the header, then pass it straight to
+`DepositService.deposit`/`TransferService.transfer`, which now take an
+extra `String idempotencyKey` parameter alongside the existing request DTO.
+
+**Canonical command.** Before any locking or validation, both services
+normalize the request exactly as they already did (currency uppercased,
+amount scaled to 4 decimal places) and build an `IdempotencyCommand`
+(operation type, account id(s), amount, currency) from that normalized
+data — this is what makes `"100"`, `"100.0"`, and `"100.00"` compare as
+the same command regardless of how the client formatted the request, and
+is why the currency/amount normalization lines moved to the top of each
+method rather than staying inline further down (a pure reordering of
+side-effect-free computation — the actual validation/throw order inside
+each service's private `doDeposit`/`doTransfer` method is unchanged from
+before Task 10).
+
+**`IdempotencyService.execute(key, command, responseType, transactionIdExtractor, operation)`**
+is the single reusable orchestration point both services call — it does
+not duplicate deposit or transfer logic, it only wraps a `Supplier<T>` that
+the caller provides:
+
+1. Acquire a PostgreSQL **transaction-scoped advisory lock**
+   (`pg_advisory_xact_lock(bigint)`), keyed on the first 8 bytes of
+   `SHA-256(idempotencyKey)` as a signed `long`. This happens before
+   `idempotency_key` or any account row is touched.
+2. Look up an existing `idempotency_key` row for that key (plain `SELECT`
+   — no `FOR UPDATE` needed, since the advisory lock above already
+   serializes every request bearing this exact key).
+   - **Found, canonical match** (`IdempotencyKeyRecord.matches`, an exact
+     comparison of operation type, account id(s), amount via
+     `BigDecimal.compareTo`, and currency — never relying on the stored
+     `command_hash` alone) → deserialize and return the stored
+     `response_body`/`response_status` verbatim. No new `LedgerTransaction`,
+     no new `LedgerEntry`, no balance change, no new `idempotency_key` row.
+   - **Found, mismatch** (different amount, currency, account, or
+     operation type — including a deposit key reused against `/transfers`
+     or vice versa) → throw `IdempotencyConflictException` immediately.
+     No financial work is attempted.
+   - **Not found** → run the supplied deposit/transfer operation (the
+     existing account-locking, ledger-entry, and balance-update logic,
+     completely unchanged), then, as the **last statement** of the same
+     `@Transactional` method, persist a new `IdempotencyKeyRecord`
+     (including the just-created `ledger_transaction.id` and the
+     JSON-serialized response) and flush.
+
+**Why this is atomic and why a failed attempt never consumes the key.**
+Everything above — the advisory lock, the lookup, the financial write, and
+the final `idempotency_key` insert — runs inside the one ambient
+`@Transactional` method (`DepositService.deposit`/`TransferService.transfer`,
+default `REQUIRES` propagation); nothing opens a `REQUIRES_NEW` transaction,
+and nothing catches and swallows an exception to commit partial state. If
+the wrapped operation throws for any reason — validation, `404`/`422`
+domain exceptions, or a genuine database-level failure surfaced at the
+existing explicit flush — the exception propagates out of the whole method
+uninterrupted, so Spring rolls back the entire transaction: no
+`ledger_transaction`, no `ledger_entry` rows, no balance change, **and no
+`idempotency_key` row**, since that insert is never reached. The key is
+therefore free to be retried, including with corrected data, exactly as if
+it had never been used.
+
+**Why the concurrency mechanism is correct and PostgreSQL-native, not
+in-memory.** `pg_advisory_xact_lock` is a real PostgreSQL server-side lock,
+scoped to the calling transaction and released automatically on that
+transaction's commit **or** rollback — never left held, never requiring
+explicit release code. A second request bearing the *same* key computes
+the identical lock id (the SHA-256 truncation is deterministic) and blocks
+inside that same call until the first transaction ends:
+- If the first transaction **commits**, the second unblocks and its
+  `SELECT` now sees the just-committed `idempotency_key` row (PostgreSQL's
+  read-committed isolation guarantees this) — it takes the replay or
+  conflict branch, never the "not found" branch, so it can never redo the
+  financial write.
+- If the first transaction **rolls back**, the second unblocks and finds
+  no row — it becomes the new "first" attempt for that key and proceeds
+  normally.
+
+Because this lock lives in PostgreSQL itself rather than the JVM, it is
+correct across multiple application instances without any inter-instance
+coordination — the same guarantee every other write-path invariant in this
+project already relies on (PostgreSQL, not application code, as the source
+of truth for concurrent correctness). The `UNIQUE` constraint on
+`idempotency_key.idempotency_key` remains as a defense-in-depth backstop,
+but in practice the advisory lock is what prevents the race — two
+transactions can never simultaneously be in the "not found → do the work"
+branch for the same key. A hash collision between two *different* keys
+would only cause them to serialize unnecessarily against each other
+(performance only) — correctness never depends on the lock id alone, since
+the exact key string is always compared afterward via the `idempotency_key`
+column, and the canonical command comparison never relies on
+`command_hash` alone either.
+
+**Why this composes safely with the existing deterministic account-row
+locking.** The advisory lock is always acquired *before* either write
+service takes its `SELECT ... FOR UPDATE` account-row lock(s) (see
+"Deterministic Lock Ordering" above), in every code path that uses it — so
+it is always the outer lock, never interleaved with or acquired after the
+account locks. Two requests bearing the same key are fully serialized by
+the advisory lock before either can reach account locking, so they never
+contend on account rows concurrently under that key; two requests bearing
+*different* keys use independent, uncorrelated lock ids, so they never
+serialize against each other and the pre-existing ascending-account-id
+ordering between them is completely unaffected. No new deadlock cycle is
+possible between the two lock types.
+
+**Persistence.** `idempotency_key` (Flyway `V2__add_idempotency_key.sql`
+— `V1` is unmodified) stores the key (`UNIQUE`, format-checked), the
+canonical command (operation type, primary/secondary account id, amount,
+currency), a SHA-256 `command_hash` (defense-in-depth only — see above),
+the resulting `ledger_transaction_id` (`NOT NULL`, foreign key), and the
+`response_status`/`response_body` needed for exact replay. Retention is
+indefinite in Phase 2 — no TTL column, no cleanup job, no delete endpoint;
+see `docs/DATA_MODEL.md` for the full schema and `docs/API_SPEC.md` for
+the client-facing contract.
 
 ## Ledger Immutability (implemented, Task 2)
 

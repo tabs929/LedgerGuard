@@ -1,15 +1,16 @@
 # Test Strategy
 
-> **Status: all Phase 1 test-writing tasks are implemented, and every
-> test now runs automatically in CI (Task 9) on every push/PR.** The
-> connectivity smoke test (Task 1), schema-verification tests (Task 2),
-> account creation's tests (Task 3), deposit's
+> **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
+> (idempotency), and every test runs automatically in CI (Task 9) on
+> every push/PR.** The connectivity smoke test (Task 1), schema-verification
+> tests (Task 2), account creation's tests (Task 3), deposit's
 > ledger-balance/rollback/concurrency tests (Task 4), transfer's
 > ledger-balance/conservation/insufficient-funds/rollback/
 > deadlock-avoidance tests (Task 5), the balance/history read tests
 > (Task 6), the global error-envelope/validation/leakage tests (Task 7),
-> and the OpenAPI document/schema-accuracy tests (Task 8) all exist (see
-> "Currently Implemented" below) and all run in
+> the OpenAPI document/schema-accuracy tests (Task 8), and the idempotency
+> header/replay/conflict/rollback/concurrency tests (Task 10) all exist
+> (see "Currently Implemented" below) and all run in
 > `.github/workflows/ci.yml` (see "CI" below). Only `GET
 > /api/v1/accounts/{id}` remains untested, since that plain-lookup
 > endpoint was never assigned to any task and so still doesn't exist.
@@ -307,6 +308,57 @@ database-free way to boot the context here:
   Task 2 immutability triggers still reject `UPDATE` against a row a real
   deposit just created.
 
+## Idempotency Tests (implemented, Task 10)
+
+`IdempotencyIntegrationTest` (21 tests) verifies `Idempotency-Key` handling
+for both protected endpoints at the HTTP boundary (`TestRestTemplate`) and
+the persisted database state (direct JDBC), against a
+Testcontainers-provisioned `postgres:16.4` instance. No PostgreSQL
+concurrency is mocked; no H2; no local Docker Compose database; no
+`Thread.sleep` used as a correctness mechanism — concurrency assertions use
+`ExecutorService.invokeAll`/`Future.get` with bounded timeouts, so a real
+deadlock or hang fails the test instead of blocking the build indefinitely.
+
+- **Header validation:** a missing header (400, both deposit and transfer),
+  a blank header, a 129-character header, and a header containing a space
+  or a slash are all rejected (400); a 128-character key and a key using
+  every allowed punctuation character (`. _ : -`) are both accepted.
+- **Sequential replay:** an identical retry (same key, same body) returns
+  the exact original status and body, creates no new `ledger_transaction`/
+  `ledger_entry` rows, and changes the balance only once; a retry with a
+  numerically-equivalent but differently-formatted amount (`"100"` then
+  `"100.00"`) replays the same original transaction rather than treating
+  them as different commands.
+- **Same-operation conflict:** reusing a deposit key with a different
+  amount, a different destination account, or a different (but otherwise
+  valid) currency all return 409 and change no balance; reusing a transfer
+  key with a different destination behaves the same way.
+- **Cross-operation conflict:** a key first used for a deposit, then
+  replayed against `/transfers` (and vice versa), returns 409 and performs
+  no financial write in either direction.
+- **Rollback / key not consumed by failure:** a deposit against a
+  nonexistent account, and a transfer rejected for insufficient funds, both
+  leave zero `idempotency_key` rows for that key — the same key then
+  succeeds normally once retried with corrected data (a valid account, or a
+  funded source). A genuine database-level failure (the same
+  `NUMERIC(19,4)`-overflow technique used in Tasks 4/5) rolls back the
+  financial write and leaves no `idempotency_key` row either — the key
+  succeeds on a later retry once the underlying condition is fixed.
+- **Concurrency (real PostgreSQL advisory locking, no mocks, no
+  application-level synchronization):**
+  - `simultaneousIdenticalDepositRequestsCommitExactlyOnce` — 15 concurrent
+    requests with the same key and the same body; asserts every response is
+    201 with an identical body, exactly one `ledger_transaction` and one
+    `idempotency_key` row exist afterward, and the balance moved by exactly
+    one deposit's worth.
+  - `simultaneousConflictingDepositRequestsWithTheSameKeyProduceExactlyOneWinner`
+    — 16 concurrent requests sharing one key, split between two different
+    amounts; asserts every response is either 201 (all with an identical
+    body — the single winning command) or 409, that the two counts sum to
+    16, that exactly one `idempotency_key` row exists, and that the final
+    balance reflects exactly one of the two candidate amounts, never both
+    and never neither.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -346,8 +398,15 @@ Transaction History Tests" above.
 `GlobalExceptionHandlingIntegrationTest` (Task 7) — see "Global Error
 Handling Tests" above.
 
-`OpenApiDocumentationIntegrationTest` (Task 8) — see "OpenAPI
-Documentation Tests" above.
+`OpenApiDocumentationIntegrationTest` (26 tests, Task 8 + Task 10) — see
+"OpenAPI Documentation Tests" above; gained two Task 10 tests (the
+`Idempotency-Key` header parameter contract, and the 409 response schema).
+
+`IdempotencyIntegrationTest` (Task 10) — see "Idempotency Tests" above.
+
+Total: 186 tests (163 from Phase 1 Tasks 1–9, plus 21 in the new
+`IdempotencyIntegrationTest` and 2 new tests added to
+`OpenApiDocumentationIntegrationTest`, all introduced by Task 10).
 
 ## CI (implemented, Task 9)
 

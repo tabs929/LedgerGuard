@@ -400,6 +400,7 @@ class TransferIntegrationTest {
 
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<String> depositResponse = restTemplate.postForEntity(
 				"/api/v1/accounts/" + sourceId + "/deposits",
 				new HttpEntity<>(Map.of("amount", "100.00", "currency", "USD"), headers), String.class);
@@ -507,6 +508,7 @@ class TransferIntegrationTest {
 		UUID accountId = createUsdCustomerAccount(ownerName);
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<String> response = restTemplate.postForEntity(
 				"/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", depositAmount, "currency", "USD"), headers), String.class);
@@ -522,6 +524,7 @@ class TransferIntegrationTest {
 				"currency", "USD");
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return restTemplate.postForEntity("/api/v1/transfers", new HttpEntity<>(body, headers), TransferResponse.class);
 	}
 
@@ -537,6 +540,7 @@ class TransferIntegrationTest {
 	private ResponseEntity<String> postTransferRawBody(Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		try {
 			String json = JSON.writeValueAsString(body);
 			return restTemplate.postForEntity("/api/v1/transfers", new HttpEntity<>(json, headers), String.class);

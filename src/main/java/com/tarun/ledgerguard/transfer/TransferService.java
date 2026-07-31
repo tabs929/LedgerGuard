@@ -10,6 +10,8 @@ import com.tarun.ledgerguard.account.CurrencyMismatchException;
 import com.tarun.ledgerguard.account.InsufficientFundsException;
 import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
+import com.tarun.ledgerguard.idempotency.IdempotencyCommand;
+import com.tarun.ledgerguard.idempotency.IdempotencyService;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
@@ -55,33 +57,47 @@ public class TransferService {
 	private final LedgerTransactionRepository ledgerTransactionRepository;
 	private final LedgerEntryRepository ledgerEntryRepository;
 	private final EntityManager entityManager;
+	private final IdempotencyService idempotencyService;
 
 	public TransferService(AccountRepository accountRepository,
 			LedgerTransactionRepository ledgerTransactionRepository,
 			LedgerEntryRepository ledgerEntryRepository,
-			EntityManager entityManager) {
+			EntityManager entityManager,
+			IdempotencyService idempotencyService) {
 		this.accountRepository = accountRepository;
 		this.ledgerTransactionRepository = ledgerTransactionRepository;
 		this.ledgerEntryRepository = ledgerEntryRepository;
 		this.entityManager = entityManager;
+		this.idempotencyService = idempotencyService;
 	}
 
 	@Transactional
-	public TransferResponse transfer(TransferRequest request) {
+	public TransferResponse transfer(TransferRequest request, String idempotencyKey) {
 		UUID sourceAccountId = request.sourceAccountId();
 		UUID destinationAccountId = request.destinationAccountId();
-
-		if (sourceAccountId.equals(destinationAccountId)) {
-			throw new SameAccountTransferException(sourceAccountId);
-		}
-
+		// Normalizing here (before the idempotency claim below) is what lets
+		// "100", "100.0" and "100.00" compare as the same command; the
+		// same-account/currency-support checks below stay in doTransfer so
+		// their relative throw order is unchanged from before Task 10.
 		String normalizedCurrency = request.currency().toUpperCase(Locale.ROOT);
-		if (!SUPPORTED_CURRENCY.equals(normalizedCurrency)) {
-			throw new UnsupportedCurrencyException(normalizedCurrency);
-		}
 		// @Digits(fraction = 4) on TransferRequest already guarantees no more
 		// than 4 fractional digits, so this only pads scale -- never rounds.
 		BigDecimal amount = request.amount().setScale(4, RoundingMode.UNNECESSARY);
+
+		IdempotencyCommand command =
+				IdempotencyCommand.forTransfer(sourceAccountId, destinationAccountId, amount, normalizedCurrency);
+		return idempotencyService.execute(idempotencyKey, command, TransferResponse.class, TransferResponse::transactionId,
+				() -> doTransfer(sourceAccountId, destinationAccountId, normalizedCurrency, amount));
+	}
+
+	private TransferResponse doTransfer(UUID sourceAccountId, UUID destinationAccountId, String normalizedCurrency,
+			BigDecimal amount) {
+		if (sourceAccountId.equals(destinationAccountId)) {
+			throw new SameAccountTransferException(sourceAccountId);
+		}
+		if (!SUPPORTED_CURRENCY.equals(normalizedCurrency)) {
+			throw new UnsupportedCurrencyException(normalizedCurrency);
+		}
 
 		// Deterministic lock ordering: both rows are locked by the query's
 		// own `ORDER BY a.id`, regardless of the (arbitrary) order the two

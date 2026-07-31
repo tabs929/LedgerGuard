@@ -144,3 +144,42 @@ Work one task at a time. Mark a task done only when its tests pass and
 Full design decisions, schema, transaction model, and API contracts are in
 the approved plan (see project history / plan file) and will be captured in
 `docs/ARCHITECTURE.md` and `docs/DATA_MODEL.md` as part of Task 2.
+
+# Phase 2: Reliability and Event Processing — Tasks
+
+- [x] 10. Idempotency for deposits and transfers — `POST
+      /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
+      require an `Idempotency-Key` header (`^[A-Za-z0-9._:-]{1,128}$`,
+      validated at the controller, 400 if missing/invalid). New
+      `idempotency` package: `IdempotencyKeyRecord`/`IdempotencyKeyRepository`
+      (new `idempotency_key` table, `V2__add_idempotency_key.sql` — `V1`
+      unmodified), `IdempotencyOperationType`, `IdempotencyCommand` (the
+      canonical, normalized deposit/transfer command used for exact
+      conflict/replay comparison — never a hash-only match), `IdempotencyService`
+      (claim/replay/conflict orchestration via a PostgreSQL
+      transaction-scoped advisory lock, `pg_advisory_xact_lock`, keyed on a
+      SHA-256 hash of the raw key — not an in-memory lock, correct across
+      multiple app instances), and `IdempotencyConflictException` (409, new
+      `GlobalExceptionHandler` mapping alongside a `MissingRequestHeaderException`
+      400 mapping). `DepositService.deposit`/`TransferService.transfer` both
+      gained an `idempotencyKey` parameter and now route their existing,
+      unchanged financial-write logic through `IdempotencyService.execute`;
+      the financial write and the `idempotency_key` row commit or roll back
+      together in the same `@Transactional` method (no `REQUIRES_NEW`) — a
+      failed attempt never consumes the key. Existing deterministic
+      account-row locking (Tasks 4–5) is unweakened; the advisory lock is
+      always acquired before it, so no new deadlock risk. All Phase 1
+      response shapes, status codes, and behavior are unchanged — every
+      existing test was updated only to supply a unique `Idempotency-Key`
+      per independent deposit/transfer call. OpenAPI annotations document
+      the header (required, string, 1–128 chars, the approved pattern) and
+      the 409 response on both endpoints only. Verified by
+      `IdempotencyIntegrationTest` (21 tests, PostgreSQL Testcontainers):
+      header validation, sequential replay (including numerically-equivalent
+      formatting), same- and cross-operation conflict, rollback/key-not-
+      consumed-on-failure, and bounded-timeout concurrency tests (simultaneous
+      identical requests commit exactly once; simultaneous conflicting
+      requests produce exactly one winner). `OpenApiDocumentationIntegrationTest`
+      gained 2 tests for the header contract and the 409 schema. No Kafka,
+      outbox, settlement, reconciliation, or authentication were introduced
+      — those remain for later Phase 2/3 tasks.

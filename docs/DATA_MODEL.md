@@ -1,20 +1,23 @@
 # Data Model
 
-> **Status: schema implemented (Task 2); account creation (Task 3),
-> deposits (Task 4), transfers (Task 5), and account balance/transaction-
-> history reads (Task 6) implemented.** The tables, constraints, indexes,
-> and triggers described below exist in the database via
-> `src/main/resources/db/migration/V1__init_account_ledger_schema.sql` and
-> are verified by `SchemaMigrationIntegrationTest`. `account`,
-> `ledger_transaction`, and `ledger_entry` all have matching JPA entities,
-> written by account creation, deposit, and transfer processing, and now
-> also read by `AccountQueryService` (Task 6) — which never writes to any
-> of them. The materialized `account.balance` it returns and the
-> `ledger_entry` history it returns are two distinct things: the former is
-> a cached number kept in lockstep with the latter by every write path;
-> the latter is the immutable record those numbers are derived from. Task 6
-> reads one, then the other, independently — it never recomputes one from
-> the other.
+> **Status: `account`/`ledger_transaction`/`ledger_entry` schema
+> implemented (Task 2, Flyway V1); account creation (Task 3), deposits
+> (Task 4), transfers (Task 5), account balance/transaction-history reads
+> (Task 6), and idempotency for deposits/transfers (Task 10, Flyway V2)
+> implemented.** The `V1` tables, constraints, indexes, and triggers
+> described below exist in the database via
+> `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
+> (unmodified since Task 2) and are verified by
+> `SchemaMigrationIntegrationTest`. `account`, `ledger_transaction`, and
+> `ledger_entry` all have matching JPA entities, written by account
+> creation, deposit, and transfer processing, and also read by
+> `AccountQueryService` (Task 6) — which never writes to any of them. The
+> materialized `account.balance` it returns and the `ledger_entry` history
+> it returns are two distinct things: the former is a cached number kept in
+> lockstep with the latter by every write path; the latter is the immutable
+> record those numbers are derived from. `idempotency_key`
+> (`V2__add_idempotency_key.sql`, Task 10) is a new, separate table — see
+> "Idempotency Key Table" below.
 
 ## Account Taxonomy
 
@@ -186,6 +189,68 @@ Java enums (Task 3) map 1:1 to the `account` table's string literals, via
 `@Enumerated(EnumType.STRING)` on the `Account` entity. `TransactionType`,
 `TransactionStatus`, and `LedgerEntryType` (Task 4) map the same way onto
 `LedgerTransaction`/`LedgerEntry`.
+
+## Idempotency Key Table (Flyway V2, Task 10)
+
+A new, separate table — `V1` is untouched. One row per `Idempotency-Key`
+value ever successfully claimed by a deposit or a transfer:
+
+```sql
+CREATE TABLE idempotency_key (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key         VARCHAR(128) NOT NULL,
+    operation_type          VARCHAR(20) NOT NULL,
+    primary_account_id      UUID NOT NULL REFERENCES account(id),
+    secondary_account_id    UUID REFERENCES account(id),
+    amount                  NUMERIC(19,4) NOT NULL,
+    currency                VARCHAR(3) NOT NULL,
+    command_hash            CHAR(64) NOT NULL,
+    ledger_transaction_id   UUID NOT NULL REFERENCES ledger_transaction(id),
+    response_status         SMALLINT NOT NULL,
+    response_body           TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT uq_idempotency_key UNIQUE (idempotency_key),
+    CONSTRAINT chk_idempotency_key_format CHECK (idempotency_key ~ '^[A-Za-z0-9._:-]{1,128}$'),
+    CONSTRAINT chk_idempotency_operation_type CHECK (operation_type IN ('DEPOSIT', 'TRANSFER')),
+    CONSTRAINT chk_idempotency_amount_positive CHECK (amount > 0),
+    CONSTRAINT chk_idempotency_currency_format CHECK (currency ~ '^[A-Z]{3}$'),
+    CONSTRAINT chk_idempotency_response_status CHECK (response_status BETWEEN 200 AND 599),
+    CONSTRAINT chk_idempotency_command_hash_format CHECK (command_hash ~ '^[0-9a-f]{64}$')
+);
+
+CREATE INDEX idx_idempotency_key_ledger_transaction_id ON idempotency_key (ledger_transaction_id);
+```
+
+- `idempotency_key` — the client-supplied header value, `UNIQUE` (a
+  defense-in-depth backstop; the primary concurrency guarantee is a
+  PostgreSQL transaction-scoped advisory lock — see
+  `docs/ARCHITECTURE.md`'s "Idempotency" section), format-checked to match
+  the same `^[A-Za-z0-9._:-]{1,128}$` pattern the controllers validate.
+- `operation_type`, `primary_account_id`, `secondary_account_id`, `amount`,
+  `currency` — the **canonical, normalized command** the key was first
+  claimed for (`secondary_account_id` is null for a deposit; it's the
+  transfer destination for a transfer). This is what a later request
+  bearing the same key is compared against — exact-value comparison, never
+  the hash alone.
+- `command_hash` — a SHA-256 hex digest of the canonical command, stored
+  for defense-in-depth/debugging only.
+- `ledger_transaction_id` — `NOT NULL`, references the `ledger_transaction`
+  row this key's operation produced.
+- `response_status`, `response_body` — the exact original HTTP status and
+  JSON response body, replayed byte-for-byte on every retry.
+- `created_at` — UTC, database-assigned, same pattern as every other
+  timestamp column in this project.
+
+**Retention is indefinite in Phase 2** — no TTL column, no cleanup job, no
+delete endpoint. **No sensitive data is stored** — only account ids,
+amount, currency, a transaction reference, and the same response fields
+already returned to the original caller.
+
+`idempotency_key` is written by `idempotency.IdempotencyService`, exactly
+once per key, as the last statement of the same `@Transactional` deposit/
+transfer method that produced `ledger_transaction_id` — never updated
+afterward.
 
 ## Account Creation Enforcement (implemented, Task 3)
 

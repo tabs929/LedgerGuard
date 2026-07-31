@@ -494,6 +494,7 @@ class AccountQueryIntegrationTest {
 	private com.tarun.ledgerguard.account.dto.DepositResponse deposit(UUID accountId, String amount) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<com.tarun.ledgerguard.account.dto.DepositResponse> response = restTemplate.postForEntity(
 				"/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", amount, "currency", "USD"), headers),
@@ -505,6 +506,7 @@ class AccountQueryIntegrationTest {
 	private com.tarun.ledgerguard.transfer.dto.TransferResponse transfer(UUID sourceId, UUID destinationId, String amount) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		Map<String, Object> body = Map.of(
 				"sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(),

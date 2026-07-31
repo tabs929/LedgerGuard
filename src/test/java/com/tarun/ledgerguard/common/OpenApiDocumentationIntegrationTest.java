@@ -285,8 +285,9 @@ class OpenApiDocumentationIntegrationTest {
 
 		assertThat(responseCodes(paths, "/api/v1/accounts", "post")).containsExactlyInAnyOrder("201", "400", "422");
 		assertThat(responseCodes(paths, "/api/v1/accounts/{id}/deposits", "post"))
-				.containsExactlyInAnyOrder("201", "400", "404", "422");
-		assertThat(responseCodes(paths, "/api/v1/transfers", "post")).containsExactlyInAnyOrder("201", "400", "404", "422");
+				.containsExactlyInAnyOrder("201", "400", "404", "422", "409");
+		assertThat(responseCodes(paths, "/api/v1/transfers", "post"))
+				.containsExactlyInAnyOrder("201", "400", "404", "422", "409");
 		assertThat(responseCodes(paths, "/api/v1/accounts/{id}/balance", "get")).containsExactlyInAnyOrder("200", "404");
 		assertThat(responseCodes(paths, "/api/v1/accounts/{id}/transactions", "get"))
 				.containsExactlyInAnyOrder("200", "400", "404");
@@ -346,6 +347,50 @@ class OpenApiDocumentationIntegrationTest {
 		assertThat(size.get("schema").get("default").asInt()).isEqualTo(20);
 		assertThat(size.get("schema").get("minimum").asInt()).isEqualTo(1);
 		assertThat(size.get("schema").get("maximum").asInt()).isEqualTo(100);
+	}
+
+	@Test
+	void idempotencyKeyHeaderIsDocumentedOnDepositAndTransferOnly() throws Exception {
+		JsonNode paths = fetchDocument().get("paths");
+
+		for (String[] pathAndMethod : new String[][] {
+				{ "/api/v1/accounts/{id}/deposits", "post" }, { "/api/v1/transfers", "post" } }) {
+			JsonNode parameters = paths.get(pathAndMethod[0]).get(pathAndMethod[1]).get("parameters");
+			JsonNode header = findParameter(parameters, "Idempotency-Key");
+			assertThat(header.get("in").asText()).isEqualTo("header");
+			assertThat(header.get("required").asBoolean()).isTrue();
+			assertThat(header.get("schema").get("type").asText()).isEqualTo("string");
+			assertThat(header.get("schema").get("minLength").asInt()).isEqualTo(1);
+			assertThat(header.get("schema").get("maxLength").asInt()).isEqualTo(128);
+			assertThat(header.get("schema").get("pattern").asText()).isEqualTo("^[A-Za-z0-9._:-]{1,128}$");
+			assertThat(header.get("example").asText()).matches("^[A-Za-z0-9._:-]{1,128}$");
+			assertThat(header.get("description").asText()).contains("retry");
+		}
+
+		// Never documented on account creation or the two read endpoints.
+		for (String[] pathAndMethod : new String[][] {
+				{ "/api/v1/accounts", "post" }, { "/api/v1/accounts/{id}/balance", "get" },
+				{ "/api/v1/accounts/{id}/transactions", "get" } }) {
+			JsonNode operation = paths.get(pathAndMethod[0]).get(pathAndMethod[1]);
+			JsonNode parameters = operation.get("parameters");
+			boolean hasIdempotencyHeader = parameters != null && java.util.stream.StreamSupport
+					.stream(parameters.spliterator(), false)
+					.anyMatch(p -> "Idempotency-Key".equals(p.get("name").asText()));
+			assertThat(hasIdempotencyHeader).as("%s %s must not document Idempotency-Key", pathAndMethod[1],
+					pathAndMethod[0]).isFalse();
+		}
+	}
+
+	@Test
+	void idempotencyConflictResponseUsesTheSharedApiErrorSchema() throws Exception {
+		JsonNode paths = fetchDocument().get("paths");
+
+		for (String path : List.of("/api/v1/accounts/{id}/deposits", "/api/v1/transfers")) {
+			JsonNode conflict = paths.get(path).get("post").get("responses").get("409");
+			assertThat(conflict).as("%s must document 409", path).isNotNull();
+			String schemaRef = conflict.get("content").get("application/json").get("schema").get("$ref").asText();
+			assertThat(schemaRef).endsWith("/ApiError");
+		}
 	}
 
 	@Test
@@ -493,6 +538,7 @@ class OpenApiDocumentationIntegrationTest {
 	private org.springframework.http.HttpEntity<Map<String, Object>> jsonEntity(Map<String, Object> body) {
 		org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return new org.springframework.http.HttpEntity<>(body, headers);
 	}
 
