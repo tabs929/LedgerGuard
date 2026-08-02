@@ -298,7 +298,79 @@ the approved plan (see project history / plan file) and will be captured in
       `@KafkaListener`, consumer, or business reaction to an event was
       added — Task 13 will add Kafka consumption and duplicate-event
       protection.
-- [ ] 13. Kafka consumption and duplicate-event protection
+- [x] 13. Kafka consumption and duplicate-event protection — a real
+      Spring Kafka `@KafkaListener` (`inbox.LedgerEventConsumer`)
+      consumes `ledger.transaction-events.v1` under consumer group
+      `ledgerguard-transaction-event-consumer-v1`, strictly validates
+      each version-1 `DEPOSIT_COMPLETED`/`TRANSFER_COMPLETED` record
+      (exact field set, UUID/timestamp/currency/amount format, Kafka
+      key == `transactionId`, source ≠ destination for transfers), and
+      durably records successful processing in a new `processed_event`
+      table (`V4__add_processed_event_deduplication.sql` — `V1`/`V2`/`V3`
+      unmodified) keyed by the event's own stable `eventId`. New `inbox`
+      package: `LedgerEventConsumer` (the listener, no financial logic),
+      `LedgerEventProcessor` (a separate `@Transactional` bean —
+      self-invocation would bypass the proxy — that validates, computes
+      a SHA-256 fingerprint over the exact Kafka value string via
+      `PayloadHasher`, and atomically claims the row), `ProcessedEventRepository`
+      (`NamedParameterJdbcTemplate`-based `INSERT ... ON CONFLICT
+      (event_id) DO NOTHING`, deliberately not JPA — a JPA
+      constraint-violation would mark the whole transaction
+      rollback-only, exactly the exception-driven duplicate control flow
+      the contract forbids), `LedgerEventValidator`,
+      `LedgerConsumerProperties` (validated
+      `ledgerguard.inbox.consumer.*` config), `LedgerEventConsumerConfig`
+      (a dedicated consumer/listener-container factory pair with
+      `enable.auto.commit=false` and `AckMode.MANUAL_IMMEDIATE`), and
+      `ValidatedLedgerEvent`/`ProcessedEventRecord`/
+      `LedgerEventValidationException`/`ConflictingEventException`. A
+      claim that inserts owns first processing (success); a claim that
+      finds an existing row with an identical fingerprint is a no-op
+      success (safe redelivery); one with a different fingerprint throws
+      `ConflictingEventException` and is never acknowledged. The listener
+      acknowledges a Kafka offset only after `LedgerEventProcessor`'s
+      `@Transactional` method returns — i.e. only after the PostgreSQL
+      commit — and on any failure calls `Acknowledgment.nack(Duration)`
+      rather than silently continuing, since with manual-immediate
+      acknowledgement a later record on the same partition being
+      committed would otherwise silently advance the offset past an
+      earlier merely-unacknowledged one (Kafka's commit is a single
+      per-partition cursor, not a per-record ledger); a permanently
+      invalid or conflicting record therefore keeps retrying on its
+      partition until corrected (poison-message/DLT handling is out of
+      scope for Task 13). This is at-least-once Kafka delivery made
+      effectively-once at the PostgreSQL layer for a given `eventId` —
+      never a claim of exactly-once Kafka delivery. The consumer performs
+      no settlement, reconciliation, balance update, ledger write, or any
+      other business mutation — recording `processed_event` is its only
+      effect; `DepositService`/`TransferService` are untouched, and Tasks
+      10–12 are preserved exactly. `processed_event` has no foreign key
+      to `ledger_transaction`/`outbox_event` (the consumer boundary must
+      not require producer-side row access) and is append-only (two
+      triggers reject `UPDATE`/`DELETE`, matching `V1`/`V3`'s style).
+      Verified by `LedgerEventConsumerIntegrationTest` (19 tests, real
+      PostgreSQL 16.4 **and** real Kafka Testcontainers,
+      `apache/kafka:3.8.0`): migration/schema checks; deposit/transfer
+      consumption via the real topic and listener with exact
+      key/payload-hash/source-position verification; identical-duplicate
+      handling (different offsets, different partitions, and two
+      concurrent `LedgerEventProcessor` calls racing the same `eventId`
+      against real PostgreSQL — no JVM-local cache); conflicting-duplicate
+      rejection (different amount/transactionId/eventType, exercised via
+      direct `LedgerEventProcessor` calls rather than the shared topic,
+      since a permanently-rejected record retries forever and would risk
+      blocking an unrelated later test sharing a partition); a forced
+      genuine `processed_event`-insertion failure that rolls back cleanly
+      and succeeds once corrected; and a full deposit/transfer
+      Task 11→12→13 end-to-end flow proving exactly one `processed_event`
+      row exists and an idempotent HTTP replay creates nothing new.
+      `LedgerEventValidatorTest` (28 unit tests) exhaustively covers the
+      validation matrix; `PayloadHasherTest` (5), `ProcessedEventRecordTest`
+      (6), and `LedgerConsumerPropertiesValidationTest` (6) cover hashing,
+      duplicate/conflict comparison, and configuration validation in
+      isolation. Every PostgreSQL-only suite disables both the Task 12
+      publisher and the Task 13 consumer via `application-test.yml`, so
+      neither ever attempts a Kafka connection.
 - [ ] 14. Settlement CSV import
 - [ ] 15. Reconciliation
 - [ ] 16. Phase 2 reliability, failure, and concurrency hardening

@@ -12,3 +12,10 @@ ledgerguard:
       # Kafka connection. OutboxPublisherIntegrationTest overrides this
       # back to true alongside a real Kafka Testcontainer.
       enabled: false
+  inbox:
+    consumer:
+      # Same reasoning as the publisher above -- disabled by default so
+      # no PostgreSQL-only test ever attempts a Kafka connection.
+      # LedgerEventConsumerIntegrationTest overrides this back to true
+      # alongside a real Kafka Testcontainer.
+      enabled: false

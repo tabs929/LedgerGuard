@@ -24,6 +24,15 @@ spring:
       acks: all
       properties:
         enable.idempotence: true
+    consumer:
+      # String deserialization (Task 13) -- mirrors the producer's String
+      # serialization. enable-auto-commit is force-overridden to false in
+      # inbox.LedgerEventConsumerConfig regardless of this value, since
+      # manual acknowledgement is mandatory for the commit-before-ack
+      # ordering this task requires.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable-auto-commit: false
 
 springdoc:
   # Every endpoint in this application only ever produces application/json;
@@ -46,3 +55,19 @@ ledgerguard:
       poll-delay-millis: 2000
       batch-size: 20
       send-timeout-millis: 5000
+  inbox:
+    consumer:
+      # Every PostgreSQL-only integration test overrides this to false via
+      # application-test.yml, specifically so it never attempts a Kafka
+      # connection. True here is the normal application default.
+      enabled: true
+      topic: ${LEDGER_EVENTS_TOPIC:ledger.transaction-events.v1}
+      group-id: ${LEDGER_EVENTS_CONSUMER_GROUP_ID:ledgerguard-transaction-event-consumer-v1}
+      # No greater than the outbox publisher's default partition count
+      # above, so every partition can have an active consumer thread.
+      concurrency: 3
+      # Deterministic for local/test use -- a fresh consumer group reads
+      # every retained record from the beginning of the topic rather than
+      # only new ones.
+      auto-offset-reset: earliest
+      poll-timeout-millis: 5000

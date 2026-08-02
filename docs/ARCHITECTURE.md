@@ -1,37 +1,44 @@
 # Architecture
 
 > **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency),
-> 11 (transactional outbox), and 12 (Kafka publishing) implemented.**
-> Database layer (Task 2), account creation (Task 3), deposits (Task 4),
-> transfers (Task 5), account balance/transaction-history reads (Task 6),
-> global error handling (Task 7), OpenAPI documentation (Task 8), CI
-> (Task 9), idempotency for deposits/transfers (Task 10), the transactional
-> outbox (Task 11), and publishing pending outbox events to Kafka
-> (Task 12) are all implemented; only plain account lookup by id remains
-> unimplemented — no task has ever been assigned it. The `account` package
-> has account creation, deposit processing, and read-only account queries;
-> the `ledger` package has `LedgerTransaction`, `LedgerEntry`, and their
-> repositories/enums; the `transfer` package has transfer processing; the
-> `idempotency` package (Task 10) has the idempotency key record,
-> repository, command, service, and conflict exception — see "Idempotency"
-> below; the `outbox` package (Task 11) has the outbox event record,
-> repository, event-type enums, the two version-1 event payload records,
-> and the event factory, and (Task 12) now also the publisher scheduler,
-> the per-event transactional publisher, the Kafka topic configuration,
-> and validated publisher properties — see "Transactional Outbox" and
-> "Kafka Publishing" below. The `common` package holds `PagedResponse<T>`
-> (Task 6), `ApiError` and `GlobalExceptionHandler` (Task 7), and
-> `OpenApiConfig` (Task 8 — see "API Documentation" below). Task 9 added
-> `.github/workflows/ci.yml` only — no application code, no new package,
-> no behavior change (see "Continuous Integration" at the end of this
-> document). `GET /api/v1/accounts/{id}` still does not exist, so the
-> public-vs-internal lookup split described below is still only partially
-> realized (see that section for exactly what deposits, transfers, and the
-> read endpoints do instead). A Kafka consumer, settlement/reconciliation,
+> 11 (transactional outbox), 12 (Kafka publishing), and 13 (Kafka
+> consumption and duplicate-event protection) implemented.** Database
+> layer (Task 2), account creation (Task 3), deposits (Task 4), transfers
+> (Task 5), account balance/transaction-history reads (Task 6), global
+> error handling (Task 7), OpenAPI documentation (Task 8), CI (Task 9),
+> idempotency for deposits/transfers (Task 10), the transactional outbox
+> (Task 11), publishing pending outbox events to Kafka (Task 12), and
+> durably deduplicated Kafka consumption (Task 13) are all implemented;
+> only plain account lookup by id remains unimplemented — no task has
+> ever been assigned it. The `account` package has account creation,
+> deposit processing, and read-only account queries; the `ledger` package
+> has `LedgerTransaction`, `LedgerEntry`, and their repositories/enums;
+> the `transfer` package has transfer processing; the `idempotency`
+> package (Task 10) has the idempotency key record, repository, command,
+> service, and conflict exception — see "Idempotency" below; the `outbox`
+> package (Tasks 11–12) has the outbox event record, repository,
+> event-type enums, the two version-1 event payload records, the event
+> factory, the publisher scheduler, the per-event transactional
+> publisher, the Kafka topic configuration, and validated publisher
+> properties — see "Transactional Outbox" and "Kafka Publishing" below;
+> the new `inbox` package (Task 13) has the Kafka listener, the
+> transactional event processor, the JDBC-based processed-event
+> repository, strict event validation, and validated consumer properties
+> — see "Kafka Consumption" below. The `common` package holds
+> `PagedResponse<T>` (Task 6), `ApiError` and `GlobalExceptionHandler`
+> (Task 7), and `OpenApiConfig` (Task 8 — see "API Documentation" below).
+> Task 9 added `.github/workflows/ci.yml` only — no application code, no
+> new package, no behavior change (see "Continuous Integration" at the
+> end of this document). `GET /api/v1/accounts/{id}` still does not
+> exist, so the public-vs-internal lookup split described below is still
+> only partially realized (see that section for exactly what deposits,
+> transfers, and the read endpoints do instead). Settlement/reconciliation
 > and authentication remain unimplemented — see `docs/TASKS.md` for what
-> Tasks 13+ still cover; Task 12 provides **at-least-once** publication
-> only, never exactly-once, and adds no consumer or business reaction to
-> an event.
+> Tasks 14+ still cover; Task 12 provides **at-least-once** publication
+> and Task 13 makes the PostgreSQL-side consumer effect idempotent for a
+> given `eventId` — neither claims, nor together produce, exactly-once
+> Kafka delivery. Task 13 performs no settlement, reconciliation, balance
+> update, or ledger mutation of any kind.
 
 ## Style
 
@@ -84,10 +91,21 @@ needs it starts — no empty placeholder packages are scaffolded in advance:
   `OutboxPublisher` (the per-event transactional publish) from Task 12 —
   see "Transactional Outbox" and "Kafka Publishing" below.
 
+- `inbox` — **implemented (Task 13)**: `LedgerEventConsumer` (the
+  `@KafkaListener`), `LedgerEventProcessor` (the per-event
+  `@Transactional` validate-and-claim logic), `ProcessedEventRepository`
+  (`NamedParameterJdbcTemplate`-based), `LedgerEventValidator`,
+  `LedgerConsumerProperties` (validated configuration),
+  `LedgerEventConsumerConfig` (the dedicated consumer/listener-container
+  factory pair), `ValidatedLedgerEvent`, `ProcessedEventRecord`,
+  `PayloadHasher`, `LedgerEventValidationException`, and
+  `ConflictingEventException` — see "Kafka Consumption" below.
+
 Packages named in `CLAUDE.md` for later phases (`settlement`,
 `reconciliation`, `security`, `audit`) are **not yet created** —
-`idempotency` (Task 10) and `outbox` (Task 11) are the two Phase 2/3
-packages added so far.
+`idempotency` (Task 10), `outbox` (Task 11), and `inbox` (Task 13,
+mirroring `outbox`'s naming for the consumer-side counterpart of the same
+pattern) are the three Phase 2/3 packages added so far.
 
 ## Account Creation (implemented, Task 3)
 
@@ -831,10 +849,223 @@ at all" risk — never done here.
 only) are the only two dependencies this task adds. No Kafka Streams, no
 Spring Cloud Stream, no Avro, no Schema Registry, no Kafka Connect, no
 Debezium, no ZooKeeper (the Testcontainers broker and the local Compose
-broker are both single-node KRaft), and no external outbox library. No
-`@KafkaListener`, no consumer factory, no consumer group business logic,
-and no settlement/reconciliation code exist anywhere in this codebase —
-Task 13 is the first task that will add consumption.
+broker are both single-node KRaft), and no external outbox library. Task 12
+itself adds no `@KafkaListener` or consumer — see "Kafka Consumption"
+below for that.
+
+## Kafka Consumption (implemented, Task 13)
+
+Consumes Task 12's published records from `ledger.transaction-events.v1`
+and durably records successful processing in PostgreSQL, keyed by the
+event's own stable `eventId` — the consumer-side half of the outbox/inbox
+pattern. This section covers persistence and deduplication only: nothing
+in this codebase reacts to a processed event (no settlement, no
+reconciliation, no balance/ledger mutation, no notification) — that is
+explicitly future work.
+
+### Consumer group and record contract
+
+Consumer group `ledgerguard-transaction-event-consumer-v1` (configurable
+via `ledgerguard.inbox.consumer.group-id`), subscribed to the same
+configurable topic Task 12 publishes to
+(`ledgerguard.inbox.consumer.topic`, default
+`ledger.transaction-events.v1` — the two properties are independently
+configurable but share the same default, so a default deployment always
+points at the same topic on both sides). Records are consumed as plain
+UTF-8 strings (`StringDeserializer` for both key and value, mirroring the
+producer's `StringSerializer`) — the key is expected to be the ledger
+transaction UUID, the value the exact Task 11/12 JSON payload. No new
+Kafka headers are required or read; the key and JSON value are sufficient.
+
+### Strict validation
+
+`LedgerEventValidator` parses the raw value with the application's real
+Jackson 3 `ObjectMapper` into a tree (never binding directly into a
+lenient DTO) and validates by hand, deliberately not via global Jackson
+configuration or record-based strict binding — neither can express rules
+like "amount must be a positive, exactly-four-decimal string" or "source
+and destination must differ." Only `DEPOSIT_COMPLETED` and
+`TRANSFER_COMPLETED` at `schemaVersion` exactly `1` (an integer, not a
+string or a floating-point literal) are accepted; every other event type
+or schema version is rejected outright — never silently treated as
+processed. Validated in full: the JSON is a single object (not an array,
+scalar, or `null`); the field set for the declared event type is *exactly*
+right (no missing field, no unexpected one — including a transfer-only
+field like `sourceAccountId` appearing on a deposit); `eventId`,
+`transactionId`, and (for transfers) `sourceAccountId`/
+`destinationAccountId` are syntactically valid UUIDs; `occurredAt` parses
+as an ISO-8601 `Instant`; `amount` is a JSON *string* (never a bare
+number) matching `^\d+\.\d{4}$` and is positive; `currency` is exactly
+uppercase `"USD"`; the Kafka record key equals `transactionId` in
+standard UUID string form; and, for transfers, `sourceAccountId` differs
+from `destinationAccountId`. Any violation throws
+`LedgerEventValidationException` with a safe, generic message — never the
+offending payload content. A successful validation yields a
+`ValidatedLedgerEvent` (`eventId`, `aggregateId`, `eventType`,
+`schemaVersion` only — Task 13 does not persist the full payload; see
+"Payload fingerprint, not payload storage" below).
+
+### Payload fingerprint, not payload storage
+
+`PayloadHasher.sha256Hex` computes SHA-256 over the *exact* UTF-8 bytes of
+the raw Kafka value string — never by deserializing and reserializing it,
+so the fingerprint can't drift from what was actually on the wire due to
+key reordering or whitespace differences a round-trip might introduce.
+This hash, not the payload itself, is what `processed_event` stores
+(`payload_hash`, a lowercase 64-character hex `CHAR(64)`) — enough to
+distinguish an identical redelivery from a conflicting reuse of the same
+`eventId` without duplicating the entire financial payload into a second
+table.
+
+### Duplicate claim algorithm
+
+`LedgerEventProcessor.process(...)` (a separate Spring bean from
+`LedgerEventConsumer`, specifically so its `@Transactional` proxy is
+effective — self-invocation from within the listener would silently
+bypass it, the same reason `outbox.OutboxPublisher` is separate from
+`outbox.OutboxPublisherScheduler`) does everything for one record inside
+one PostgreSQL transaction:
+
+1. Validate (above); a validation failure throws before anything is
+   attempted against the database.
+2. Compute `payload_hash`.
+3. Call `ProcessedEventRepository.tryClaim`, which executes:
+   ```sql
+   INSERT INTO processed_event
+       (event_id, aggregate_id, event_type, schema_version, payload_hash,
+        source_topic, source_partition, source_offset)
+   VALUES (...)
+   ON CONFLICT (event_id) DO NOTHING
+   ```
+   and reports success by the JDBC affected-row count (`1` = inserted,
+   `0` = a row for this `event_id` already existed) — **not** by catching
+   a constraint-violation exception. This is deliberate: a normal JPA
+   `save()` hitting the primary key would throw a `PersistenceException`
+   that marks the whole `EntityManager`/transaction rollback-only, making
+   "this event was already claimed" indistinguishable from "this
+   transaction is now unusable" — exactly the exception-driven duplicate
+   control flow the Task 13 contract forbids. `ProcessedEventRepository`
+   is therefore deliberately implemented with
+   `NamedParameterJdbcTemplate`, not JPA, unlike every other repository in
+   this project.
+4. **1 row inserted (first delivery):** this invocation owns first
+   processing of that `eventId`. The insert itself is the entire
+   consumer-side effect; the method returns normally.
+5. **0 rows inserted (a row already exists):** load the existing row
+   (`findByEventId`) and compare `aggregate_id`, `event_type`,
+   `schema_version`, and `payload_hash` (`ProcessedEventRecord.matches`)
+   against this delivery — **never** comparing `source_topic`/
+   `source_partition`/`source_offset`, since a legitimate redelivery of
+   the same event may land at a different Kafka position entirely.
+   - **All four match (identical duplicate):** a genuine success, not a
+     mutation — the method returns normally without touching the
+     database again.
+   - **Any differ (conflicting duplicate):** throws
+     `ConflictingEventException`. The existing row is never touched; no
+     second row is inserted (`event_id` is the primary key).
+
+A source-position (`source_topic`/`source_partition`/`source_offset`)
+uniqueness violation — a *different* `event_id` claiming a Kafka position
+another event already occupies, which never happens under correct
+redelivery — is not specially handled; it propagates as a genuine
+failure. This is a corruption safeguard, not the duplicate-detection
+mechanism: `event_id` alone is the logical duplicate identity (see
+`docs/DATA_MODEL.md`'s "Processed Event Table" section for why Kafka
+coordinates are deliberately not used as the primary key).
+
+### Why this is safe under concurrent consumers, multiple partitions, and multiple application instances
+
+The `INSERT ... ON CONFLICT (event_id)` claim is resolved entirely by
+PostgreSQL, which allows exactly one transaction to successfully insert a
+given primary key — regardless of whether the competing attempts come
+from two listener threads in one process, two consumers on different
+partitions, or two entirely separate application instances sharing the
+same database. There is no JVM-local map, `synchronized` block, or
+single-instance assumption anywhere in this path — the database is the
+only source of coordination truth, the same principle every other
+concurrency guarantee in this project already relies on (account-row
+locking, the Task 10 advisory lock, the Task 12 `FOR UPDATE SKIP LOCKED`
+claim).
+
+### Kafka acknowledgement boundary
+
+The listener container (`inbox.LedgerEventConsumerConfig`) is configured
+with `enable.auto.commit=false` and
+`ContainerProperties.AckMode.MANUAL_IMMEDIATE`. `LedgerEventConsumer`
+calls `Acknowledgment.acknowledge()` **only** after
+`LedgerEventProcessor.process(...)` returns normally — and that method is
+`@Transactional`, so it cannot return normally until its PostgreSQL
+transaction has committed. The required ordering (validate → PostgreSQL
+commit → Kafka acknowledgement) therefore falls out of this structure by
+construction, not from a manually sequenced try/finally that could drift
+out of sync.
+
+On any failure — a validation error, a `ConflictingEventException`, or a
+transient failure such as a database outage — the listener calls
+`Acknowledgment.nack(Duration)` instead of silently continuing to the
+next record. This is a deliberate choice, not the default "just don't
+ack": with manual-immediate acknowledgement, Kafka's committed offset is
+a single per-partition cursor, not a per-record ledger — if a *later*
+record on the same partition were acknowledged while an earlier one was
+merely left un-acked, the commit would silently advance past the
+earlier failure the next time any record in that partition committed,
+permanently skipping it. `nack(Duration)` avoids this: it re-seeks the
+consumer back to the failed record (and everything already fetched after
+it on that partition) so it is redelivered after a bounded backoff,
+rather than ever being silently bypassed. Every failure category uses the
+same fixed, bounded backoff and the same non-skipping behavior — a
+permanently invalid or conflicting record therefore keeps its partition
+positioned at that record until it is corrected or removed upstream. This
+is a deliberate, documented limitation for Task 13: dead-letter handling
+for a genuinely poison record is out of scope here (see `docs/TASKS.md`'s
+Task 16 entry).
+
+### The duplicate/redelivery window, precisely
+
+- **Before the PostgreSQL commit:** no `processed_event` row exists for
+  this `eventId`. A failure at any point (validation, a database outage
+  mid-transaction, a crash) leaves nothing behind; the record is
+  redelivered (via `nack`, or via a fresh poll after a consumer restart)
+  and the next attempt starts fresh.
+- **After the PostgreSQL commit but before the Kafka offset commit:** the
+  `processed_event` row exists. If the process crashes in this narrow
+  window, Kafka will redeliver the record (since its offset was never
+  committed) — the redelivery finds the existing `event_id`, the
+  fingerprint comparison finds an identical match, and the redelivery
+  becomes a no-op success whose offset can then be acknowledged/committed
+  normally.
+- **After the Kafka offset commit:** normal consumption proceeds past
+  this record; it is never redelivered under ordinary operation.
+
+Kafka delivery therefore remains **at-least-once** — this project never
+claims otherwise. What Task 13 actually guarantees is that the
+**PostgreSQL-side effect** of processing a given `eventId` is idempotent:
+however many times the same event is redelivered, `processed_event` ends
+up with exactly one row for it, and every redelivery after the first is
+a safe no-op. This is not global exactly-once processing across arbitrary
+external systems — only the specific PostgreSQL side effect Task 13
+itself introduces.
+
+**Why this isn't hidden behind Kafka transactions, `REQUIRES_NEW`, or
+two-phase commit** — the same reasoning Task 12 already applied to
+publishing: none of these can make a single Kafka offset commit and a
+single PostgreSQL commit atomic with each other without a genuine
+distributed transaction spanning both systems, which Task 13 does not
+introduce. Marking a record as processed before actually processing it,
+or acknowledging before the PostgreSQL commit, would trade today's
+"maybe processed twice" risk (already handled safely by the `eventId`
+claim) for a strictly worse "maybe never durably processed at all" risk —
+never done here.
+
+### No downstream business mutation
+
+`LedgerEventProcessor.process(...)` never calls `DepositService` or
+`TransferService`, never constructs a `LedgerTransaction`/`LedgerEntry`,
+never updates an `Account` balance, never touches `outbox_event`
+(including `published_at`), and never touches `idempotency_key`. The
+`processed_event` insert described above is Task 13's only effect,
+by construction — there is no code path in `inbox` that reaches any of
+those other tables at all.
 
 ## Ledger Immutability (implemented, Task 2)
 

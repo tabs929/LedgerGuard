@@ -1,8 +1,9 @@
 # Test Strategy
 
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
-> (idempotency), Task 11 (transactional outbox), and Task 12 (Kafka
-> publishing), and every test runs automatically in CI (Task 9) on every
+> (idempotency), Task 11 (transactional outbox), Task 12 (Kafka
+> publishing), and Task 13 (Kafka consumption and duplicate-event
+> protection), and every test runs automatically in CI (Task 9) on every
 > push/PR.** The connectivity smoke test (Task 1), schema-verification
 > tests (Task 2), account creation's tests (Task 3), deposit's
 > ledger-balance/rollback/concurrency tests (Task 4), transfer's
@@ -11,12 +12,14 @@
 > (Task 6), the global error-envelope/validation/leakage tests (Task 7),
 > the OpenAPI document/schema-accuracy tests (Task 8), the idempotency
 > header/replay/conflict/rollback/concurrency tests (Task 10), the outbox
-> event/replay/rollback/constraint/immutability tests (Task 11), and the
-> Kafka publisher tests (Task 12, real PostgreSQL **and** real Kafka
-> Testcontainers) all exist (see "Currently Implemented" below) and all
-> run in `.github/workflows/ci.yml` (see "CI" below). Only `GET
-> /api/v1/accounts/{id}` remains untested, since that plain-lookup
-> endpoint was never assigned to any task and so still doesn't exist.
+> event/replay/rollback/constraint/immutability tests (Task 11), the
+> Kafka publisher tests (Task 12), and the Kafka consumer
+> validation/duplicate/conflict/rollback tests (Task 13, real PostgreSQL
+> **and** real Kafka Testcontainers) all exist (see "Currently
+> Implemented" below) and all run in `.github/workflows/ci.yml` (see "CI"
+> below). Only `GET /api/v1/accounts/{id}` remains untested, since that
+> plain-lookup endpoint was never assigned to any task and so still
+> doesn't exist.
 
 ## Split
 
@@ -48,6 +51,14 @@ disables the Kafka publisher entirely
 connection — no `NewTopic` bean and no `@Scheduled` poller are even
 registered in those suites' contexts. No Kafka broker behavior is ever
 mocked in the one suite that does start Kafka.
+
+`LedgerEventConsumerIntegrationTest` (Task 13) likewise starts its own
+isolated `apache/kafka:3.8.0` container and re-enables both
+`ledgerguard.outbox.publisher.enabled` and
+`ledgerguard.inbox.consumer.enabled` (both `false` by default in
+`application-test.yml`, for the same reason as above). No PostgreSQL
+transaction/locking behavior and no Kafka consumption is ever mocked in
+this suite either.
 
 ## Schema-Level Tests (implemented, Task 2)
 
@@ -504,6 +515,104 @@ configuration is valid, and a blank topic or a non-positive partitions/
 replication-factor/poll-delay/batch-size/send-timeout each produce a
 violation.
 
+## Kafka Consumer Tests (implemented, Task 13)
+
+`LedgerEventConsumerIntegrationTest` (19 tests) verifies Kafka consumption
+and duplicate-event protection against **both** a real PostgreSQL 16.4
+Testcontainer and a real `apache/kafka:3.8.0` Testcontainer — no
+PostgreSQL transaction/locking behavior and no Kafka broker/consumer
+behavior is ever mocked. Both the Task 12 publisher and the Task 13
+consumer are re-enabled for this class (both `false` by default in
+`application-test.yml`).
+
+A deliberate design choice shapes which tests go through the real Kafka
+topic versus calling `LedgerEventProcessor` directly: a permanently
+invalid or conflicting record is *never* acknowledged (see
+`docs/ARCHITECTURE.md`'s "Kafka Consumption" section), so it retries on
+its Kafka partition indefinitely by design. Producing even one or two
+such records onto the real, shared 3-partition topic risked the default
+key-hash partitioner landing a later test's legitimate record on the same
+partition as an earlier test's permanently-stuck one — which would then
+never be delivered and hang that later test. `LedgerEventValidator` is
+already exhaustively unit-tested in isolation (`LedgerEventValidatorTest`,
+below); this integration suite instead calls
+`LedgerEventProcessor.process(...)` directly — still against this class's
+real PostgreSQL Testcontainer, so the actual transactional behavior is
+genuinely exercised — for every case that would otherwise retry forever.
+Success and identical-duplicate cases (which always acknowledge and so
+can never block a partition) go through the real topic and the real
+`@KafkaListener` container throughout.
+
+- **Migration/schema:** `V1`–`V4` all apply from an empty schema and
+  Flyway validation succeeds; `processed_event` has exactly the expected
+  columns, constraints (event type, schema version, payload-hash format,
+  non-blank topic, non-negative partition/offset, the source-position
+  uniqueness constraint), and both immutability triggers; `V1`–`V3`
+  objects are confirmed still present and unchanged.
+- **Consumer/topic configuration:** the consumer uses the configured
+  topic and group id.
+- **Deposit/transfer consumption (real topic, real listener):** a valid
+  record of each type, produced directly to the topic, results in exactly
+  one `processed_event` row with the correct `aggregate_id`, `event_type`,
+  `schema_version`, a `payload_hash` matching `PayloadHasher.sha256Hex`
+  of the exact produced value, and the real Kafka source
+  topic/partition/offset — with no financial (`ledger_transaction`/
+  `account`) row created anywhere.
+- **Duplicate handling (real topic, real listener):** an identical record
+  delivered twice at different offsets, and the same `eventId` delivered
+  concurrently on two explicitly different partitions, both still result
+  in exactly one `processed_event` row; two `LedgerEventProcessor`
+  invocations racing the same `eventId` concurrently (via an
+  `ExecutorService`, bounded `invokeAll`/`get` timeouts, real PostgreSQL,
+  no JVM-local cache) also produce exactly one row.
+- **Conflicting duplicate handling (direct processor calls — see above
+  for why):** the same `eventId` reused with a different amount,
+  `transactionId`, or `eventType` is rejected via
+  `ConflictingEventException`, the original row's `payload_hash` is
+  unchanged, and no second row is inserted.
+- **Validation (direct processor calls against real PostgreSQL):**
+  malformed JSON and a Kafka-key/`transactionId` mismatch both throw
+  `LedgerEventValidationException` and create no `processed_event` row; a
+  rejected record also leaves `ledger_transaction`, `outbox_event`, and
+  `idempotency_key` completely unchanged — proving the "no downstream
+  mutation" guarantee directly, not just by absence of a listed effect.
+- **Transaction/rollback behavior:** a real, deterministic PostgreSQL
+  failure — a `CHECK (1 = 0) NOT VALID` constraint added directly to
+  `processed_event` for the duration of the test, the same technique
+  `OutboxIntegrationTest`/`OutboxPublisherIntegrationTest` already use —
+  proves the whole transaction rolls back cleanly (no row committed), and
+  that the same event processes successfully once the constraint is
+  removed.
+- **End-to-end Task 11→12→13 flow:** a real deposit (and, separately, a
+  real transfer) is submitted over HTTP, its outbox event is published by
+  the real Task 12 scheduler, consumed by the real Task 13 listener, and
+  results in exactly one `processed_event` row; replaying the identical
+  HTTP request (same `Idempotency-Key`) creates no second `outbox_event`
+  row and therefore nothing new for the consumer to process.
+
+`LedgerEventValidatorTest` (28 unit tests, no Spring context, no Kafka, no
+PostgreSQL) exhaustively covers the validation matrix directly against raw
+JSON strings: structural rejection (malformed JSON, a JSON array/scalar/
+`null`, a missing field, an unexpected field, a `null` field);
+field-format rejection (invalid `eventId`/`transactionId` UUIDs, an
+invalid `occurredAt`, an unknown `eventType`, an unsupported
+`schemaVersion` — as an out-of-range integer, as a string, and as a
+floating-point literal — a Kafka-key/`transactionId` mismatch, a JSON
+numeric `amount`, an incorrectly-scaled or zero/negative `amount`, and a
+lowercase or otherwise unsupported `currency`); and event-type-specific
+rules (a deposit payload carrying a transfer-only field, a transfer
+missing `sourceAccountId`, and a transfer with identical source and
+destination accounts).
+
+`PayloadHasherTest` (5 unit tests) proves the SHA-256 hashing is over the
+exact UTF-8 string (a known test vector, plus that whitespace-only
+differences change the hash). `ProcessedEventRecordTest` (6 unit tests)
+covers the identical-vs-conflicting comparison directly, including that
+source position is never part of the comparison.
+`LedgerConsumerPropertiesValidationTest` (6 unit tests, no Spring context)
+covers the Jakarta Bean Validation constraints on every
+`ledgerguard.inbox.consumer.*` property.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -555,9 +664,16 @@ Handling Tests" above.
 `OutboxPublisherIntegrationTest` and `OutboxPublisherPropertiesValidationTest`
 (Task 12) — see "Outbox Publisher Tests" above.
 
-Total: 245 tests (221 from Phase 1 + Tasks 10–11, plus 17 in the new
-`OutboxPublisherIntegrationTest` and 7 in the new
-`OutboxPublisherPropertiesValidationTest`, all introduced by Task 12).
+`LedgerEventConsumerIntegrationTest`, `LedgerEventValidatorTest`,
+`PayloadHasherTest`, `ProcessedEventRecordTest`, and
+`LedgerConsumerPropertiesValidationTest` (Task 13) — see "Kafka Consumer
+Tests" above.
+
+Total: 309 tests (245 from Phase 1 + Tasks 10–12, plus 19 in the new
+`LedgerEventConsumerIntegrationTest`, 28 in the new
+`LedgerEventValidatorTest`, 6 in the new `LedgerConsumerPropertiesValidationTest`,
+6 in the new `ProcessedEventRecordTest`, and 5 in the new
+`PayloadHasherTest` — 64 new tests, all introduced by Task 13).
 
 ## CI (implemented, Task 9)
 
@@ -573,9 +689,10 @@ no altered profiles. GitHub-hosted runners come with a Docker daemon
 already running, so Testcontainers starts real `postgres:16.4` containers
 on the runner exactly as it does on a developer's machine — no
 `docker-compose.yml` service container, no shared or long-lived database.
-The workflow file itself required no change for Task 12: the same runner
-Docker daemon also starts the real `apache/kafka:3.8.0` Testcontainer
-`OutboxPublisherIntegrationTest` needs, with no additional CI
+The workflow file itself required no change for Task 12 or Task 13: the
+same runner Docker daemon also starts the real `apache/kafka:3.8.0`
+Testcontainers `OutboxPublisherIntegrationTest` and
+`LedgerEventConsumerIntegrationTest` need, with no additional CI
 configuration.
 A failure at any stage (compilation, a unit test, an integration test,
 Spring context startup, a Flyway migration, an immutability-trigger check,

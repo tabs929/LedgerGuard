@@ -4,12 +4,15 @@
 > implemented (Task 2, Flyway V1); account creation (Task 3), deposits
 > (Task 4), transfers (Task 5), account balance/transaction-history reads
 > (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), the
-> transactional outbox (Task 11, Flyway V3), and Kafka publishing of
-> pending outbox events (Task 12) implemented.** Task 12 added no new
-> migration — `V3`'s `published_at` column, its one-way-transition
-> trigger, and its pending partial index were already exactly what safe
-> publishing needed; see "Outbox Event Table" below for how `published_at`
-> is now actually used. The `V1`
+> transactional outbox (Task 11, Flyway V3), Kafka publishing of pending
+> outbox events (Task 12), and durably deduplicated Kafka consumption
+> (Task 13, Flyway V4) implemented.** Task 12 added no new migration —
+> `V3`'s `published_at` column, its one-way-transition trigger, and its
+> pending partial index were already exactly what safe publishing needed;
+> see "Outbox Event Table" below for how `published_at` is now actually
+> used. Task 13 adds exactly one new migration,
+> `V4__add_processed_event_deduplication.sql` — see "Processed Event
+> Table" below. The `V1`
 > tables, constraints, indexes, and triggers described below exist in the
 > database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
@@ -399,12 +402,94 @@ record a future state transition.
   clearing, no overwriting). The only update this trigger ever allows is
   `published_at` moving from `NULL` to a non-null value, exactly once.
 
-No application code path can even attempt an edit — `OutboxEvent` (the
-JPA entity) exposes no setters — so these triggers are a database-level
-guarantee on top of an application-level one, the same reasoning
-`docs/ARCHITECTURE.md`'s "Ledger Immutability" section already gives for
-why a trigger is used instead of relying on differentiated database role
-grants (a single application database role in this project).
+No application code path can attempt any other edit — `OutboxEvent` (the
+JPA entity) exposes exactly one narrow mutator,
+`markPublished(Instant)` (Task 12), used only by `outbox.OutboxPublisher`
+after a successful Kafka acknowledgement — so these triggers are a
+database-level guarantee on top of an application-level one, the same
+reasoning `docs/ARCHITECTURE.md`'s "Ledger Immutability" section already
+gives for why a trigger is used instead of relying on differentiated
+database role grants (a single application database role in this
+project).
+
+## Processed Event Table (Flyway V4, Task 13)
+
+A new, separate table — `V1`, `V2`, and `V3` are untouched. One row per
+Kafka ledger event Task 13 has successfully processed, keyed by the
+event's own stable `event_id` (Task 11's `outbox_event.id`):
+
+```sql
+CREATE TABLE processed_event (
+    event_id           UUID PRIMARY KEY,
+    aggregate_id        UUID NOT NULL,
+    event_type          VARCHAR(30) NOT NULL,
+    schema_version       INTEGER NOT NULL,
+    payload_hash          CHAR(64) NOT NULL,
+    source_topic          VARCHAR(255) NOT NULL,
+    source_partition       INTEGER NOT NULL,
+    source_offset          BIGINT NOT NULL,
+    processed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_processed_event_type CHECK (event_type IN ('DEPOSIT_COMPLETED', 'TRANSFER_COMPLETED')),
+    CONSTRAINT chk_processed_event_schema_version CHECK (schema_version = 1),
+    CONSTRAINT chk_processed_event_payload_hash_format CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT chk_processed_event_source_topic_nonblank CHECK (btrim(source_topic) <> ''),
+    CONSTRAINT chk_processed_event_source_partition_nonneg CHECK (source_partition >= 0),
+    CONSTRAINT chk_processed_event_source_offset_nonneg CHECK (source_offset >= 0),
+    CONSTRAINT uq_processed_event_source_position UNIQUE (source_topic, source_partition, source_offset)
+);
+```
+
+- **`event_id` is the primary key and the sole logical duplicate
+  identity** — deliberately not Kafka topic/partition/offset. A
+  legitimate at-least-once redelivery of the exact same event may land at
+  a completely different Kafka position; if source coordinates were the
+  identity, that ordinary redelivery would look like a brand new event
+  and be processed (and "duplicated") again. `event_id` is what stays
+  constant across any number of redeliveries.
+- `aggregate_id`, `event_type`, `schema_version`, `payload_hash` — the
+  canonical, comparable content of the event, checked against a
+  redelivery with a matching `event_id` to distinguish an identical
+  duplicate (safe no-op) from a conflicting reuse of the same id
+  (rejected) — see `docs/ARCHITECTURE.md`'s "Kafka Consumption" section.
+  `payload_hash` is a SHA-256 hex digest of the *exact* Kafka value
+  string (never a reserialized form) — the full payload itself is not
+  stored; the hash is deliberately the minimal fingerprint needed to
+  detect a conflict, not a payload archive.
+- `source_topic`/`source_partition`/`source_offset` — where this
+  particular delivery was consumed from, recorded for diagnostics.
+  `uq_processed_event_source_position` is a **corruption safeguard, not
+  the deduplication mechanism**: it only prevents two *different*
+  `event_id`s from ever claiming to have been read from the exact same
+  Kafka position, which should never happen under correct redelivery. It
+  deliberately does not constrain two different rows from sharing a
+  `source_topic`/`source_partition` — only the specific
+  `(topic, partition, offset)` triple must be unique.
+- `processed_at` — UTC, database-assigned (`DEFAULT now()`), when this
+  row was committed.
+- **No foreign key to `ledger_transaction` or `outbox_event`.** The
+  consumer boundary must not require direct access to producer-side rows
+  to validate or process an event — `aggregate_id` is stored as a plain
+  UUID value, not a JPA/foreign-key relationship.
+- **No attempt counts, retry timestamps, error-message columns,
+  dead-letter tracking, Kafka consumer-offset-management columns,
+  settlement columns, or reconciliation columns.** Task 13's only retry
+  signal is whether a row exists for a given `event_id` at all — nothing
+  more granular is needed yet.
+
+### Processed Event Immutability
+
+`processed_event` is append-only, enforced the same way `V1`'s ledger
+tables and `V3`'s `outbox_event` are: `trg_processed_event_no_update`
+(`BEFORE UPDATE`) and `trg_processed_event_no_delete` (`BEFORE DELETE`)
+both unconditionally raise an exception — `INSERT` remains the only
+permitted operation, with no exception for `published_at`-style partial
+mutation the way `outbox_event` has, since `processed_event` has no field
+that is ever expected to change after insert.
+`ProcessedEventRepository` (the JDBC-based repository — see
+`docs/ARCHITECTURE.md`'s "Kafka Consumption" section for why it is
+JDBC-based rather than JPA) exposes no update or delete method at all, so
+no application code path can even attempt to violate this.
 
 ## Account Creation Enforcement (implemented, Task 3)
 

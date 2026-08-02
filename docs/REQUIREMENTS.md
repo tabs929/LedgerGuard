@@ -1,8 +1,9 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
 > **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
-> has begun — Task 10 (idempotency), Task 11 (transactional outbox), and
-> Task 12 (Kafka publishing of outbox events) are also implemented. See
+> has begun — Task 10 (idempotency), Task 11 (transactional outbox),
+> Task 12 (Kafka publishing of outbox events), and Task 13 (Kafka
+> consumption and duplicate-event protection) are also implemented. See
 > `docs/TASKS.md` for the per-task breakdown and what each one covered.
 
 ## Scope
@@ -47,6 +48,12 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   request itself — Kafka downtime never fails a financial request (Phase
   2, Task 12 — see below). This is at-least-once publication, not
   exactly-once delivery.
+- Every published event is durably recorded exactly once in PostgreSQL by
+  a real Kafka consumer, keyed by the event's own stable `eventId` — a
+  redelivered duplicate is a safe no-op, and a conflicting reuse of an
+  `eventId` is rejected and never acknowledged as successful (Phase 2,
+  Task 13 — see below). Kafka delivery itself remains at-least-once; the
+  PostgreSQL-side effect is what is idempotent.
 - JPA entities are never returned directly from API endpoints.
 - PostgreSQL (via Testcontainers) is used for all persistence and
   transaction integration tests — H2 is never used as a substitute.
@@ -59,12 +66,10 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   currencies to match exactly.
 - **No authentication or authorization:** Spring Security and JWT are
   introduced in Phase 3. All Phase 1/2 endpoints are unauthenticated.
-- **No Kafka consumer or business reaction to events:** Task 12 publishes
-  pending outbox events to Kafka; nothing in this project consumes them
-  yet — no `@KafkaListener`, no consumer group, no downstream business
-  logic, no settlement or reconciliation reaction. Task 13 adds
-  consumption and duplicate-event protection (keyed by the stable
-  `eventId`, since Task 12 is at-least-once, not exactly-once).
+- **No business reaction to events:** Task 13 consumes and durably
+  deduplicates events, but performs no settlement, reconciliation,
+  balance update, ledger write, notification, or any other downstream
+  business logic — recording `processed_event` is its only effect.
 - **No withdrawals:** only deposits (money entering via the internal
   `EXTERNAL_FUNDING` account) and transfers between customer accounts exist
   in Phase 1/2. A withdrawal operation is designed for structurally (see
@@ -78,7 +83,9 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   database commit. A crash in that window can cause the same event to be
   published again on a later retry. No Kafka transactions, `REQUIRES_NEW`,
   or two-phase commit are used to hide this — see
-  `docs/ARCHITECTURE.md`'s "Kafka Publishing" section.
+  `docs/ARCHITECTURE.md`'s "Kafka Publishing" section. Task 13's consumer
+  makes the *PostgreSQL-side effect* of a redelivered duplicate a
+  no-op — it does not and cannot make Kafka delivery itself exactly-once.
 
 ## Phase 2 Progress
 
@@ -104,10 +111,19 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   row-claiming for multi-instance safety, `published_at` set only after a
   successful broker acknowledgement. At-least-once, not exactly-once. See
   `docs/ARCHITECTURE.md`'s "Kafka Publishing" section.
-- Kafka consumption, settlement CSV import, and reconciliation are the
-  remaining Phase 2 scope per `CLAUDE.md`; idempotency (Task 10), the
-  transactional outbox (Task 11), and Kafka publishing (Task 12) are done
-  so far.
+- **Task 13 — Kafka consumption and duplicate-event protection
+  (implemented):** a real `@KafkaListener` durably records each
+  successfully validated event in a new `processed_event` table, keyed by
+  `eventId`. First delivery: recorded. Identical redelivery: a safe
+  no-op. Conflicting reuse of an `eventId`: rejected, never acknowledged.
+  The Kafka offset is only acknowledged after the PostgreSQL transaction
+  commits. No settlement, reconciliation, balance update, or ledger
+  mutation is performed. See `docs/ARCHITECTURE.md`'s "Kafka Consumption"
+  section and `docs/DATA_MODEL.md`'s "Processed Event Table" section.
+- Settlement CSV import and reconciliation are the remaining Phase 2
+  scope per `CLAUDE.md`; idempotency (Task 10), the transactional outbox
+  (Task 11), Kafka publishing (Task 12), and Kafka consumption/dedup
+  (Task 13) are done so far.
 
 ## Non-Goals
 

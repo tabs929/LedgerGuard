@@ -5,7 +5,7 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–12 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–13 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
@@ -13,8 +13,9 @@ transfers (Task 5), read-only account balance/transaction-history APIs
 (Task 6), centralized error handling (Task 7), OpenAPI/Swagger
 documentation (Task 8), continuous integration (Task 9), idempotency for
 deposits and transfers (Task 10), a transactional outbox for durable
-event persistence (Task 11), and publishing pending outbox events to
-Kafka (Task 12). A Kafka consumer, settlement/reconciliation, and
+event persistence (Task 11), publishing pending outbox events to Kafka
+(Task 12), and consuming those events with durable, database-backed
+duplicate-event protection (Task 13). Settlement/reconciliation and
 authentication remain unimplemented — see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
@@ -231,10 +232,45 @@ between a successful Kafka acknowledgement and the `published_at` commit
 can cause the same event to be published again on a later retry — this
 window is real and is not hidden with Kafka transactions, `REQUIRES_NEW`,
 or two-phase commit (see `docs/ARCHITECTURE.md`'s "Kafka Publishing"
-section for exactly why). Every event's stable `eventId` is what will let
-a future consumer (Task 13) detect and discard such a duplicate. **No
-Kafka consumer exists in this repository yet** — Task 12 is publishing
-only.
+section for exactly why). Every event's stable `eventId` is what lets the
+Task 13 consumer below detect and discard such a duplicate.
+
+## Kafka Consumption
+
+A real `@KafkaListener` (`LedgerEventConsumer`) consumes
+`ledger.transaction-events.v1` under consumer group
+`ledgerguard-transaction-event-consumer-v1` (both configurable). Every
+record is strictly validated against the version-1
+`DEPOSIT_COMPLETED`/`TRANSFER_COMPLETED` contract — exact field set,
+UUID/timestamp/currency/amount format, and the Kafka key matching the
+payload's `transactionId` — before anything else happens; an invalid,
+unsupported, or key-mismatched record is rejected outright.
+
+Duplicate protection is entirely PostgreSQL-native, keyed by the event's
+own stable `eventId` (never by Kafka topic/partition/offset, since a
+legitimate at-least-once redelivery can land at a different position): an
+atomic `INSERT ... ON CONFLICT (event_id) DO NOTHING` either claims first
+processing or reveals an existing row, which is then compared by content
+(a SHA-256 fingerprint of the exact original Kafka value, never the
+payload itself) — an identical match is a safe no-op, a mismatch is
+rejected and never acknowledged as successful. The durable
+`processed_event` record is the *only* effect this consumer has: it never
+creates ledger transactions or entries, never updates a balance, never
+touches `outbox_event` or `idempotency_key`, and performs no settlement,
+reconciliation, or notification of any kind.
+
+The Kafka offset is acknowledged **only after** the PostgreSQL transaction
+that claims the event has committed — never before. A failure of any
+kind (validation, a conflicting event, or a transient database problem)
+negatively acknowledges the record instead, causing Kafka to redeliver it
+after a bounded backoff rather than skipping past it silently.
+
+**This makes the PostgreSQL-side effect of processing a given `eventId`
+idempotent — it does not make Kafka delivery exactly-once.** Kafka
+delivery remains at-least-once, by design; see `docs/ARCHITECTURE.md`'s
+"Kafka Consumption" section for the exact redelivery window and why it
+can't be closed without a distributed transaction this project
+deliberately doesn't add.
 
 ## Technology Stack
 
@@ -242,9 +278,9 @@ only.
 - Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL (via Docker Compose for local development)
-- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox)
-- Spring Data JPA
-- Spring Kafka (Task 12 — publishing only, no consumer)
+- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox, `V4`: processed-event deduplication)
+- Spring Data JPA, Spring Data JDBC (`NamedParameterJdbcTemplate`, for Task 13's deduplication repository)
+- Spring Kafka (Task 12 publishing, Task 13 consumption — no downstream business logic)
 - JUnit 5, Mockito, Testcontainers (including a Kafka Testcontainer)
 - Spring Boot Actuator
 - springdoc-openapi (OpenAPI 3 + Swagger UI)
@@ -314,16 +350,16 @@ hand-maintained file, and covers exactly the five implemented endpoints
 (account creation, deposit, transfer, balance, transaction history) plus
 the shared error-response schema. No authentication scheme is declared.
 
-## Manually Verifying Kafka Publishing
+## Manually Verifying Kafka Publishing and Consumption
 
-The steps below describe how to verify Task 12 end to end locally; they
-were not run as part of writing this documentation — treat them as
+The steps below describe how to verify Tasks 12–13 end to end locally;
+they were not run as part of writing this documentation — treat them as
 instructions, not a claim that this exact sequence was executed.
 
 1. Start PostgreSQL and Kafka: `docker compose up -d` (or just start the
    application — see "Running PostgreSQL and Kafka" above).
-2. Start the application with publisher scheduling enabled (the default):
-   `./mvnw spring-boot:run`.
+2. Start the application with publisher and consumer both enabled (the
+   default): `./mvnw spring-boot:run`.
 3. Submit a deposit with an Idempotency-Key:
    ```
    curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
@@ -331,7 +367,8 @@ instructions, not a claim that this exact sequence was executed.
      -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
      -d '{"amount": "100.00", "currency": "USD"}'
    ```
-4. Inspect the topic with a console consumer:
+4. Inspect the topic with a console consumer (a second, independent
+   reader — the application's own consumer group already consumed it too):
    ```
    docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
      --bootstrap-server localhost:9092 \
@@ -343,17 +380,23 @@ instructions, not a claim that this exact sequence was executed.
 6. Confirm the printed JSON value matches the stored outbox payload —
    `eventType: "DEPOSIT_COMPLETED"`, the same `transactionId`,
    `destinationAccountId`, `amount` (four decimals), and `currency`.
-7. Confirm `published_at` is populated (non-null) for that row once the
-   next poll cycle runs (`ledgerguard.outbox.publisher.poll-delay-millis`,
-   default 2000ms).
-8. Retry the same deposit (same Idempotency-Key, same body).
-9. Confirm no second outbox row and no second Kafka record are produced —
-   the retry returns the identical original response.
-10. Stop Kafka (`docker compose stop kafka`), submit a new deposit with a
+7. Confirm `published_at` is populated (non-null) for that
+   `outbox_event` row once the next poll cycle runs
+   (`ledgerguard.outbox.publisher.poll-delay-millis`, default 2000ms).
+8. Query PostgreSQL directly and confirm exactly one `processed_event`
+   row exists for that transaction's event, with a `payload_hash` and a
+   non-null `processed_at`.
+9. Retry the same deposit (same Idempotency-Key, same body).
+10. Confirm no second `outbox_event` row, no second Kafka record, and no
+    second `processed_event` row are produced — the retry returns the
+    identical original response, and there is nothing new for the
+    consumer to process.
+11. Stop Kafka (`docker compose stop kafka`), submit a new deposit with a
     fresh Idempotency-Key, and confirm the request still succeeds (201)
     and its `outbox_event` row's `published_at` remains `NULL`.
-11. Restart Kafka (`docker compose start kafka`) and confirm that pending
-    event is published on a later poll, without resubmitting the request.
+12. Restart Kafka (`docker compose start kafka`) and confirm that pending
+    event is published on a later poll, without resubmitting the request,
+    and that a `processed_event` row for it appears shortly after.
 
 ## Running Tests
 
@@ -361,7 +404,7 @@ instructions, not a claim that this exact sequence was executed.
 ./mvnw verify
 ```
 
-This runs the full test suite (245 tests), including Testcontainers-backed
+This runs the full test suite (309 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
@@ -371,18 +414,19 @@ deposit test suite, a transfer test suite, an account
 balance/transaction-history test suite, a global error-handling test
 suite, an OpenAPI documentation test suite, an idempotency test suite
 (Task 10), an outbox test suite plus a small unit-test suite (Task 11),
-and a Kafka publisher test suite plus a small configuration-validation
-unit-test suite (Task 12). The idempotency suite verifies header
-validation, exact response replay, same- and cross-operation conflict
-detection, that a failed attempt never consumes the key, and — against
-real PostgreSQL advisory locking, never mocks or Java-only
-synchronization, with bounded timeouts rather than `Thread.sleep` — that
-concurrent requests sharing a key produce exactly one financial write.
-The outbox suite verifies exactly one event row per new deposit/transfer
-with the approved payload shape, no duplicate event on any idempotent
-replay (including concurrently), full rollback of the event alongside
-the ledger/idempotency state on any failure — including a forced,
-genuine outbox-insertion failure — and that every database-level
+a Kafka publisher test suite plus a small configuration-validation
+unit-test suite (Task 12), and a Kafka consumer test suite plus focused
+unit tests for validation, hashing, and duplicate comparison (Task 13).
+The idempotency suite verifies header validation, exact response replay,
+same- and cross-operation conflict detection, that a failed attempt never
+consumes the key, and — against real PostgreSQL advisory locking, never
+mocks or Java-only synchronization, with bounded timeouts rather than
+`Thread.sleep` — that concurrent requests sharing a key produce exactly
+one financial write. The outbox suite verifies exactly one event row per
+new deposit/transfer with the approved payload shape, no duplicate event
+on any idempotent replay (including concurrently), full rollback of the
+event alongside the ledger/idempotency state on any failure — including a
+forced, genuine outbox-insertion failure — and that every database-level
 constraint, immutability trigger, and the `V1`–`V3` migration sequence
 all behave exactly as documented. The Kafka publisher suite runs against
 a **real Kafka Testcontainer** (never a mocked broker): it verifies topic/
@@ -394,8 +438,17 @@ event publishes successfully once retried against a working broker), that
 one failed candidate never blocks a later one, safe concurrent publishing
 of both the same event and distinct events, deterministic candidate
 ordering/bounded batching, and that the V3 immutability triggers remain
-fully effective after a real publish. The deposit and transfer suites
-both verify balanced double-entry
+fully effective after a real publish. The Kafka consumer suite, also
+against a real Kafka Testcontainer, verifies strict version-1 event
+validation, that duplicate deliveries (different offsets, different
+partitions, or two processor calls racing the same event id against real
+PostgreSQL) produce exactly one `processed_event` row, that conflicting
+reuse of an event id is rejected and never acknowledged, that a genuine
+database failure rolls back cleanly and the record processes successfully
+once corrected, that the Kafka offset is only acknowledged after the
+PostgreSQL commit, and a full deposit/transfer flow proving Tasks 11–13
+work together end to end. The deposit and transfer suites both verify
+balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
 no Java-only synchronization) — the transfer suite additionally proves
@@ -441,14 +494,14 @@ reports are uploaded as a short-retention build artifact for diagnosis.
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
   error-handling, API-documentation, CI, idempotency, the transactional
-  outbox, and Kafka publishing are all implemented)
+  outbox, Kafka publishing, and Kafka consumption are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
   (Flyway V1); account creation, deposits, and transfers all read/write
   them; the balance/history endpoints read all three but write none of
-  them. `idempotency_key` (Flyway V2, Task 10) and `outbox_event`
-  (Flyway V3, Task 11) are both separate tables; Task 12 added no new
-  migration.
+  them. `idempotency_key` (Flyway V2, Task 10), `outbox_event` (Flyway
+  V3, Task 11), and `processed_event` (Flyway V4, Task 13) are all
+  separate tables; Task 12 added no new migration.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, and `GET
