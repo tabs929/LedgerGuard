@@ -6,6 +6,12 @@ import com.tarun.ledgerguard.account.InsufficientFundsException;
 import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
 import com.tarun.ledgerguard.idempotency.IdempotencyConflictException;
+import com.tarun.ledgerguard.settlement.InvalidSettlementRequestException;
+import com.tarun.ledgerguard.settlement.SettlementConflictException;
+import com.tarun.ledgerguard.settlement.SettlementFileTooLargeException;
+import com.tarun.ledgerguard.settlement.SettlementImportDisabledException;
+import com.tarun.ledgerguard.settlement.SettlementRowLimitExceededException;
+import com.tarun.ledgerguard.settlement.UnsupportedSettlementContentTypeException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
@@ -17,9 +23,13 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
+import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
 import java.time.Instant;
 import java.util.Comparator;
@@ -77,7 +87,73 @@ public class GlobalExceptionHandler {
 		return build(HttpStatus.CONFLICT, ex.getMessage(), request);
 	}
 
+	// -- settlement import (Task 14) --------------------------------------
+
+	// ledgerguard.settlement.import.enabled=false. One explicit,
+	// documented response for this endpoint only -- every other endpoint
+	// is unaffected by this flag.
+	@ExceptionHandler(SettlementImportDisabledException.class)
+	public ResponseEntity<ApiError> handleSettlementImportDisabled(SettlementImportDisabledException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), request);
+	}
+
+	// Invalid source value, empty/header-only file, malformed CSV header,
+	// or an invalid row. ex.getMessage() is always safe here -- see
+	// InvalidSettlementRequestException's Javadoc: never the raw
+	// submitted value, only a fixed string plus a row number and/or a
+	// hardcoded field name.
+	@ExceptionHandler(InvalidSettlementRequestException.class)
+	public ResponseEntity<ApiError> handleInvalidSettlementRequest(InvalidSettlementRequestException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.BAD_REQUEST, ex.getMessage(), request);
+	}
+
+	@ExceptionHandler(UnsupportedSettlementContentTypeException.class)
+	public ResponseEntity<ApiError> handleUnsupportedSettlementContentType(
+			UnsupportedSettlementContentTypeException ex, HttpServletRequest request) {
+		return build(HttpStatus.UNSUPPORTED_MEDIA_TYPE, ex.getMessage(), request);
+	}
+
+	// File size or row-count limit exceeded -- both represent "too much
+	// data for one import," mapped to the same status.
+	@ExceptionHandler({ SettlementFileTooLargeException.class, SettlementRowLimitExceededException.class })
+	public ResponseEntity<ApiError> handleSettlementLimitExceeded(RuntimeException ex, HttpServletRequest request) {
+		return build(HttpStatus.CONTENT_TOO_LARGE, ex.getMessage(), request);
+	}
+
+	// Spring's own outer multipart size boundary
+	// (spring.servlet.multipart.max-file-size), distinct from Task 14's
+	// own configurable, independently-enforced limit above.
+	@ExceptionHandler(MaxUploadSizeExceededException.class)
+	public ResponseEntity<ApiError> handleMaxUploadSizeExceeded(MaxUploadSizeExceededException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.CONTENT_TOO_LARGE, "Uploaded file exceeds the maximum allowed size.", request);
+	}
+
+	@ExceptionHandler(SettlementConflictException.class)
+	public ResponseEntity<ApiError> handleSettlementConflict(SettlementConflictException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.CONFLICT, ex.getMessage(), request);
+	}
+
 	// -- request-shape validation (400) ----------------------------------
+
+	// A required multipart parameter (source, file) is entirely absent.
+	// Distinct exception types depending on how Spring's multipart
+	// argument resolution fails to find the part.
+	@ExceptionHandler({ MissingServletRequestParameterException.class, MissingServletRequestPartException.class })
+	public ResponseEntity<ApiError> handleMissingParameter(Exception ex, HttpServletRequest request) {
+		return build(HttpStatus.BAD_REQUEST, "Required request parameter is missing.", request);
+	}
+
+	// Any other malformed multipart request (MaxUploadSizeExceededException,
+	// a MultipartException subtype, is handled separately above and takes
+	// precedence for that specific case).
+	@ExceptionHandler(MultipartException.class)
+	public ResponseEntity<ApiError> handleMultipartError(MultipartException ex, HttpServletRequest request) {
+		return build(HttpStatus.BAD_REQUEST, "Malformed multipart request.", request);
+	}
 
 	// The required Idempotency-Key header (deposits, transfers) is absent
 	// entirely. A blank/too-long/invalid-character value is instead caught

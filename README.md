@@ -5,7 +5,7 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–13 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–14 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
@@ -14,8 +14,9 @@ transfers (Task 5), read-only account balance/transaction-history APIs
 documentation (Task 8), continuous integration (Task 9), idempotency for
 deposits and transfers (Task 10), a transactional outbox for durable
 event persistence (Task 11), publishing pending outbox events to Kafka
-(Task 12), and consuming those events with durable, database-backed
-duplicate-event protection (Task 13). Settlement/reconciliation and
+(Task 12), consuming those events with durable, database-backed
+duplicate-event protection (Task 13), and importing external settlement
+CSV files as immutable observations (Task 14). Reconciliation and
 authentication remain unimplemented — see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
@@ -102,9 +103,8 @@ Testcontainers, with no tests skipped. See "Continuous Integration" below.
 
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
 implemented** — no task has been assigned it so far. There is also no
-authentication, no Kafka/event processing/outbox, and no
-settlement/reconciliation — those are explicitly out of scope until later
-Phase 2/3 tasks per `docs/TASKS.md` and `CLAUDE.md`.
+authentication and no reconciliation — those are explicitly out of scope
+until later Phase 2/3 tasks per `docs/TASKS.md` and `CLAUDE.md`.
 
 ## Idempotency
 
@@ -272,15 +272,48 @@ delivery remains at-least-once, by design; see `docs/ARCHITECTURE.md`'s
 can't be closed without a distributed transaction this project
 deliberately doesn't add.
 
+## Settlement Import
+
+`POST /api/v1/settlement-imports` (`multipart/form-data`: a `source` text
+field plus a `file` CSV part) imports a bank/payment-processor's
+settlement CSV. **It records immutable external observations only — it
+never reconciles them against LedgerGuard's own ledger** (that comparison
+is a later task) and never mutates any account, ledger, outbox,
+processed-event, or idempotency state.
+
+The CSV must use the exact header
+`external_reference,transaction_id,amount,currency,settled_at`, UTF-8
+(an optional leading BOM is accepted), CRLF or LF line endings, and
+standard quoting — parsed with Apache Commons CSV, never hand-rolled
+comma-splitting. `transaction_id` is accepted whether or not it matches
+an existing LedgerGuard transaction; an unmatched reference is retained
+as evidence for future reconciliation, not rejected.
+
+Two identities are enforced atomically at the PostgreSQL level (`INSERT
+... ON CONFLICT DO NOTHING`, never an unlocked select-then-insert, never
+a JVM lock or cache): the whole file's `(source, file_hash)` — an exact
+SHA-256 hash of the raw uploaded bytes — and each row's `(source,
+external_reference)`. Re-uploading the exact same file replays the
+original committed result (`200`, `replayed: true`, no new rows); a
+byte-distinct file containing an already-seen identical row counts it as
+a duplicate; a row whose identity already exists with *different*
+content rejects the **entire file** (`409`) and rolls back every row
+already claimed from it. Two new PostgreSQL tables, `settlement_import`
+and `settlement_record` (`V5__add_settlement_import.sql`, `V1`–`V4`
+unchanged), are both append-only. `settlement_record` has **no foreign
+key to `ledger_transaction`** — see `docs/ARCHITECTURE.md`'s "Settlement
+Import" section for why.
+
 ## Technology Stack
 
 - Java 21
 - Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL (via Docker Compose for local development)
-- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox, `V4`: processed-event deduplication)
-- Spring Data JPA, Spring Data JDBC (`NamedParameterJdbcTemplate`, for Task 13's deduplication repository)
+- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox, `V4`: processed-event deduplication, `V5`: settlement import)
+- Spring Data JPA, Spring Data JDBC (`NamedParameterJdbcTemplate`, for Task 13's and Task 14's JDBC-based repositories)
 - Spring Kafka (Task 12 publishing, Task 13 consumption — no downstream business logic)
+- Apache Commons CSV (Task 14 settlement CSV parsing)
 - JUnit 5, Mockito, Testcontainers (including a Kafka Testcontainer)
 - Spring Boot Actuator
 - springdoc-openapi (OpenAPI 3 + Swagger UI)
@@ -404,7 +437,7 @@ instructions, not a claim that this exact sequence was executed.
 ./mvnw verify
 ```
 
-This runs the full test suite (309 tests), including Testcontainers-backed
+This runs the full test suite (417 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
@@ -415,8 +448,11 @@ balance/transaction-history test suite, a global error-handling test
 suite, an OpenAPI documentation test suite, an idempotency test suite
 (Task 10), an outbox test suite plus a small unit-test suite (Task 11),
 a Kafka publisher test suite plus a small configuration-validation
-unit-test suite (Task 12), and a Kafka consumer test suite plus focused
-unit tests for validation, hashing, and duplicate comparison (Task 13).
+unit-test suite (Task 12), a Kafka consumer test suite plus focused
+unit tests for validation, hashing, and duplicate comparison (Task 13),
+and a settlement-import schema/behavior/concurrency test suite plus
+focused unit tests for CSV parsing, hashing, and configuration validation
+(Task 14).
 The idempotency suite verifies header validation, exact response replay,
 same- and cross-operation conflict detection, that a failed attempt never
 consumes the key, and — against real PostgreSQL advisory locking, never
@@ -447,7 +483,17 @@ reuse of an event id is rejected and never acknowledged, that a genuine
 database failure rolls back cleanly and the record processes successfully
 once corrected, that the Kafka offset is only acknowledged after the
 PostgreSQL commit, and a full deposit/transfer flow proving Tasks 11–13
-work together end to end. The deposit and transfer suites both verify
+work together end to end. The settlement-import suite (no Kafka
+Testcontainer — the feature has no Kafka dependency) verifies the full
+CSV contract (headers, quoting, encoding, every field's validation rule),
+exact file-hash/row-hash computation, exact-file replay, identical- and
+conflicting-duplicate classification with whole-file rollback on
+conflict, that neither `account`, `ledger_transaction`, `ledger_entry`,
+`idempotency_key`, `outbox_event`, nor `processed_event` is ever touched,
+and three genuine concurrency scenarios (identical files, byte-distinct
+files sharing one row, and conflicting rows) proving real PostgreSQL
+constraint arbitration rather than request serialization. The deposit and
+transfer suites both verify
 balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
@@ -494,18 +540,21 @@ reports are uploaded as a short-retention build artifact for diagnosis.
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
   error-handling, API-documentation, CI, idempotency, the transactional
-  outbox, Kafka publishing, and Kafka consumption are all implemented)
+  outbox, Kafka publishing, Kafka consumption, and settlement import are
+  all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
   (Flyway V1); account creation, deposits, and transfers all read/write
   them; the balance/history endpoints read all three but write none of
   them. `idempotency_key` (Flyway V2, Task 10), `outbox_event` (Flyway
-  V3, Task 11), and `processed_event` (Flyway V4, Task 13) are all
+  V3, Task 11), `processed_event` (Flyway V4, Task 13), and
+  `settlement_import`/`settlement_record` (Flyway V5, Task 14) are all
   separate tables; Task 12 added no new migration.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
-  /api/v1/accounts/{id}/balance`, and `GET
-  /api/v1/accounts/{id}/transactions` are all implemented and documented
+  /api/v1/accounts/{id}/balance`, `GET
+  /api/v1/accounts/{id}/transactions`, and `POST
+  /api/v1/settlement-imports` are all implemented and documented
   exactly as built, including the shared error-response contract, the
   OpenAPI/Swagger endpoints, and the `Idempotency-Key` contract (Task 10);
   the remaining endpoints are still planned contracts.

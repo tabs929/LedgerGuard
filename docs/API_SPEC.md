@@ -2,35 +2,44 @@
 
 > **Status: Phase 1 (Tasks 1–9) complete. Phase 2, Task 10 (idempotency
 > for deposits and transfers), Task 11 (transactional outbox), Task 12
-> (Kafka publishing of outbox events), and Task 13 (Kafka consumption and
-> duplicate-event protection) implemented.** None of Tasks 11–13 add any
-> new endpoint, request field, response field, status code, or header —
-> the outbox, its Kafka publisher, and its Kafka consumer are all internal
+> (Kafka publishing of outbox events), Task 13 (Kafka consumption and
+> duplicate-event protection), and Task 14 (settlement CSV import)
+> implemented.** None of Tasks 11–13 add any new endpoint, request field,
+> response field, status code, or header — the outbox, its Kafka
+> publisher, and its Kafka consumer are all internal
 > persistence/background-processing details (see `docs/ARCHITECTURE.md`'s
 > "Transactional Outbox", "Kafka Publishing", and "Kafka Consumption"
-> sections); every contract below is unchanged from Task 10. `POST /api/v1/accounts`,
+> sections); every contract for the five Phase 1/Task 10 endpoints below
+> is unchanged from Task 10. `POST /api/v1/accounts`,
 > `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
-> /api/v1/accounts/{id}/balance`, and `GET
-> /api/v1/accounts/{id}/transactions` all exist and match the contracts
+> /api/v1/accounts/{id}/balance`, `GET
+> /api/v1/accounts/{id}/transactions`, and the new `POST
+> /api/v1/settlement-imports` (Task 14) all exist and match the contracts
 > below exactly. Both deposits and transfers are USD-only and always post
 > a balanced double-entry ledger transaction in the same database
 > transaction as the materialized balance updates; the two read endpoints
 > never modify that state. `POST /api/v1/accounts/{id}/deposits` and
 > `POST /api/v1/transfers` additionally require an `Idempotency-Key`
 > request header (Task 10) — see each endpoint's section below and
-> "Idempotency" further down. Every documented error response, from every
-> endpoint, goes through one centralized `@RestControllerAdvice`
+> "Idempotency" further down; `POST /api/v1/settlement-imports` does
+> **not** use that header — its own idempotent-replay behavior is keyed
+> on the uploaded file's content, not a caller-supplied header (see its
+> section below). Every documented error response, from every endpoint,
+> goes through one centralized `@RestControllerAdvice`
 > (`common.GlobalExceptionHandler`) and matches the "Error Response Shape"
-> section below exactly. All five endpoints, every request/response
+> section below exactly. Every endpoint, every request/response
 > schema, and this exact error envelope are also machine-readable at
 > `GET /v3/api-docs` (OpenAPI 3.1 JSON) and browsable at
 > `GET /swagger-ui/index.html` — see "OpenAPI/Swagger" below. Plain
 > `GET /api/v1/accounts/{id}` remains unimplemented — no task has been
 > assigned it so far — no controller, service, or DTO exists for it yet.
-> Settlement/reconciliation and authentication remain unimplemented — see
-> `docs/TASKS.md` for what Tasks 14+ still cover. `processed_event` is
+> Reconciliation and authentication remain unimplemented — see
+> `docs/TASKS.md` for what Tasks 15+ still cover. `processed_event` is
 > never exposed as a public resource — there is no consumer
-> administration, replay, or health-detail endpoint.
+> administration, replay, or health-detail endpoint; likewise
+> `settlement_import`/`settlement_record` have no list, get, retry,
+> update, delete, reconciliation, or administration endpoint — `POST
+> /api/v1/settlement-imports` is the only settlement endpoint.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -227,6 +236,85 @@ malformed or out of bounds — regardless of whether `{id}` would otherwise
 resolve (malformed pagination parameters are rejected before the account
 is even looked up).
 
+## POST /api/v1/settlement-imports (implemented, Task 14)
+
+Imports a CSV file of external settlement observations. **Records
+immutable observations only — never reconciles them against the ledger,
+and never mutates any account, ledger, outbox, processed-event, or
+idempotency state.** See `docs/ARCHITECTURE.md`'s "Settlement Import"
+section for the full duplicate/conflict/concurrency contract.
+
+Request: `multipart/form-data` with two parts —
+- `source` (text, required): external provider identifier, non-blank, at
+  most `ledgerguard.settlement.import.max-source-length` characters
+  (default 64).
+- `file` (required): a CSV file matching the exact header
+  `external_reference,transaction_id,amount,currency,settled_at` — see
+  "Settlement CSV Contract" below.
+
+Response 201 (a new import was recorded):
+```
+{
+  "importId": uuid,
+  "source": string,
+  "fileHash": string (64-character lowercase hex),
+  "totalRows": integer,
+  "insertedRows": integer,
+  "duplicateRows": integer,
+  "replayed": false,
+  "importedAt": iso8601
+}
+```
+
+Response 200 (the exact same file bytes were already imported from this
+source): identical shape, `replayed: true`, and every other field
+reflects the **original** committed import — not a new one.
+
+Response 400: missing/blank `source`, `source` too long, missing/empty
+file, empty or header-only CSV, malformed CSV (bad quoting, wrong column
+count, duplicate/missing/reordered/unknown header), or an invalid row
+(blank/oversized/non-printable `external_reference`, non-canonical
+`transaction_id`, malformed/non-positive/wrong-scale `amount`,
+unsupported/malformed `currency`, or an offset-less `settled_at`) —
+including a repeated `external_reference` within the same file.
+
+Response 409: a row's `(source, external_reference)` identity conflicts
+with a previously stored settlement observation (different transaction
+id, amount, currency, or timestamp) — the entire import is rejected, and
+the original observation is left unchanged.
+
+Response 413: the file, or its row count, exceeds
+`ledgerguard.settlement.import.max-file-size-bytes`/`max-row-count`
+(defaults 5 MiB / 10 000 rows).
+
+Response 415: the uploaded file part's content type is not one of a
+small accepted set (`text/csv`, `application/csv`, `text/plain`,
+`application/octet-stream`, or absent).
+
+Response 503: `ledgerguard.settlement.import.enabled` is `false`. No
+other endpoint is affected by this flag.
+
+### Settlement CSV Contract
+
+Exact header, in this exact order, every time:
+```
+external_reference,transaction_id,amount,currency,settled_at
+```
+
+| Field | Rule |
+|---|---|
+| `external_reference` | Required, trimmed, non-blank, printable text with no control characters, at most `max-external-reference-length` characters (default 128). |
+| `transaction_id` | Required, canonical UUID text. Accepted whether or not it matches an existing LedgerGuard transaction — an unmatched reference is retained, not rejected. |
+| `amount` | Required, plain decimal string with exactly two decimal places, greater than zero. No scientific notation, no locale-specific grouping. Never compared against the referenced transaction's actual amount. |
+| `currency` | Required, exactly three uppercase ASCII letters, and a currency LedgerGuard supports (USD only in Phase 1). Never compared against the referenced transaction's actual currency. |
+| `settled_at` | Required, ISO-8601 instant with an explicit UTC offset (a bare local timestamp is rejected). |
+
+UTF-8 only, with an optional leading BOM accepted. CRLF and LF line
+endings, standard CSV quoting/escaped-quotes/embedded commas/embedded
+newlines inside quoted fields (Apache Commons CSV — never hand-rolled
+comma-splitting). Raw field values are never reflected into an error
+message, log line, or API response.
+
 ## Idempotency (implemented, Task 10)
 
 `POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
@@ -331,6 +419,7 @@ behind each one.
 - `POST /api/v1/transfers` (Task 5) — see above.
 - `GET /api/v1/accounts/{id}/balance` (Task 6) — see above.
 - `GET /api/v1/accounts/{id}/transactions` (Task 6) — see above.
+- `POST /api/v1/settlement-imports` (Task 14) — see above.
 - `GET /v3/api-docs` and `GET /swagger-ui/index.html` (Task 8) — see
   "OpenAPI/Swagger" below.
 - Spring Boot Actuator's built-in health check:
@@ -350,10 +439,10 @@ actual request/response shapes.
 - **Swagger UI:** `GET /swagger-ui/index.html` (the conventional
   `GET /swagger-ui.html` short form also redirects there).
 
-Documents exactly the five endpoints above — `POST /api/v1/accounts`,
+Documents exactly the six endpoints above — `POST /api/v1/accounts`,
 `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`,
-`GET /api/v1/accounts/{id}/balance`, `GET /api/v1/accounts/{id}/transactions`
-— with their exact request/response schemas, documented status codes, and
+`GET /api/v1/accounts/{id}/balance`, `GET /api/v1/accounts/{id}/transactions`,
+`POST /api/v1/settlement-imports` — with their exact request/response schemas, documented status codes, and
 the shared `ApiError` envelope reused across every error response. No
 security scheme is declared (Phase 1 has no authentication — declaring one
 would falsely imply these endpoints are protected). No `EXTERNAL_FUNDING`

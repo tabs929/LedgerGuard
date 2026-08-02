@@ -1,16 +1,18 @@
 # Architecture
 
 > **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency),
-> 11 (transactional outbox), 12 (Kafka publishing), and 13 (Kafka
-> consumption and duplicate-event protection) implemented.** Database
-> layer (Task 2), account creation (Task 3), deposits (Task 4), transfers
-> (Task 5), account balance/transaction-history reads (Task 6), global
-> error handling (Task 7), OpenAPI documentation (Task 8), CI (Task 9),
-> idempotency for deposits/transfers (Task 10), the transactional outbox
-> (Task 11), publishing pending outbox events to Kafka (Task 12), and
-> durably deduplicated Kafka consumption (Task 13) are all implemented;
-> only plain account lookup by id remains unimplemented — no task has
-> ever been assigned it. The `account` package has account creation,
+> 11 (transactional outbox), 12 (Kafka publishing), 13 (Kafka
+> consumption and duplicate-event protection), and 14 (settlement CSV
+> import) implemented.** Database layer (Task 2), account creation
+> (Task 3), deposits (Task 4), transfers (Task 5), account
+> balance/transaction-history reads (Task 6), global error handling
+> (Task 7), OpenAPI documentation (Task 8), CI (Task 9), idempotency for
+> deposits/transfers (Task 10), the transactional outbox (Task 11),
+> publishing pending outbox events to Kafka (Task 12), durably
+> deduplicated Kafka consumption (Task 13), and settlement CSV import
+> (Task 14) are all implemented; only plain account lookup by id remains
+> unimplemented — no task has ever been assigned it. The `account`
+> package has account creation,
 > deposit processing, and read-only account queries; the `ledger` package
 > has `LedgerTransaction`, `LedgerEntry`, and their repositories/enums;
 > the `transfer` package has transfer processing; the `idempotency`
@@ -21,10 +23,14 @@
 > factory, the publisher scheduler, the per-event transactional
 > publisher, the Kafka topic configuration, and validated publisher
 > properties — see "Transactional Outbox" and "Kafka Publishing" below;
-> the new `inbox` package (Task 13) has the Kafka listener, the
+> the `inbox` package (Task 13) has the Kafka listener, the
 > transactional event processor, the JDBC-based processed-event
 > repository, strict event validation, and validated consumer properties
-> — see "Kafka Consumption" below. The `common` package holds
+> — see "Kafka Consumption" below; the new `settlement` package (Task 14)
+> has the multipart controller, the CSV parser, the transactional import
+> processor, the two JDBC-based repositories, validated import
+> properties, and the hashing/normalization utilities — see "Settlement
+> Import" below. The `common` package holds
 > `PagedResponse<T>` (Task 6), `ApiError` and `GlobalExceptionHandler`
 > (Task 7), and `OpenApiConfig` (Task 8 — see "API Documentation" below).
 > Task 9 added `.github/workflows/ci.yml` only — no application code, no
@@ -32,13 +38,16 @@
 > end of this document). `GET /api/v1/accounts/{id}` still does not
 > exist, so the public-vs-internal lookup split described below is still
 > only partially realized (see that section for exactly what deposits,
-> transfers, and the read endpoints do instead). Settlement/reconciliation
-> and authentication remain unimplemented — see `docs/TASKS.md` for what
-> Tasks 14+ still cover; Task 12 provides **at-least-once** publication
+> transfers, and the read endpoints do instead). Reconciliation and
+> authentication remain unimplemented — see `docs/TASKS.md` for what
+> Tasks 15+ still cover; Task 12 provides **at-least-once** publication
 > and Task 13 makes the PostgreSQL-side consumer effect idempotent for a
 > given `eventId` — neither claims, nor together produce, exactly-once
 > Kafka delivery. Task 13 performs no settlement, reconciliation, balance
-> update, or ledger mutation of any kind.
+> update, or ledger mutation of any kind. Task 14 only records immutable
+> external settlement observations — it performs no reconciliation, and
+> no ledger, balance, outbox, Kafka, processed-event, or idempotency
+> mutation of any kind.
 
 ## Style
 
@@ -1066,6 +1075,139 @@ never updates an `Account` balance, never touches `outbox_event`
 `processed_event` insert described above is Task 13's only effect,
 by construction — there is no code path in `inbox` that reaches any of
 those other tables at all.
+
+## Settlement Import (implemented, Task 14)
+
+Imports a CSV file of settlement observations reported by an external
+bank or payment processor, via `POST /api/v1/settlement-imports`
+(`multipart/form-data`, `source` text field + `file` CSV part). Task 14
+**only records immutable external observations** — it does not reconcile
+them against LedgerGuard's own ledger (that is Task 15's job) and never
+mutates any account, ledger, outbox, processed-event, or idempotency
+state. The `settlement` package: `SettlementImportController` (multipart
+request validation only, no CSV/SQL logic), `SettlementImportService`
+(bounded file reading, exact SHA-256 file hashing, orchestration —
+no database transaction of its own), `SettlementCsvParser` (strict
+RFC 4180 parsing via Apache Commons CSV, no database access),
+`SettlementImportProcessor` (a separate `@Transactional` bean — the same
+self-invocation-avoidance reason as `OutboxPublisher`/`LedgerEventProcessor`
+— that performs the whole-file atomic import), `SettlementImportRepository`/
+`SettlementRecordRepository` (`NamedParameterJdbcTemplate`-based atomic
+`INSERT ... ON CONFLICT DO NOTHING`, deliberately not JPA, the same reason
+as `ProcessedEventRepository`), `SettlementImportProperties` (validated
+`ledgerguard.settlement.import.*` config), `SettlementCsvRow`/
+`StoredSettlementImport`/`StoredSettlementRecord`/`SettlementImportOutcome`,
+`RowFingerprint`/`Sha256`/`SourceNormalizer` (small, pure hashing/encoding
+utilities), and the exception types
+`SettlementImportDisabledException`/`InvalidSettlementRequestException`/
+`UnsupportedSettlementContentTypeException`/`SettlementFileTooLargeException`/
+`SettlementRowLimitExceededException`/`SettlementConflictException`, all
+mapped to their documented status codes by `GlobalExceptionHandler`.
+
+### CSV contract
+
+Exact header order required: `external_reference,transaction_id,amount,
+currency,settled_at` — any missing/extra/reordered/duplicate/unknown
+column rejects the whole file (400). UTF-8 only (an optional leading BOM
+is stripped before hashing comparisons occur at the parsing layer, but
+`file_hash` below is always computed over the *original*, pre-strip
+bytes); CRLF and LF line endings; standard CSV quoting, escaped quotes,
+embedded commas, and embedded newlines inside quoted fields, via Apache
+Commons CSV — never hand-rolled comma-splitting. `amount` must be a plain
+decimal string with exactly two decimal places, greater than zero, no
+scientific notation, no locale-specific grouping — parsed with
+`BigDecimal`, never `float`/`double`. `currency` must be exactly three
+uppercase ASCII letters *and* a currency LedgerGuard actually supports
+(USD only in Phase 1, mirroring `AccountService`'s list) — but Task 14
+never compares the reported amount/currency against the referenced
+transaction's actual values; that comparison, if any, belongs to Task 15.
+`transaction_id` must be a canonical UUID string but is accepted whether
+or not it matches an existing `ledger_transaction` row — an unmatched
+reference is retained as evidence for future reconciliation, not
+rejected. `settled_at` must be an ISO-8601 instant with an explicit UTC
+offset (a bare local timestamp without an offset is rejected).
+`external_reference` must be non-blank, printable text with no control
+characters, up to `ledgerguard.settlement.import.max-external-reference-length`.
+A repeated `external_reference` within one file unconditionally rejects
+the whole file (400) — the simpler, more unambiguous of the two contracts
+the Task 14 specification allowed, rather than tolerating an identical
+intra-file repeat while rejecting only a conflicting one.
+
+### File identity, row identity, and hashing
+
+`file_hash` is the lowercase SHA-256 hex digest of the *exact* uploaded
+bytes, computed before any BOM removal, UTF-8 decoding, or CSV parsing —
+two byte-distinct files with logically equivalent rows hash differently.
+The logical file identity is `(normalized_source, file_hash)`.
+`normalized_source` is the lowercase form of the trimmed `source` field
+(`SourceNormalizer`) — the display value is preserved separately in
+`settlement_import.source`.
+
+A settlement observation's logical identity is
+`(normalized_source, external_reference)`. Its fingerprint (`row_hash`)
+is a SHA-256 hex digest over a **length-prefixed** canonical encoding
+(`RowFingerprint`) of every business field — `<byte-length>:<value>` for
+each of normalized source, external reference, canonical transaction
+UUID, two-decimal amount, uppercase currency, and the settled-at instant
+normalized to ISO-8601 UTC — concatenated in a fixed order. Length
+prefixing (not a delimiter-joined string) makes every field boundary
+unambiguous regardless of its content, so two different field tuples can
+never collide onto the same canonical string.
+
+### Duplicate and conflict behavior
+
+| Scenario | Behavior |
+|---|---|
+| Same `(normalized_source, file_hash)` re-uploaded | 200, the original committed import result, `replayed: true`. No new `settlement_import` row, no new `settlement_record` rows. |
+| A byte-distinct file containing a row identical (same `row_hash`) to an already-stored observation | 201 for the new import; that row is counted in `duplicateRows`, not re-inserted. |
+| A row whose `(normalized_source, external_reference)` already exists with a *different* `row_hash`/business fields | 409, the **entire file's import is rolled back** — no `settlement_import` row, no `settlement_record` rows from that file, and the original stored observation is left untouched. |
+
+Claims are atomic PostgreSQL operations — `INSERT ... ON CONFLICT DO
+NOTHING`, then (only if that insert claimed nothing) a plain `SELECT` to
+compare the existing row's hash — never an unlocked "SELECT, then insert
+if absent," never a JVM lock, static map, or cache, and never a JPA
+constraint-violation exception used as duplicate control flow (the same
+concurrency-safety pattern `outbox`/`inbox` already established).
+`SettlementImportProcessor.importFile(...)` claims every row first,
+computing final `insertedRowCount`/`duplicateRowCount`, and inserts the
+`settlement_import` row **last**, since that table is append-only and
+must never be inserted with placeholder counts and updated afterward;
+`settlement_record.first_import_id`'s foreign key is declared
+`DEFERRABLE INITIALLY DEFERRED` in `V5` specifically so a row can
+reference that not-yet-inserted import id without failing the constraint
+mid-transaction. Under a genuine concurrent race for the same
+`(normalized_source, file_hash)`, PostgreSQL blocks a conflicting insert
+against an uncommitted row until the first transaction resolves; the
+loser's row claims therefore already resolve as identical duplicates
+against the winner's now-committed data, and the loser's own final
+`settlement_import` claim then also loses, so it returns the winner's
+result as a replay — correct across multiple application instances with
+zero JVM-local coordination.
+
+### Configuration and limits
+
+`ledgerguard.settlement.import.{enabled, max-file-size-bytes,
+max-row-count, max-source-length, max-external-reference-length}`
+(`SettlementImportProperties`, validated, defaults: `true`, 5 MiB,
+10 000, 64, 128). `spring.servlet.multipart.max-file-size`/
+`max-request-size` (`application.yml`) is an *outer* boundary only — the
+actual enforced limit is the smaller, independently configurable Task 14
+property, checked again inside `SettlementImportService` regardless of
+the framework-level setting. When disabled, every import request
+receives one explicit 503 response; no other endpoint is affected.
+
+### Filename and content handling
+
+The submitted filename is never trusted for identity, parsing, or
+authorization, and is never used to construct a filesystem path — only a
+sanitized basename (directory components stripped, length-capped) is
+stored as `settlement_import.original_filename`, audit metadata only. No
+uploaded file is ever written to an application-controlled path; the only
+filesystem interaction is reading `MultipartFile#getInputStream()`, a
+framework-managed temporary resource. Raw CSV content is never logged,
+and no field value is ever reflected into an error message, log line, or
+API response — every validation error carries only a row number and a
+hardcoded field name.
 
 ## Ledger Immutability (implemented, Task 2)
 

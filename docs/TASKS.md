@@ -371,6 +371,96 @@ the approved plan (see project history / plan file) and will be captured in
       isolation. Every PostgreSQL-only suite disables both the Task 12
       publisher and the Task 13 consumer via `application-test.yml`, so
       neither ever attempts a Kafka connection.
-- [ ] 14. Settlement CSV import
+- [x] 14. Settlement CSV import — `POST /api/v1/settlement-imports`
+      (`multipart/form-data`: `source` text field + `file` CSV part)
+      records immutable external settlement observations reported by a
+      bank or payment processor. **Records observations only — no
+      reconciliation** (that is Task 15) and no account, ledger, outbox,
+      Kafka, processed-event, or idempotency mutation of any kind. New
+      `settlement` package: `SettlementImportController` (multipart
+      validation only), `SettlementImportService` (bounded file reading,
+      exact SHA-256 file hashing, orchestration), `SettlementCsvParser`
+      (strict RFC 4180 parsing via Apache Commons CSV — a new dependency,
+      no hand-rolled comma-splitting), `SettlementImportProcessor` (a
+      separate `@Transactional` bean, the same self-invocation-avoidance
+      pattern as `OutboxPublisher`/`LedgerEventProcessor`, performing the
+      whole-file atomic import), `SettlementImportRepository`/
+      `SettlementRecordRepository` (`NamedParameterJdbcTemplate`-based
+      atomic `INSERT ... ON CONFLICT DO NOTHING`, deliberately not JPA —
+      the same reason as `ProcessedEventRepository`), validated
+      `SettlementImportProperties` (`ledgerguard.settlement.import.*`:
+      `enabled`, `max-file-size-bytes`, `max-row-count`,
+      `max-source-length`, `max-external-reference-length`), and small
+      pure utilities `RowFingerprint`/`Sha256`/`SourceNormalizer`. Exactly
+      one new migration, `V5__add_settlement_import.sql` (`V1`–`V4`
+      unmodified): `settlement_import` (one row per committed whole-file
+      import, unique `(normalized_source, file_hash)`) and
+      `settlement_record` (one row per distinct observation, unique
+      `(normalized_source, external_reference)`, **no foreign key to
+      `ledger_transaction`** — an unmatched reported transaction id is
+      retained as future-reconciliation evidence, not rejected — and a
+      `DEFERRABLE INITIALLY DEFERRED` foreign key to `settlement_import`
+      so a row can reference its not-yet-inserted parent import within
+      one transaction). Both tables are append-only (the same
+      `BEFORE UPDATE`/`BEFORE DELETE`-rejecting trigger style as
+      `V1`/`V3`/`V4`). CSV contract: exact header
+      `external_reference,transaction_id,amount,currency,settled_at`;
+      UTF-8 with an optional BOM; CRLF/LF; full quoting/escaped-quote/
+      embedded-comma/embedded-newline support; two-decimal `BigDecimal`
+      amounts (no scientific notation, no locale formatting); currency
+      restricted to what LedgerGuard actually supports (USD) but never
+      compared against the referenced transaction's real amount/currency;
+      an ISO-8601 `settled_at` with a mandatory explicit UTC offset; and
+      an unconditional whole-file rejection of any `external_reference`
+      repeated within one file. File identity is
+      `(normalized_source, file_hash)` — `file_hash` is a SHA-256 hex
+      digest of the exact uploaded bytes, computed before BOM
+      removal/decoding/parsing. Observation identity is
+      `(normalized_source, external_reference)`, fingerprinted
+      (`row_hash`) via a length-prefixed canonical encoding
+      (`RowFingerprint`) that is collision-resistant against
+      delimiter-containing CSV content. An exact-file re-upload replays
+      the original committed result (200, `replayed: true`, no new rows);
+      a byte-distinct file containing an already-seen identical row
+      counts it as a duplicate (201, not re-inserted); a row whose
+      identity already exists with *different* business content rejects
+      the **entire file** (409) and rolls back every row already claimed
+      earlier in that same file. All arbitration is atomic PostgreSQL
+      `INSERT ... ON CONFLICT DO NOTHING` plus a follow-up comparison
+      `SELECT` — never an unlocked select-then-insert, never
+      `synchronized`/a static map/Caffeine/Redis/a local file, and never a
+      JPA constraint-violation exception used as duplicate control flow —
+      correct across concurrent requests and multiple application
+      instances with zero JVM-local coordination. The submitted filename
+      is never trusted for identity/parsing/authorization and never used
+      to build a filesystem path — only a sanitized basename is stored as
+      audit metadata (`original_filename`, nullable); no uploaded file is
+      ever written to an application-controlled path. Raw CSV/field
+      values are never logged or reflected into an error message.
+      `DepositService`/`TransferService` are untouched; the Task 12
+      publisher was not tuned. Verified by
+      `SettlementSchemaMigrationIntegrationTest` (20 tests: `V1`–`V5`
+      migration/schema/constraint/trigger checks),
+      `SettlementImportIntegrationTest` (28 tests: valid imports, exact
+      persisted-value/hash verification, unknown/real transaction UUIDs
+      accepted without ledger comparison, exact-file replay,
+      identical/conflicting duplicate handling, transaction/rollback
+      behavior, financial-and-event-table non-effects across `account`,
+      `ledger_transaction`, `ledger_entry`, `idempotency_key`,
+      `outbox_event`, and `processed_event`, request-level validation,
+      and three real concurrency scenarios using
+      `ExecutorService`/`CountDownLatch` — never `Thread.sleep` — to prove
+      genuine PostgreSQL constraint arbitration),
+      `SettlementImportDisabledIntegrationTest` (2 tests: a separate
+      Spring context with the feature disabled — one explicit 503,
+      every other endpoint unaffected),
+      `SettlementImportOpenApiIntegrationTest` (5 tests: endpoint/schema/
+      status-code documentation, no settlement CRUD/reconciliation
+      endpoint), and unit tests `SettlementCsvParserTest` (35),
+      `SettlementImportPropertiesTest` (6), `RowFingerprintTest` (5),
+      `Sha256Test` (4), and `SourceNormalizerTest` (3) — 108 new tests
+      total (417 overall). Every PostgreSQL-only suite relies on the
+      Task 12/13 Kafka beans already being disabled under the `test`
+      profile; none of the new tests start a Kafka Testcontainer.
 - [ ] 15. Reconciliation
 - [ ] 16. Phase 2 reliability, failure, and concurrency hardening

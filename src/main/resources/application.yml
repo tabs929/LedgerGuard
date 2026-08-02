@@ -7,6 +7,14 @@ spring:
   jackson:
     deserialization:
       fail-on-unknown-properties: true
+  servlet:
+    multipart:
+      # Task 14: outer request-level boundary only. The actual enforced
+      # settlement-import limit is the smaller, independently configurable
+      # ledgerguard.settlement.import.max-file-size-bytes below, checked
+      # again inside SettlementImportService regardless of this value.
+      max-file-size: 6MB
+      max-request-size: 7MB
   kafka:
     # Overridable via the KAFKA_BOOTSTRAP_SERVERS environment variable in
     # any environment where localhost:9092 (the local Compose broker,
@@ -71,3 +79,10 @@ ledgerguard:
       # only new ones.
       auto-offset-reset: earliest
       poll-timeout-millis: 5000
+  settlement:
+    import:
+      enabled: true
+      max-file-size-bytes: 5242880
+      max-row-count: 10000
+      max-source-length: 64
+      max-external-reference-length: 128

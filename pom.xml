@@ -73,6 +73,16 @@
 		</dependency>
 
 		<dependency>
+			<!-- Task 14: strict, RFC 4180-compliant CSV parsing for
+			     settlement-import files (quoted fields, escaped quotes,
+			     embedded commas/newlines), not present anywhere else in
+			     the dependency tree; hand-rolled comma-splitting is
+			     explicitly out of scope for a financial-data import. -->
+			<groupId>org.apache.commons</groupId>
+			<artifactId>commons-csv</artifactId>
+			<version>1.14.1</version>
+		</dependency>
+		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-docker-compose</artifactId>
 			<scope>runtime</scope>

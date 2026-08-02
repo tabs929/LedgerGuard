@@ -143,7 +143,11 @@ class OpenApiDocumentationIntegrationTest {
 		Iterator<String> pathNames = paths.fieldNames();
 		Set<String> allPaths = Set.of(
 				"/api/v1/accounts", "/api/v1/accounts/{id}/deposits", "/api/v1/transfers",
-				"/api/v1/accounts/{id}/balance", "/api/v1/accounts/{id}/transactions");
+				"/api/v1/accounts/{id}/balance", "/api/v1/accounts/{id}/transactions",
+				// Task 14: the only settlement endpoint -- no list, get,
+				// retry, update, delete, reconciliation, or administration
+				// endpoint exists for settlement_import/settlement_record.
+				"/api/v1/settlement-imports");
 		while (pathNames.hasNext()) {
 			String path = pathNames.next();
 			if (path.startsWith("/api/v1/")) {

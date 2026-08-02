@@ -2,20 +2,22 @@
 
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
 > (idempotency), Task 11 (transactional outbox), Task 12 (Kafka
-> publishing), and Task 13 (Kafka consumption and duplicate-event
-> protection), and every test runs automatically in CI (Task 9) on every
-> push/PR.** The connectivity smoke test (Task 1), schema-verification
-> tests (Task 2), account creation's tests (Task 3), deposit's
-> ledger-balance/rollback/concurrency tests (Task 4), transfer's
-> ledger-balance/conservation/insufficient-funds/rollback/
-> deadlock-avoidance tests (Task 5), the balance/history read tests
-> (Task 6), the global error-envelope/validation/leakage tests (Task 7),
-> the OpenAPI document/schema-accuracy tests (Task 8), the idempotency
-> header/replay/conflict/rollback/concurrency tests (Task 10), the outbox
-> event/replay/rollback/constraint/immutability tests (Task 11), the
-> Kafka publisher tests (Task 12), and the Kafka consumer
+> publishing), Task 13 (Kafka consumption and duplicate-event
+> protection), and Task 14 (settlement CSV import), and every test runs
+> automatically in CI (Task 9) on every push/PR.** The connectivity smoke
+> test (Task 1), schema-verification tests (Task 2), account creation's
+> tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
+> (Task 4), transfer's ledger-balance/conservation/insufficient-funds/
+> rollback/deadlock-avoidance tests (Task 5), the balance/history read
+> tests (Task 6), the global error-envelope/validation/leakage tests
+> (Task 7), the OpenAPI document/schema-accuracy tests (Task 8), the
+> idempotency header/replay/conflict/rollback/concurrency tests (Task 10),
+> the outbox event/replay/rollback/constraint/immutability tests
+> (Task 11), the Kafka publisher tests (Task 12), the Kafka consumer
 > validation/duplicate/conflict/rollback tests (Task 13, real PostgreSQL
-> **and** real Kafka Testcontainers) all exist (see "Currently
+> **and** real Kafka Testcontainers), and the settlement CSV
+> parsing/hashing/duplicate/conflict/concurrency/financial-non-effect
+> tests (Task 14, real PostgreSQL, no Kafka) all exist (see "Currently
 > Implemented" below) and all run in `.github/workflows/ci.yml` (see "CI"
 > below). Only `GET /api/v1/accounts/{id}` remains untested, since that
 > plain-lookup endpoint was never assigned to any task and so still
@@ -613,6 +615,92 @@ source position is never part of the comparison.
 covers the Jakarta Bean Validation constraints on every
 `ledgerguard.inbox.consumer.*` property.
 
+## Settlement Import Tests (implemented, Task 14)
+
+Unit tests (no Spring context, package `com.tarun.ledgerguard.settlement`):
+- `Sha256Test` (4) — a known SHA-256 test vector, 64-lowercase-hex-char
+  shape, identical-bytes-identical-hash, and that a byte-distinct
+  (BOM-prefixed) file hashes differently from its BOM-stripped equivalent.
+- `RowFingerprintTest` (5) — determinism, 64-lowercase-hex-char shape,
+  that changing any single field changes the hash, that the
+  length-prefixed canonical encoding resists field-boundary ambiguity
+  (two field tuples whose naive concatenation would collide), and the
+  exact length-prefix format.
+- `SourceNormalizerTest` (3) — lowercasing, idempotence, and that two
+  different casings of the same source normalize identically.
+- `SettlementImportPropertiesTest` (6) — Jakarta Bean Validation on every
+  `ledgerguard.settlement.import.*` property, direct against a
+  `Validator`, no Spring context.
+- `SettlementCsvParserTest` (35) — the full CSV-contract matrix: valid
+  single/multi-row parsing, 1-based row numbering, LF and CRLF line
+  endings, an optional UTF-8 BOM, quoted fields with embedded
+  commas/escaped quotes/embedded newlines, ignored blank physical lines,
+  empty file, header-only file, unknown/missing/duplicate/reordered
+  header columns, missing/extra row values, malformed quoting, invalid
+  UTF-8, row-limit enforcement while parsing, a repeated
+  `external_reference` within one file, and every field's validation
+  rule (blank/oversized/control-character `external_reference`,
+  non-canonical `transaction_id`, scientific-notation/locale-formatted/
+  wrong-scale/zero/negative `amount`, lowercase/unsupported `currency`,
+  and an offset-less `settled_at`).
+
+Integration tests (PostgreSQL 16.4 Testcontainers, never H2, never the
+local Docker Compose database):
+- `SettlementSchemaMigrationIntegrationTest` (20) — `V1`–`V5` all apply
+  from an empty schema; `V1`–`V4` unchanged (same descriptions as before
+  Task 14); both settlement tables' columns, primary keys, the unique
+  file/row identity constraints, the absence of a foreign key from
+  `settlement_record` to `ledger_transaction`, the foreign key to
+  `settlement_import`, every `CHECK` constraint, and both tables'
+  append-only `UPDATE`/`DELETE`-rejecting triggers.
+- `SettlementImportIntegrationTest` (28) — HTTP-boundary tests via
+  `TestRestTemplate` against `POST /api/v1/settlement-imports`
+  (`multipart/form-data`), plus direct JDBC verification of persisted
+  state: single/multi-row imports (201, correct counts), exact
+  persisted-value/file-hash/row-hash verification, unknown and real
+  (deposit) transaction UUIDs accepted without any comparison to the
+  ledger's actual amount, exact-file replay (200, no new rows), a
+  logically identical row inside a byte-distinct file (counted as a
+  duplicate, not re-inserted), conflicting amount/currency/transaction-id/
+  timestamp (all 409, whole import rolled back, original observation
+  unchanged — the currency case plants its "existing" row directly via
+  JDBC, since LedgerGuard supports only USD today and a currency conflict
+  cannot otherwise be produced from two valid CSV rows), retry-after-
+  conflict success, an invalid row creating no import or observation, a
+  conflict in a file's *last* row rolling back every earlier row in the
+  same file, financial and event-table non-effects (`account` row count
+  and total balance, `ledger_transaction`, `ledger_entry`,
+  `idempotency_key`, `outbox_event`, `processed_event` all unchanged
+  before vs. after), request-level validation (empty file, header-only
+  file, invalid row, blank source, unsupported content type,
+  file-size-limit and row-count-limit rejection), and three real
+  concurrency tests — two threads uploading the exact same file
+  (exactly one import row, the loser gets a replay), two threads
+  uploading byte-distinct files sharing one identical row (exactly one
+  observation, both imports still complete), and two threads uploading
+  conflicting rows (exactly one winner, one 409) — using
+  `ExecutorService`/`CountDownLatch`-gated concurrent starts, never
+  `Thread.sleep` as the correctness mechanism, proving real PostgreSQL
+  constraint arbitration rather than request serialization.
+- `SettlementImportDisabledIntegrationTest` (2) — a separate
+  `@SpringBootTest` context with
+  `ledgerguard.settlement.import.enabled=false`: every import request
+  gets one explicit 503, and account creation on the same running
+  instance is unaffected.
+- `SettlementImportOpenApiIntegrationTest` (5) — the endpoint is
+  documented; the multipart request body's file part is `type: string,
+  format: binary` and `source` is a required string parameter; the
+  documented status set is exactly `{200, 201, 400, 409, 413, 415}`;
+  400/409 responses reference the shared `ApiError` schema; and no
+  settlement list/get/update/delete/reconciliation endpoint exists.
+
+Every PostgreSQL-only settlement test suite relies on
+`ledgerguard.outbox.publisher.enabled`/`ledgerguard.inbox.consumer.enabled`
+already being `false` under the `test` profile (`application-test.yml`,
+Tasks 12–13) — none of them attempt a Kafka connection, and none of them
+start a Kafka Testcontainer (settlement import has no Kafka dependency at
+all).
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -669,11 +757,20 @@ Handling Tests" above.
 `LedgerConsumerPropertiesValidationTest` (Task 13) — see "Kafka Consumer
 Tests" above.
 
-Total: 309 tests (245 from Phase 1 + Tasks 10–12, plus 19 in the new
-`LedgerEventConsumerIntegrationTest`, 28 in the new
-`LedgerEventValidatorTest`, 6 in the new `LedgerConsumerPropertiesValidationTest`,
-6 in the new `ProcessedEventRecordTest`, and 5 in the new
-`PayloadHasherTest` — 64 new tests, all introduced by Task 13).
+`SettlementSchemaMigrationIntegrationTest`, `SettlementImportIntegrationTest`,
+`SettlementImportDisabledIntegrationTest`, `SettlementImportOpenApiIntegrationTest`,
+`SettlementCsvParserTest`, `SettlementImportPropertiesTest`,
+`RowFingerprintTest`, `Sha256Test`, and `SourceNormalizerTest` (Task 14) —
+see "Settlement Import Tests" above.
+
+Total: 417 tests (309 from Phase 1 + Tasks 10–13, plus 20 in the new
+`SettlementSchemaMigrationIntegrationTest`, 28 in the new
+`SettlementImportIntegrationTest`, 2 in the new
+`SettlementImportDisabledIntegrationTest`, 5 in the new
+`SettlementImportOpenApiIntegrationTest`, 35 in the new
+`SettlementCsvParserTest`, 6 in the new `SettlementImportPropertiesTest`,
+5 in the new `RowFingerprintTest`, 4 in the new `Sha256Test`, and 3 in the
+new `SourceNormalizerTest` — 108 new tests, all introduced by Task 14).
 
 ## CI (implemented, Task 9)
 

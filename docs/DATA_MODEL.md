@@ -5,14 +5,17 @@
 > (Task 4), transfers (Task 5), account balance/transaction-history reads
 > (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), the
 > transactional outbox (Task 11, Flyway V3), Kafka publishing of pending
-> outbox events (Task 12), and durably deduplicated Kafka consumption
-> (Task 13, Flyway V4) implemented.** Task 12 added no new migration —
+> outbox events (Task 12), durably deduplicated Kafka consumption
+> (Task 13, Flyway V4), and settlement CSV import (Task 14, Flyway V5)
+> implemented.** Task 12 added no new migration —
 > `V3`'s `published_at` column, its one-way-transition trigger, and its
 > pending partial index were already exactly what safe publishing needed;
 > see "Outbox Event Table" below for how `published_at` is now actually
 > used. Task 13 adds exactly one new migration,
 > `V4__add_processed_event_deduplication.sql` — see "Processed Event
-> Table" below. The `V1`
+> Table" below. Task 14 adds exactly one new migration,
+> `V5__add_settlement_import.sql` — see "Settlement Import Tables" below.
+> `V1`–`V4` are unmodified by Task 14. The `V1`
 > tables, constraints, indexes, and triggers described below exist in the
 > database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
@@ -490,6 +493,94 @@ that is ever expected to change after insert.
 `docs/ARCHITECTURE.md`'s "Kafka Consumption" section for why it is
 JDBC-based rather than JPA) exposes no update or delete method at all, so
 no application code path can even attempt to violate this.
+
+## Settlement Import Tables (Flyway V5, Task 14)
+
+Two tables, added by `V5__add_settlement_import.sql`. `V1`–`V4` are
+unmodified.
+
+### `settlement_import`
+
+One row per successfully committed whole-file import — inserted **once**,
+with its final row counts already known, never inserted with placeholder
+counts and updated afterward (see `docs/ARCHITECTURE.md`'s "Settlement
+Import" section for why).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `source` | `VARCHAR(64)` | Display value as submitted (trimmed, not case-folded). |
+| `normalized_source` | `VARCHAR(64)` | Lowercase form of `source`; part of both identities below. |
+| `original_filename` | `VARCHAR(255)`, nullable | Sanitized basename only — audit metadata, never used for identity, parsing, or paths. |
+| `file_hash` | `CHAR(64)` | Lowercase SHA-256 hex of the exact uploaded bytes, before BOM removal or decoding. |
+| `file_size_bytes` | `BIGINT` | `> 0` and `<= 104857600` (a database-level sanity ceiling, independent of the smaller, configurable application limit). |
+| `total_row_count` | `INTEGER` | `> 0`. |
+| `inserted_row_count` | `INTEGER` | `>= 0`. |
+| `duplicate_row_count` | `INTEGER` | `>= 0`; `inserted_row_count + duplicate_row_count = total_row_count` (`CHECK`). |
+| `imported_at` | `TIMESTAMPTZ` | `DEFAULT now()`. |
+
+Unique constraint `uq_settlement_import_source_file` on
+`(normalized_source, file_hash)` — the logical file identity. A second
+upload of the exact same bytes from the exact same normalized source
+either replays the existing row (application layer) or, under a genuine
+constraint bypass, is rejected outright by the database.
+
+### `settlement_record`
+
+One row per distinct settlement observation.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `normalized_source` | `VARCHAR(64)` | Part of the observation's identity. |
+| `external_reference` | `VARCHAR(128)` | Non-blank; part of the observation's identity. |
+| `transaction_id` | `UUID` | The LedgerGuard transaction id the external source reports. **No foreign key to `ledger_transaction`** — see below. |
+| `amount` | `NUMERIC(19,2)` | `> 0`. Two decimal places, matching the CSV contract's required scale — not `NUMERIC(19,4)` like `account`/`ledger_entry`, since this column stores an *external report*, never compared against or combined with internal ledger amounts. |
+| `currency` | `VARCHAR(3)` | Format-only `CHECK` (`^[A-Z]{3}$`), the same convention as `account`/`ledger_entry` — currency *support* (USD only) is an application-level check in `SettlementCsvParser`, not a database constraint. |
+| `settled_at` | `TIMESTAMPTZ` | The external source's reported timestamp, stored as reported. |
+| `row_hash` | `CHAR(64)` | SHA-256 hex of the canonical, length-prefixed encoding of every business field above (see `docs/ARCHITECTURE.md`). |
+| `first_import_id` | `UUID` | The import that first created this row. Foreign key to `settlement_import(id)`, **`DEFERRABLE INITIALLY DEFERRED`** — see below. |
+| `source_row_number` | `INTEGER` | `> 0`; the 1-based data-row number within its originating file. |
+| `created_at` | `TIMESTAMPTZ` | `DEFAULT now()`. |
+
+Unique constraint `uq_settlement_record_source_reference` on
+`(normalized_source, external_reference)` — the logical observation
+identity, and the constraint `SettlementRecordRepository.tryClaim(...)`'s
+`INSERT ... ON CONFLICT DO NOTHING` targets.
+
+**Why no foreign key to `ledger_transaction`:** a settlement row may
+legitimately reference a transaction UUID that does not (yet, or ever)
+exist in LedgerGuard — an unmatched external transaction is itself
+important evidence for future reconciliation (Task 15), not invalid data.
+A foreign key would incorrectly reject exactly the rows this table exists
+to retain, so `transaction_id` is stored as a plain `UUID` value with no
+referential-integrity relationship, the same pattern `processed_event`
+already established for `aggregate_id` (Task 13).
+
+**Why the foreign key to `settlement_import` is deferred:**
+`SettlementImportProcessor` claims every `settlement_record` row for a
+new import *before* it knows the import's final row counts (it must
+finish counting first, since `settlement_import` is append-only and is
+never updated after insert) — so those row claims reference
+`first_import_id` before that row exists yet. `DEFERRABLE INITIALLY
+DEFERRED` moves the constraint check from per-statement to per-commit, so
+this within-transaction ordering is valid; the constraint is still fully
+enforced by the time any other transaction can observe the data.
+
+**No settlement status, reconciliation-result, match/mismatch, retry, or
+error-message columns; no raw file or raw row storage; no settlement
+ledger entries or adjustment records; no reconciliation-result table.**
+Task 14 is limited to durably recording the external observation itself.
+
+### Settlement Table Immutability
+
+Both tables are append-only, in the same style as `V1`/`V3`/`V4`:
+`trg_settlement_import_no_update`/`trg_settlement_import_no_delete` and
+`trg_settlement_record_no_update`/`trg_settlement_record_no_delete`
+(`BEFORE UPDATE`/`BEFORE DELETE`) unconditionally raise an exception.
+`SettlementImportRepository` and `SettlementRecordRepository` (both
+JDBC-based, the same reason as `ProcessedEventRepository`) expose no
+update or delete method at all.
 
 ## Account Creation Enforcement (implemented, Task 3)
 

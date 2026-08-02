@@ -2,9 +2,10 @@
 
 > **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
 > has begun — Task 10 (idempotency), Task 11 (transactional outbox),
-> Task 12 (Kafka publishing of outbox events), and Task 13 (Kafka
-> consumption and duplicate-event protection) are also implemented. See
-> `docs/TASKS.md` for the per-task breakdown and what each one covered.
+> Task 12 (Kafka publishing of outbox events), Task 13 (Kafka
+> consumption and duplicate-event protection), and Task 14 (settlement
+> CSV import) are also implemented. See `docs/TASKS.md` for the per-task
+> breakdown and what each one covered.
 
 ## Scope
 
@@ -74,8 +75,9 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   `EXTERNAL_FUNDING` account) and transfers between customer accounts exist
   in Phase 1/2. A withdrawal operation is designed for structurally (see
   `docs/DATA_MODEL.md`) but not implemented.
-- **No reconciliation or settlement import:** still to come later in
-  Phase 2.
+- **No reconciliation:** Task 14 records external settlement observations
+  durably, but never compares them against LedgerGuard's own ledger —
+  that comparison is Task 15, still to come.
 - **No exactly-once delivery:** Task 12 is at-least-once publication.
   Kafka producer idempotence (enabled) suppresses duplicate broker-retry
   sends within one producer session — it does not close the window
@@ -120,10 +122,25 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   commits. No settlement, reconciliation, balance update, or ledger
   mutation is performed. See `docs/ARCHITECTURE.md`'s "Kafka Consumption"
   section and `docs/DATA_MODEL.md`'s "Processed Event Table" section.
-- Settlement CSV import and reconciliation are the remaining Phase 2
-  scope per `CLAUDE.md`; idempotency (Task 10), the transactional outbox
-  (Task 11), Kafka publishing (Task 12), and Kafka consumption/dedup
-  (Task 13) are done so far.
+- **Task 14 — Settlement CSV import (implemented):** `POST
+  /api/v1/settlement-imports` (`multipart/form-data`) parses and strictly
+  validates an external bank/processor's settlement CSV, then atomically
+  claims a whole-file identity `(source, file_hash)` and a per-row
+  identity `(source, external_reference)` via PostgreSQL `INSERT ...
+  ON CONFLICT DO NOTHING` — never an unlocked select-then-insert, never a
+  JVM lock or cache. An exact-file re-upload replays the original
+  committed result (200); a byte-distinct file containing an already-seen
+  identical row counts it as a duplicate; a row whose identity already
+  exists with *different* content rejects the entire file (409) and rolls
+  back every row from it. Records external observations only — no
+  reconciliation, and no account, ledger, outbox, Kafka, processed-event,
+  or idempotency mutation of any kind. See `docs/ARCHITECTURE.md`'s
+  "Settlement Import" section and `docs/DATA_MODEL.md`'s "Settlement
+  Import Tables" section.
+- Reconciliation is the remaining Phase 2 scope per `CLAUDE.md`;
+  idempotency (Task 10), the transactional outbox (Task 11), Kafka
+  publishing (Task 12), Kafka consumption/dedup (Task 13), and settlement
+  CSV import (Task 14) are done so far.
 
 ## Non-Goals
 
