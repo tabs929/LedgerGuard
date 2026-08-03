@@ -32,6 +32,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.time.Instant;
 import java.util.Comparator;
@@ -233,6 +234,19 @@ public class GlobalExceptionHandler {
 	// caught earlier by application-level validation. The original
 	// exception is logged once, server-side, for diagnosis; the client
 	// only ever sees a generic, safe message.
+	// No handler and no static resource matched the request path at all
+	// (e.g. a nonexistent /api/v1/... path, or any other unmapped URL).
+	// Spring throws this for the framework's own default 404 handling;
+	// without this explicit handler it would otherwise be caught by the
+	// generic Exception fallback below and misreported as a 500. Adding
+	// the static UI (src/main/resources/static/) is what first exercised
+	// this path in a test -- the incorrect 500 was already latent
+	// before that, for any unmapped URL under this application.
+	@ExceptionHandler(NoResourceFoundException.class)
+	public ResponseEntity<ApiError> handleNoResourceFound(NoResourceFoundException ex, HttpServletRequest request) {
+		return build(HttpStatus.NOT_FOUND, "No such resource.", request);
+	}
+
 	@ExceptionHandler(Exception.class)
 	public ResponseEntity<ApiError> handleUnexpected(Exception ex, HttpServletRequest request) {
 		log.error("Unhandled exception processing {} {}", request.getMethod(), request.getRequestURI(), ex);

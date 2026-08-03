@@ -398,6 +398,30 @@ docker compose up -d
 
 The application starts on port `8080` by default.
 
+## Demonstration UI
+
+A small, plain HTML/CSS/JavaScript demonstration UI is served directly by
+Spring Boot from `src/main/resources/static/` — no separate frontend
+server, no Node/npm, no build step. Once the application is running, open:
+
+```
+http://localhost:8080/
+```
+
+The UI is only a browser-based client for the existing REST API — every
+action calls `fetch()` against a same-origin, relative URL (e.g.
+`/api/v1/accounts`), and it never accesses PostgreSQL, Kafka, or any
+repository/service directly. It supports: creating an account; looking up
+an existing account's balance and paginated transaction history;
+depositing and transferring funds (with idempotency-key generation);
+uploading a settlement CSV; and running/inspecting reconciliation. Every
+card includes a collapsible "Developer details" panel showing the exact
+HTTP method, path, status, and JSON response for that action. Recently
+used account and settlement-import IDs are kept in the browser's
+`localStorage` purely as a convenience (never balances, CSV contents, or
+full API responses) — a "Clear recent IDs" button is provided at the
+bottom of the page.
+
 ## Actuator Health Check
 
 Once running:
@@ -423,6 +447,37 @@ The document is generated from the actual controllers and DTOs, not a
 hand-maintained file, and covers exactly the five implemented endpoints
 (account creation, deposit, transfer, balance, transaction history) plus
 the shared error-response schema. No authentication scheme is declared.
+
+## Demonstration Workflow
+
+A short end-to-end walkthrough using the Demonstration UI
+(`http://localhost:8080/`) once PostgreSQL (and, if you want the
+reconciliation step to have something realistic to compare against,
+Kafka) are running — see "Running PostgreSQL and Kafka" and "Running the
+Application" above. Full field-by-field contracts are in
+`docs/API_SPEC.md`; this is just the click-through order.
+
+1. **Create two accounts** — in the "Create account" card, submit the form
+   twice with different owner names. Each created account ID is saved to
+   the browser's recent-IDs list automatically.
+2. **Deposit funds** — in the "Deposit" card, pick one of the two accounts
+   (or paste its ID), enter an amount, click "Generate key" for the
+   `Idempotency-Key`, and submit.
+3. **Transfer funds** — in the "Transfer" card, use the funded account as
+   the source and the other account as the destination, generate a key,
+   and submit.
+4. **View balances and history** — in the "Account lookup" card, enter
+   either account ID and load its balance and transaction history.
+5. **Upload a settlement CSV** — in the "Settlement CSV import" card,
+   enter a source name and choose a CSV file matching the shown header
+   (`external_reference,transaction_id,amount,currency,settled_at`); for
+   a realistic row, use one of the deposit transaction IDs shown in step
+   2's result. Submit — the import ID is saved to the recent-IDs list.
+6. **Run reconciliation** — in the "Reconciliation" card, use the import
+   ID from step 5 and click "Start reconciliation".
+7. **Inspect reconciliation results** — click "Load results" in the same
+   card to see the per-row classification (e.g. `MATCHED` if the CSV row
+   referenced a real deposit with the same amount/currency).
 
 ## Manually Verifying Kafka Publishing and Consumption
 

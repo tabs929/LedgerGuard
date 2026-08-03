@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>LedgerGuard — Demonstration UI</title>
+	<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="site-header">
+	<div class="site-header-inner">
+		<div>
+			<h1>LedgerGuard</h1>
+			<p class="tagline">Demonstration UI — a plain API client for the LedgerGuard backend. Not a production frontend.</p>
+		</div>
+		<nav class="quick-links" aria-label="Developer links">
+			<a href="/swagger-ui/index.html">Swagger UI</a>
+			<a href="/v3/api-docs">OpenAPI JSON</a>
+			<a href="/actuator/health">Actuator health</a>
+		</nav>
+	</div>
+</header>
+
+<nav class="section-nav" aria-label="Page sections">
+	<a href="#status">Status</a>
+	<a href="#create-account">Create account</a>
+	<a href="#account-lookup">Account lookup</a>
+	<a href="#deposit">Deposit</a>
+	<a href="#transfer">Transfer</a>
+	<a href="#settlement-import">Settlement import</a>
+	<a href="#reconciliation">Reconciliation</a>
+</nav>
+
+<main>
+
+	<section id="status" class="card" aria-labelledby="status-heading">
+		<h2 id="status-heading">Backend status</h2>
+		<p class="card-description">Calls <code>GET /actuator/health</code>.</p>
+		<div class="status-row">
+			<span id="status-indicator" class="status-indicator status-unknown" role="status" aria-live="polite">Unknown</span>
+			<span id="status-checked-at" class="muted">Not checked yet</span>
+			<button type="button" id="status-refresh">Refresh</button>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="status-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="create-account" class="card" aria-labelledby="create-account-heading">
+		<h2 id="create-account-heading">Create account</h2>
+		<p class="card-description">Calls <code>POST /api/v1/accounts</code>. Every account opens with a zero USD balance; category, class, and purpose are server-assigned.</p>
+		<form id="create-account-form" novalidate>
+			<div class="form-row">
+				<label for="create-account-owner">Owner name</label>
+				<input type="text" id="create-account-owner" name="ownerName" required maxlength="255" autocomplete="off">
+			</div>
+			<div class="form-row">
+				<label for="create-account-currency">Currency</label>
+				<input type="text" id="create-account-currency" name="currency" required maxlength="3" value="USD" autocomplete="off">
+			</div>
+			<button type="submit">Create account</button>
+		</form>
+		<div id="create-account-result" class="result-box" hidden>
+			<h3>Result</h3>
+			<dl class="kv-list" id="create-account-fields"></dl>
+			<button type="button" id="create-account-copy" hidden>Copy account ID</button>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="create-account-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="account-lookup" class="card" aria-labelledby="account-lookup-heading">
+		<h2 id="account-lookup-heading">Account lookup</h2>
+		<p class="card-description">Reads via <code>GET /api/v1/accounts/{id}/balance</code> and <code>GET /api/v1/accounts/{id}/transactions</code>. LedgerGuard has no account-list or account-detail endpoint, so an account id must be supplied.</p>
+		<div class="form-row">
+			<label for="lookup-account-id">Account ID</label>
+			<input type="text" id="lookup-account-id" name="accountId" list="recent-account-ids" autocomplete="off" placeholder="UUID">
+		</div>
+		<p class="muted small" id="recent-accounts-hint">Recently used in this browser: <span id="recent-accounts-list">none yet</span></p>
+
+		<div class="button-row">
+			<button type="button" id="lookup-balance-button">Load balance</button>
+		</div>
+		<div id="lookup-balance-result" class="result-box" hidden>
+			<dl class="kv-list" id="lookup-balance-fields"></dl>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details (balance)</summary>
+			<div id="lookup-balance-dev-details" class="dev-details-body"></div>
+		</details>
+
+		<hr>
+
+		<div class="form-row-group">
+			<div class="form-row">
+				<label for="lookup-page">Page</label>
+				<input type="number" id="lookup-page" name="page" min="0" step="1" value="0">
+			</div>
+			<div class="form-row">
+				<label for="lookup-size">Size</label>
+				<input type="number" id="lookup-size" name="size" min="1" max="100" step="1" value="20">
+			</div>
+			<button type="button" id="lookup-history-button">Load transactions</button>
+		</div>
+		<div id="lookup-history-result" hidden>
+			<div class="table-scroll">
+				<table id="lookup-history-table">
+					<caption class="sr-only">Transaction history</caption>
+					<thead>
+					<tr>
+						<th scope="col">Transaction ID</th>
+						<th scope="col">Entry type</th>
+						<th scope="col">Amount</th>
+						<th scope="col">Currency</th>
+						<th scope="col">Created at</th>
+					</tr>
+					</thead>
+					<tbody id="lookup-history-body"></tbody>
+				</table>
+			</div>
+			<p id="lookup-history-empty" class="muted" hidden>No transactions found for this account and page.</p>
+			<p id="lookup-history-summary" class="muted small"></p>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details (transactions)</summary>
+			<div id="lookup-history-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="deposit" class="card" aria-labelledby="deposit-heading">
+		<h2 id="deposit-heading">Deposit</h2>
+		<p class="card-description">Calls <code>POST /api/v1/accounts/{id}/deposits</code>. Requires an <code>Idempotency-Key</code> header.</p>
+		<form id="deposit-form" novalidate>
+			<div class="form-row">
+				<label for="deposit-account-id">Account ID</label>
+				<input type="text" id="deposit-account-id" name="accountId" list="recent-account-ids" required autocomplete="off" placeholder="UUID">
+			</div>
+			<div class="form-row">
+				<label for="deposit-amount">Amount</label>
+				<input type="text" id="deposit-amount" name="amount" required inputmode="decimal" placeholder="100.00" autocomplete="off">
+			</div>
+			<div class="form-row">
+				<label for="deposit-currency">Currency</label>
+				<input type="text" id="deposit-currency" name="currency" required maxlength="3" value="USD" autocomplete="off">
+			</div>
+			<div class="form-row">
+				<label for="deposit-idempotency-key">Idempotency-Key</label>
+				<div class="input-with-button">
+					<input type="text" id="deposit-idempotency-key" name="idempotencyKey" required maxlength="128" autocomplete="off">
+					<button type="button" id="deposit-generate-key">Generate key</button>
+				</div>
+			</div>
+			<button type="submit">Submit deposit</button>
+		</form>
+		<div id="deposit-result" class="result-box" hidden>
+			<h3>Result</h3>
+			<dl class="kv-list" id="deposit-fields"></dl>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="deposit-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="transfer" class="card" aria-labelledby="transfer-heading">
+		<h2 id="transfer-heading">Transfer</h2>
+		<p class="card-description">Calls <code>POST /api/v1/transfers</code>. Requires an <code>Idempotency-Key</code> header.</p>
+		<form id="transfer-form" novalidate>
+			<div class="form-row">
+				<label for="transfer-source-id">Source account ID</label>
+				<input type="text" id="transfer-source-id" name="sourceAccountId" list="recent-account-ids" required autocomplete="off" placeholder="UUID">
+			</div>
+			<div class="form-row">
+				<label for="transfer-destination-id">Destination account ID</label>
+				<input type="text" id="transfer-destination-id" name="destinationAccountId" list="recent-account-ids" required autocomplete="off" placeholder="UUID">
+			</div>
+			<div class="form-row">
+				<label for="transfer-amount">Amount</label>
+				<input type="text" id="transfer-amount" name="amount" required inputmode="decimal" placeholder="50.00" autocomplete="off">
+			</div>
+			<div class="form-row">
+				<label for="transfer-currency">Currency</label>
+				<input type="text" id="transfer-currency" name="currency" required maxlength="3" value="USD" autocomplete="off">
+			</div>
+			<div class="form-row">
+				<label for="transfer-idempotency-key">Idempotency-Key</label>
+				<div class="input-with-button">
+					<input type="text" id="transfer-idempotency-key" name="idempotencyKey" required maxlength="128" autocomplete="off">
+					<button type="button" id="transfer-generate-key">Generate key</button>
+				</div>
+			</div>
+			<p id="transfer-validation-message" class="field-error" role="alert" hidden></p>
+			<button type="submit">Submit transfer</button>
+		</form>
+		<div id="transfer-result" class="result-box" hidden>
+			<h3>Result</h3>
+			<dl class="kv-list" id="transfer-fields"></dl>
+			<dl class="kv-list" id="transfer-balances"></dl>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="transfer-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="settlement-import" class="card" aria-labelledby="settlement-import-heading">
+		<h2 id="settlement-import-heading">Settlement CSV import</h2>
+		<p class="card-description">Calls <code>POST /api/v1/settlement-imports</code> (<code>multipart/form-data</code>). Records immutable external observations only.</p>
+		<p class="muted small">Required CSV header:</p>
+		<pre class="code-sample">external_reference,transaction_id,amount,currency,settled_at</pre>
+		<form id="settlement-import-form" novalidate>
+			<div class="form-row">
+				<label for="settlement-import-source">Source</label>
+				<input type="text" id="settlement-import-source" name="source" required maxlength="64" autocomplete="off" placeholder="acme-bank">
+			</div>
+			<div class="form-row">
+				<label for="settlement-import-file">CSV file</label>
+				<input type="file" id="settlement-import-file" name="file" accept=".csv,text/csv" required>
+			</div>
+			<button type="submit">Upload and import</button>
+		</form>
+		<div id="settlement-import-result" class="result-box" hidden>
+			<h3>Result</h3>
+			<dl class="kv-list" id="settlement-import-fields"></dl>
+			<button type="button" id="settlement-import-copy" hidden>Copy import ID</button>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="settlement-import-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+	<section id="reconciliation" class="card" aria-labelledby="reconciliation-heading">
+		<h2 id="reconciliation-heading">Reconciliation</h2>
+		<p class="card-description">Compares settlement observations first recorded by one import against the ledger. Records and reports only — never mutates financial state.</p>
+		<div class="form-row">
+			<label for="reconciliation-import-id">Settlement import ID</label>
+			<input type="text" id="reconciliation-import-id" name="importId" list="recent-import-ids" autocomplete="off" placeholder="UUID">
+		</div>
+		<p class="muted small">Recently used in this browser: <span id="recent-imports-list">none yet</span></p>
+		<div class="button-row">
+			<button type="button" id="reconciliation-start-button">Start reconciliation</button>
+			<button type="button" id="reconciliation-load-button">Load existing reconciliation</button>
+		</div>
+
+		<div id="reconciliation-summary-result" class="result-box" hidden>
+			<h3>Summary</h3>
+			<dl class="kv-list" id="reconciliation-summary-fields"></dl>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details (summary)</summary>
+			<div id="reconciliation-summary-dev-details" class="dev-details-body"></div>
+		</details>
+
+		<hr>
+
+		<div class="form-row-group">
+			<div class="form-row">
+				<label for="reconciliation-page">Page</label>
+				<input type="number" id="reconciliation-page" name="page" min="0" step="1" value="0">
+			</div>
+			<div class="form-row">
+				<label for="reconciliation-size">Size</label>
+				<input type="number" id="reconciliation-size" name="size" min="1" max="100" step="1" value="20">
+			</div>
+			<button type="button" id="reconciliation-results-button">Load results</button>
+		</div>
+
+		<p class="legend" aria-hidden="false">
+			<span class="outcome-badge outcome-MATCHED">✓ MATCHED</span>
+			<span class="outcome-badge outcome-DISCREPANCY">⚠ discrepancy outcomes</span>
+			<span class="outcome-badge outcome-INCONSISTENT">✕ INTERNAL_LEDGER_INCONSISTENT</span>
+			— discrepancies and inconsistencies are normal result data, not request failures.
+		</p>
+
+		<div id="reconciliation-results-result" hidden>
+			<div class="table-scroll">
+				<table id="reconciliation-results-table">
+					<caption class="sr-only">Reconciliation results</caption>
+					<thead>
+					<tr>
+						<th scope="col">Outcome</th>
+						<th scope="col">Settlement record ID</th>
+						<th scope="col">Reported transaction ID</th>
+						<th scope="col">Reported amount</th>
+						<th scope="col">Reported currency</th>
+						<th scope="col">Internal amount</th>
+						<th scope="col">Internal currency</th>
+						<th scope="col">Created at</th>
+					</tr>
+					</thead>
+					<tbody id="reconciliation-results-body"></tbody>
+				</table>
+			</div>
+			<p id="reconciliation-results-empty" class="muted" hidden>No reconciliation results found for this page.</p>
+			<p id="reconciliation-results-summary" class="muted small"></p>
+		</div>
+		<details class="dev-details">
+			<summary>Developer details (results)</summary>
+			<div id="reconciliation-results-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
+
+</main>
+
+<datalist id="recent-account-ids"></datalist>
+<datalist id="recent-import-ids"></datalist>
+
+<footer class="site-footer">
+	<p>All actions call the same-origin LedgerGuard REST API only. No direct database or broker access.</p>
+	<button type="button" id="clear-recent-ids">Clear recent IDs</button>
+	<p class="muted small" id="clear-recent-ids-status" role="status" aria-live="polite"></p>
+</footer>
+
+<script src="/app.js" defer></script>
+</body>
+</html>
