@@ -6,8 +6,9 @@
 > (Task 6), idempotency for deposits/transfers (Task 10, Flyway V2), the
 > transactional outbox (Task 11, Flyway V3), Kafka publishing of pending
 > outbox events (Task 12), durably deduplicated Kafka consumption
-> (Task 13, Flyway V4), and settlement CSV import (Task 14, Flyway V5)
-> implemented.** Task 12 added no new migration —
+> (Task 13, Flyway V4), settlement CSV import (Task 14, Flyway V5), and
+> settlement reconciliation (Task 15, Flyway V6) implemented.** Task 12
+> added no new migration —
 > `V3`'s `published_at` column, its one-way-transition trigger, and its
 > pending partial index were already exactly what safe publishing needed;
 > see "Outbox Event Table" below for how `published_at` is now actually
@@ -15,7 +16,9 @@
 > `V4__add_processed_event_deduplication.sql` — see "Processed Event
 > Table" below. Task 14 adds exactly one new migration,
 > `V5__add_settlement_import.sql` — see "Settlement Import Tables" below.
-> `V1`–`V4` are unmodified by Task 14. The `V1`
+> Task 15 adds exactly one new migration,
+> `V6__add_settlement_reconciliation.sql` — see "Settlement Reconciliation
+> Tables" below. `V1`–`V5` are unmodified by Task 15. The `V1`
 > tables, constraints, indexes, and triggers described below exist in the
 > database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
@@ -579,6 +582,82 @@ Both tables are append-only, in the same style as `V1`/`V3`/`V4`:
 `trg_settlement_record_no_update`/`trg_settlement_record_no_delete`
 (`BEFORE UPDATE`/`BEFORE DELETE`) unconditionally raise an exception.
 `SettlementImportRepository` and `SettlementRecordRepository` (both
+JDBC-based, the same reason as `ProcessedEventRepository`) expose no
+update or delete method at all.
+
+## Settlement Reconciliation Tables (Flyway V6, Task 15)
+
+Two tables, added by `V6__add_settlement_reconciliation.sql`. `V1`–`V5`
+are unmodified.
+
+### `reconciliation_run`
+
+One row per `(settlement_import_id, algorithm_version)` ever committed —
+inserted **once**, with its final result counts already known (computed
+before the row is inserted), never inserted with placeholder counts and
+updated afterward.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `settlement_import_id` | `UUID` | Foreign key to `settlement_import(id)`. |
+| `algorithm_version` | `INTEGER` | `> 0`. Task 15 always writes `1` — no public API selects a version. |
+| `total_result_count` | `INTEGER` | `>= 0`. May legitimately be `0` (an all-duplicate import). |
+| `matched_count` | `INTEGER` | `>= 0`. |
+| `discrepancy_count` | `INTEGER` | `>= 0`. Every outcome except `MATCHED` and `INTERNAL_LEDGER_INCONSISTENT`. |
+| `inconsistent_count` | `INTEGER` | `>= 0`. `INTERNAL_LEDGER_INCONSISTENT` only. |
+| `created_at` | `TIMESTAMPTZ` | `DEFAULT now()`. |
+
+`CHECK (matched_count + discrepancy_count + inconsistent_count = total_result_count)`.
+Unique constraint `uq_reconciliation_run_settlement_import_algorithm_version`
+on `(settlement_import_id, algorithm_version)` — **not**
+`settlement_import_id` alone, so a future, separately-approved algorithm
+version can produce a new immutable run against the same import without
+being rejected as a duplicate of version 1, while a repeated command for
+the exact same `(import, version)` pair replays the existing row.
+
+`importedFileRows`/`newlyRecordedObservations`/`duplicateRows` (the
+response summary's disambiguating fields — see
+`docs/ARCHITECTURE.md`'s "Settlement Reconciliation" section) are
+deliberately **not** duplicated onto this table — they are exactly
+`settlement_import.total_row_count`/`inserted_row_count`/
+`duplicate_row_count`, already stored immutably there and read via a
+join.
+
+### `reconciliation_result`
+
+One row per settlement observation a run reconciled.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID` | Primary key. |
+| `run_id` | `UUID` | Foreign key to `reconciliation_run(id)`. |
+| `settlement_record_id` | `UUID` | Foreign key to `settlement_record(id)`. |
+| `reported_transaction_id` | `UUID` | Copied from `settlement_record.transaction_id` at result-creation time. |
+| `outcome` | `VARCHAR(40)` | One of the seven approved values (`CHECK`). |
+| `reported_amount` | `NUMERIC(19,2)` | Snapshotted from `settlement_record.amount` — matches its scale exactly. |
+| `reported_currency` | `VARCHAR(3)` | Snapshotted from `settlement_record.currency`. |
+| `internal_amount` | `NUMERIC(19,4)`, nullable | Snapshotted from the validated `ledger_entry` pair — matches its scale exactly. `NULL` for `INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`, and `INTERNAL_LEDGER_INCONSISTENT`. |
+| `internal_currency` | `VARCHAR(3)`, nullable | `NULL` exactly when `internal_amount` is `NULL` (`CHECK`). |
+| `created_at` | `TIMESTAMPTZ` | `DEFAULT now()`. |
+
+Unique constraint `uq_reconciliation_result_run_settlement_record` on
+`(run_id, settlement_record_id)` — one result per observation per run.
+`reported_amount`/`reported_currency`/`internal_amount`/`internal_currency`
+are **copied**, not just referenced by id — both `settlement_record` and
+`ledger_entry` are themselves immutable, so snapshotting is safe and
+makes a historical result independently interpretable without a join.
+**No raw CSV, no raw ledger row, no complete error message, no account
+balance, and no mutable status field is stored here** — the outcome code
+itself is the complete, safe classification signal.
+
+### Settlement Reconciliation Table Immutability
+
+Both tables are append-only, in the same style as `V1`/`V3`/`V4`/`V5`:
+`trg_reconciliation_run_no_update`/`trg_reconciliation_run_no_delete` and
+`trg_reconciliation_result_no_update`/`trg_reconciliation_result_no_delete`
+(`BEFORE UPDATE`/`BEFORE DELETE`) unconditionally raise an exception.
+`ReconciliationRunRepository` and `ReconciliationResultRepository` (both
 JDBC-based, the same reason as `ProcessedEventRepository`) expose no
 update or delete method at all.
 

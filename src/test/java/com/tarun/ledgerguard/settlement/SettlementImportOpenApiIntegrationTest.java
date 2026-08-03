@@ -13,7 +13,6 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
-import java.util.Iterator;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -100,21 +99,17 @@ class SettlementImportOpenApiIntegrationTest {
 	}
 
 	@Test
-	void noSettlementCrudOrReconciliationEndpointExists() throws Exception {
-		JsonNode paths = fetchDocument().get("paths");
-		Iterator<String> pathNames = paths.fieldNames();
-		while (pathNames.hasNext()) {
-			String path = pathNames.next();
-			if (path.startsWith("/api/v1/settlement")) {
-				assertThat(path).isEqualTo("/api/v1/settlement-imports");
-				JsonNode operations = paths.get(path);
-				assertThat(operations.has("get")).isFalse();
-				assertThat(operations.has("put")).isFalse();
-				assertThat(operations.has("delete")).isFalse();
-				assertThat(operations.has("patch")).isFalse();
-			}
-			assertThat(path.toLowerCase()).doesNotContain("reconcil");
-		}
+	void noSettlementImportCrudEndpointExists() throws Exception {
+		// The settlement-imports path itself never grows a GET/PUT/DELETE/
+		// PATCH -- POST only. Task 15's reconciliation endpoints legitimately
+		// exist under /api/v1/settlement-imports/{importId}/reconciliation
+		// (a different, nested path) and are verified separately by
+		// reconciliation.ReconciliationOpenApiIntegrationTest.
+		JsonNode operations = fetchDocument().get("paths").get("/api/v1/settlement-imports");
+		assertThat(operations.has("get")).isFalse();
+		assertThat(operations.has("put")).isFalse();
+		assertThat(operations.has("delete")).isFalse();
+		assertThat(operations.has("patch")).isFalse();
 	}
 
 }

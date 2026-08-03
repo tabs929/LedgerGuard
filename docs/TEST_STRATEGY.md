@@ -3,7 +3,8 @@
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
 > (idempotency), Task 11 (transactional outbox), Task 12 (Kafka
 > publishing), Task 13 (Kafka consumption and duplicate-event
-> protection), and Task 14 (settlement CSV import), and every test runs
+> protection), Task 14 (settlement CSV import), and Task 15 (settlement
+> reconciliation), and every test runs
 > automatically in CI (Task 9) on every push/PR.** The connectivity smoke
 > test (Task 1), schema-verification tests (Task 2), account creation's
 > tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
@@ -15,9 +16,12 @@
 > the outbox event/replay/rollback/constraint/immutability tests
 > (Task 11), the Kafka publisher tests (Task 12), the Kafka consumer
 > validation/duplicate/conflict/rollback tests (Task 13, real PostgreSQL
-> **and** real Kafka Testcontainers), and the settlement CSV
+> **and** real Kafka Testcontainers), the settlement CSV
 > parsing/hashing/duplicate/conflict/concurrency/financial-non-effect
-> tests (Task 14, real PostgreSQL, no Kafka) all exist (see "Currently
+> tests (Task 14, real PostgreSQL, no Kafka), and the settlement
+> reconciliation matching/classification/replay/concurrency/
+> financial-non-effect tests (Task 15, real PostgreSQL, no Kafka) all
+> exist (see "Currently
 > Implemented" below) and all run in `.github/workflows/ci.yml` (see "CI"
 > below). Only `GET /api/v1/accounts/{id}` remains untested, since that
 > plain-lookup endpoint was never assigned to any task and so still
@@ -701,6 +705,96 @@ Tasks 12–13) — none of them attempt a Kafka connection, and none of them
 start a Kafka Testcontainer (settlement import has no Kafka dependency at
 all).
 
+## Settlement Reconciliation Tests (implemented, Task 15)
+
+Unit tests (no Spring context, package `com.tarun.ledgerguard.reconciliation`):
+- `ReconciliationMatcherTest` (16) — the complete classification matrix
+  against the pure, DB-free matcher: unknown transaction, transfer
+  ineligibility, matched (including two equal monetary values at scales 2
+  and 4 comparing equal via `compareTo`), amount-only/currency-only/
+  combined mismatch, and every internal-ledger-inconsistency case (wrong
+  entry count, wrong debit account taxonomy, wrong credit account
+  taxonomy, reversed debit/credit direction, unequal amount between legs,
+  unequal currency between legs, a non-positive amount, both entries on
+  the same side), plus a determinism test (identical inputs always
+  produce an identical classification).
+
+Integration tests (PostgreSQL 16.4 Testcontainers, never H2, never the
+local Docker Compose database):
+- `ReconciliationSchemaMigrationIntegrationTest` (20) — `V1`–`V6` all
+  apply from an empty schema; `V1`–`V5` unchanged; both reconciliation
+  tables' columns, primary keys, foreign keys (to `settlement_import`,
+  `reconciliation_run`, and `settlement_record`), the
+  `(settlement_import_id, algorithm_version)` and
+  `(run_id, settlement_record_id)` unique constraints (including that the
+  former is genuinely composite — a second row for the same import under
+  a *different* algorithm version is accepted at the database level),
+  every `CHECK` constraint (including the run's count-consistency
+  invariant, the approved outcome-value list, and the internal
+  amount/currency "populated together" pair constraint), and both
+  tables' append-only `UPDATE`/`DELETE`-rejecting triggers.
+- `ReconciliationIntegrationTest` (23) — HTTP-boundary tests via
+  `TestRestTemplate` against all three endpoints, plus direct JDBC
+  verification: a matched real deposit; a real transfer classified
+  ineligible; an unknown transaction; exact amount/currency/combined
+  mismatches (the currency and combined cases plant their "internal" side
+  directly via JDBC, since LedgerGuard supports only USD today and a
+  currency mismatch cannot otherwise be produced from valid CSV input —
+  the same technique `SettlementImportIntegrationTest`'s own
+  currency-conflict test uses); multiple observations in one import
+  classified independently; the same underlying transaction reported by
+  two different settlement imports, reconciled independently with two
+  distinct run ids; a malformed internal ledger structure (a
+  single-entry deposit, inserted directly, bypassing `DepositService`)
+  classified inconsistent, explicitly asserting the command's own HTTP
+  status stays 201 (and a repeat stays 200) — `INTERNAL_LEDGER_INCONSISTENT`
+  is ordinary result data, never an HTTP/server error; a direct proof
+  that corrupting `account.balance` has no effect on the result
+  (reconciliation never reads it); a forced genuine PostgreSQL-level
+  failure — a temporary `CHECK (1 = 0) NOT VALID` constraint added to
+  `reconciliation_result` for the duration of the test, forcing the
+  result insert (reached only after the owning `reconciliation_run` row
+  already exists, uncommitted, in the same transaction) to fail — proving
+  the whole run rolls back (no run row, no result rows), then removing
+  the constraint and confirming a retry succeeds as a fresh, non-replayed
+  run; an all-duplicate import producing a valid zero-result run;
+  a case where `importedFileRows` exceeds `reconciliationResultCount`;
+  proof that a duplicated observation is reconciled only under the
+  import that first recorded it, never under a later import that merely
+  re-reported it; same-import-same-algorithm-version replay (200,
+  identical `runId`/`createdAt`); `GET` returning the same committed run
+  a `POST` produced; a real concurrency test — four threads issuing the
+  reconciliation command for the same import simultaneously produce
+  exactly one committed run, and every response (including the three
+  losers) references that same `runId`, proving the losers successfully
+  loaded the committed winner rather than erroring — using
+  `ExecutorService`/`CountDownLatch`-gated concurrent starts, never
+  `Thread.sleep`; financial-and-event-table non-effects across `account`
+  (row count and total balance), `ledger_transaction`, `ledger_entry`,
+  `idempotency_key`, `settlement_import`, `settlement_record`,
+  `outbox_event`, and `processed_event`; and request-level validation
+  (nonexistent import on both the command and `GET`, an import that
+  exists but was never reconciled on `GET`, a malformed import id, and
+  an excessive page size).
+- `ReconciliationOpenApiIntegrationTest` (6) — all three endpoints are
+  documented; the command endpoint's status set is exactly
+  `{201, 200, 400, 404}` and both reads' are exactly `{200, 400, 404}`;
+  400/404 responses reference the shared `ApiError` schema; and no
+  settlement/reconciliation endpoint exists beyond the four approved
+  paths.
+
+Every PostgreSQL-only reconciliation test suite relies on the Task 12/13
+Kafka beans already being disabled under the `test` profile; none of them
+start a Kafka Testcontainer (reconciliation has no Kafka dependency at
+all). The forced-rollback test uses the same technique as Task 11's
+`forcedOutboxInsertionFailureRollsBackTheWholeOperationAndKeySucceedsAfterCorrection`:
+a temporary, real PostgreSQL `CHECK (1 = 0) NOT VALID` constraint added
+to and then removed from the target table within the test itself —
+`NOT VALID` so it never retroactively rejects rows other tests sharing
+the same container already committed — rather than a fault-injection
+mock, since no ordinary, well-formed reconciliation input can otherwise
+trigger a genuine mid-transaction constraint violation.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -771,6 +865,16 @@ Total: 417 tests (309 from Phase 1 + Tasks 10–13, plus 20 in the new
 `SettlementCsvParserTest`, 6 in the new `SettlementImportPropertiesTest`,
 5 in the new `RowFingerprintTest`, 4 in the new `Sha256Test`, and 3 in the
 new `SourceNormalizerTest` — 108 new tests, all introduced by Task 14).
+
+`ReconciliationSchemaMigrationIntegrationTest`, `ReconciliationIntegrationTest`,
+`ReconciliationOpenApiIntegrationTest`, and `ReconciliationMatcherTest`
+(Task 15) — see "Settlement Reconciliation Tests" above.
+
+Total: 482 tests (417 from Phase 1 + Tasks 10–14, plus 20 in the new
+`ReconciliationSchemaMigrationIntegrationTest`, 23 in the new
+`ReconciliationIntegrationTest`, 6 in the new
+`ReconciliationOpenApiIntegrationTest`, and 16 in the new
+`ReconciliationMatcherTest` — 65 new tests, all introduced by Task 15).
 
 ## CI (implemented, Task 9)
 

@@ -2,16 +2,17 @@
 
 > **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency),
 > 11 (transactional outbox), 12 (Kafka publishing), 13 (Kafka
-> consumption and duplicate-event protection), and 14 (settlement CSV
-> import) implemented.** Database layer (Task 2), account creation
-> (Task 3), deposits (Task 4), transfers (Task 5), account
-> balance/transaction-history reads (Task 6), global error handling
-> (Task 7), OpenAPI documentation (Task 8), CI (Task 9), idempotency for
-> deposits/transfers (Task 10), the transactional outbox (Task 11),
-> publishing pending outbox events to Kafka (Task 12), durably
-> deduplicated Kafka consumption (Task 13), and settlement CSV import
-> (Task 14) are all implemented; only plain account lookup by id remains
-> unimplemented — no task has ever been assigned it. The `account`
+> consumption and duplicate-event protection), 14 (settlement CSV
+> import), and 15 (settlement reconciliation) implemented.** Database
+> layer (Task 2), account creation (Task 3), deposits (Task 4), transfers
+> (Task 5), account balance/transaction-history reads (Task 6), global
+> error handling (Task 7), OpenAPI documentation (Task 8), CI (Task 9),
+> idempotency for deposits/transfers (Task 10), the transactional outbox
+> (Task 11), publishing pending outbox events to Kafka (Task 12), durably
+> deduplicated Kafka consumption (Task 13), settlement CSV import
+> (Task 14), and settlement reconciliation (Task 15) are all implemented;
+> only plain account lookup by id remains unimplemented — no task has
+> ever been assigned it. The `account`
 > package has account creation,
 > deposit processing, and read-only account queries; the `ledger` package
 > has `LedgerTransaction`, `LedgerEntry`, and their repositories/enums;
@@ -26,11 +27,15 @@
 > the `inbox` package (Task 13) has the Kafka listener, the
 > transactional event processor, the JDBC-based processed-event
 > repository, strict event validation, and validated consumer properties
-> — see "Kafka Consumption" below; the new `settlement` package (Task 14)
+> — see "Kafka Consumption" below; the `settlement` package (Task 14)
 > has the multipart controller, the CSV parser, the transactional import
 > processor, the two JDBC-based repositories, validated import
 > properties, and the hashing/normalization utilities — see "Settlement
-> Import" below. The `common` package holds
+> Import" below; the new `reconciliation` package (Task 15) has the
+> command/read controller, the orchestrating service, the transactional
+> matching processor, the pure matcher, the bulk ledger-data loader, and
+> four JDBC-based read/write repositories — see "Settlement
+> Reconciliation" below. The `common` package holds
 > `PagedResponse<T>` (Task 6), `ApiError` and `GlobalExceptionHandler`
 > (Task 7), and `OpenApiConfig` (Task 8 — see "API Documentation" below).
 > Task 9 added `.github/workflows/ci.yml` only — no application code, no
@@ -38,16 +43,20 @@
 > end of this document). `GET /api/v1/accounts/{id}` still does not
 > exist, so the public-vs-internal lookup split described below is still
 > only partially realized (see that section for exactly what deposits,
-> transfers, and the read endpoints do instead). Reconciliation and
-> authentication remain unimplemented — see `docs/TASKS.md` for what
-> Tasks 15+ still cover; Task 12 provides **at-least-once** publication
+> transfers, and the read endpoints do instead). Authentication remains
+> unimplemented — see `docs/TASKS.md` for what Task 16+ still covers;
+> Task 12 provides **at-least-once** publication
 > and Task 13 makes the PostgreSQL-side consumer effect idempotent for a
 > given `eventId` — neither claims, nor together produce, exactly-once
 > Kafka delivery. Task 13 performs no settlement, reconciliation, balance
 > update, or ledger mutation of any kind. Task 14 only records immutable
 > external settlement observations — it performs no reconciliation, and
 > no ledger, balance, outbox, Kafka, processed-event, or idempotency
-> mutation of any kind.
+> mutation of any kind. Task 15 compares those observations against the
+> ledger and durably records the classification — it likewise performs no
+> ledger, balance, account, settlement-evidence, outbox, Kafka,
+> processed-event, or idempotency mutation of any kind, and no automated
+> correction.
 
 ## Style
 
@@ -1208,6 +1217,166 @@ framework-managed temporary resource. Raw CSV content is never logged,
 and no field value is ever reflected into an error message, log line, or
 API response — every validation error carries only a row number and a
 hardcoded field name.
+
+## Settlement Reconciliation (implemented, Task 15)
+
+Compares immutable Task 14 settlement observations against LedgerGuard's
+own immutable ledger and durably records the classification. **Task 15
+performs no reconciliation-driven mutation of any kind** — it never
+creates or modifies ledger transactions/entries, never changes an account
+or its balance, never modifies `settlement_import`/`settlement_record`,
+never touches `idempotency_key`/`outbox_event`/`processed_event`, never
+calls `DepositService`/`TransferService`, and never auto-corrects a
+discrepancy. Its only effect is inserting `reconciliation_run`/
+`reconciliation_result` rows.
+
+Three endpoints, all under `/api/v1/settlement-imports/{importId}/reconciliation`:
+`POST` (the command), `GET` (the summary), `GET .../results` (paginated
+item-level results). No update, delete, retry, correction, export,
+administration, or reconciliation-by-source endpoint exists.
+
+New `reconciliation` package: `ReconciliationController` (path/pagination
+validation only), `ReconciliationService` (orchestration and the two
+"import exists"/"run exists" 404 checks), `ReconciliationProcessor` (a
+separate `@Transactional` bean — the same self-invocation-avoidance reason
+as `SettlementImportProcessor`/`LedgerEventProcessor` — that computes and
+atomically commits one run), `ReconciliationMatcher` (the pure, DB-free
+matching algorithm), `LedgerDataLoader` (bulk-loads ledger data),
+`ReconciliationRunRepository`/`ReconciliationResultRepository`
+(`NamedParameterJdbcTemplate`-based, the same reason as every other
+append-only claim table in this project), and two small, deliberately
+independent read-only repositories,
+`SettlementImportSummaryRepository`/`SettlementObservationRepository`,
+that query `settlement_import`/`settlement_record` directly rather than
+depending on the `settlement` package's own (deliberately package-private)
+repository types — Task 15 must not depend on or modify Task 14's
+internals, and this keeps that boundary absolute.
+
+### Reconciliation scope: first_import_id, not "every row in the file"
+
+A reconciliation run reconciles the settlement observations **first
+recorded by** one settlement import —
+`settlement_record.first_import_id = settlement_import.id` — not
+necessarily every logical row that import's uploaded file contained. A
+row a file duplicated from an earlier import belongs to its *original*
+observation and *original* import (Task 14 deliberately stores no
+import-to-observation many-to-many mapping — see `docs/DATA_MODEL.md`'s
+"Settlement Import Tables" section); Task 15 does not add one either. An
+import containing only previously-known duplicate rows legitimately
+produces a **zero-result run** — `total_result_count = 0` is valid, not
+an error. The response summary makes this unambiguous with four distinct
+counts: `importedFileRows` (`settlement_import.total_row_count`),
+`newlyRecordedObservations` (`settlement_import.inserted_row_count`),
+`duplicateRows` (`settlement_import.duplicate_row_count`), and
+`reconciliationResultCount` (this run's own result count — equal to
+`newlyRecordedObservations` by construction, since every row a given
+import first recorded gets exactly one result). `importedFileRows` can
+exceed `reconciliationResultCount` whenever the file also duplicated rows
+from an earlier import.
+
+### Matching algorithm and eligibility
+
+Only `DEPOSIT` is settlement-eligible — deposits are the only transaction
+type that crosses the system boundary (`DEBIT EXTERNAL_FUNDING`);
+transfers move value only between two internal customer accounts, so
+there is no reason an external source would ever report one. A reported
+`TRANSFER` is classified `INELIGIBLE_TRANSACTION_TYPE`, never compared
+against any amount/currency.
+
+For an eligible deposit, the **complete posting structure is revalidated
+independently** before its amount/currency are trusted — exactly two
+entries; one `DEBIT` against a `SYSTEM`/`ASSET`/`EXTERNAL_FUNDING`
+account; one `CREDIT` against a `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`
+account; both positive; equal amounts (via `BigDecimal.compareTo`, never
+`equals` — reported amounts are `NUMERIC(19,2)`, internal amounts are
+`NUMERIC(19,4)`, different scales for numerically-equal values; never a
+`float`/`double`); equal currencies. Any violation — wrong entry count,
+wrong account taxonomy on either leg, reversed debit/credit direction,
+unequal amount or currency between the two legs, a non-positive amount —
+classifies `INTERNAL_LEDGER_INCONSISTENT`, a finding about LedgerGuard's
+own data, never about the external report. `ReconciliationMatcher` is a
+pure function (see its Javadoc for the exact classification precedence)
+with no database access, fully unit-tested in isolation.
+
+`account.balance` is never read or compared anywhere in this algorithm —
+the authoritative amount/currency come only from the two validated
+`ledger_entry` legs, the same "ledger over materialized balance" principle
+established in "Ledger as Source of Truth vs. Materialized Balance"
+above.
+
+### Classifications
+
+`MATCHED`, `INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`,
+`AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `AMOUNT_AND_CURRENCY_MISMATCH`,
+`INTERNAL_LEDGER_INCONSISTENT` — mutually exclusive by construction (the
+matcher stops at the first applicable condition), so one enum column is
+sufficient. Every value except `INTERNAL_LEDGER_INCONSISTENT` (a
+data-integrity finding) is an ordinary, expected reconciliation outcome —
+including an unmatched or ineligible reference — returned as result data
+in a successful 2xx response, **never** as an HTTP-level command failure.
+`settled_at` is never compared to anything (no internal timestamp shares
+its meaning — `ledger_transaction.created_at` measures when LedgerGuard
+itself posted the transaction, not when an external processor settled
+it); there is no `TIMESTAMP_MISMATCH` outcome. Missing-external detection
+(concluding an internal deposit *should* have appeared in an external
+file but didn't) is out of scope — `settlement_import`/`settlement_record`
+record nothing about expected provider coverage, settlement period, file
+completeness, or allowed delay.
+
+### Persistence, identity, and replay
+
+Two new append-only tables (`V6__add_settlement_reconciliation.sql`;
+`V1`–`V5` unchanged) — see `docs/DATA_MODEL.md`'s "Settlement
+Reconciliation Tables" section for the full schema. A run's logical
+identity is **`(settlement_import_id, algorithm_version)`, not
+`settlement_import_id` alone** — Task 15 always writes
+`algorithm_version = 1` (there is no public API to select a version), so
+a repeated command for the same import replays the existing committed
+run (200) rather than computing a second "true" answer for the same
+question; a future, separately-approved algorithm version could produce
+a genuinely new immutable run against the same import without being
+rejected as a duplicate. Every reconciliation-result row snapshots its
+reported values (from `settlement_record`) and its validated internal
+values (from `ledger_entry`) at creation time rather than only
+referencing them by id — both sources are themselves immutable, so
+snapshotting is safe and makes a historical result independently
+interpretable without a join.
+
+Every claim is atomic PostgreSQL `INSERT ... ON CONFLICT DO NOTHING`,
+never an unlocked "SELECT, then insert if absent," never a JVM lock,
+static map, or cache — the same concurrency-safety pattern every other
+append-only claim table in this project already establishes. The
+transactional workflow, all inside one `ReconciliationProcessor.reconcile(...)`
+call:
+
+1. Compute the complete proposed result set (settlement observations and
+   ledger data are both immutable, so reading them first is safe).
+2. Atomically claim `(settlement_import_id, algorithm_version)`.
+3. If the claim wins, insert every result in the same transaction, commit.
+4. If the claim loses, read back and return the committed winning run as
+   a replay — no results are inserted on this path.
+
+**READ COMMITTED, not REPEATABLE READ**, and this is a correctness
+requirement, not a preference: under REPEATABLE READ, a losing
+transaction's snapshot is fixed at its own start, so its follow-up read
+after losing the claim could still fail to see the winner's now-committed
+row — the very row it needs to return as a replay. Under READ COMMITTED,
+that follow-up read gets a fresh snapshot and reliably observes it. See
+`ReconciliationProcessor`'s Javadoc for the full explanation.
+
+### Performance
+
+Three bulk queries per run regardless of row count — settlement
+observations (`first_import_id = ?`), `ledger_transaction` rows
+(`id = ANY(:ids)`), `ledger_entry` rows (`transaction_id = ANY(:ids)`) —
+never one query per observation (`LedgerDataLoader`). Result-set
+retrieval is paginated (`ORDER BY` the originating observation's
+`source_row_number` — a stable, meaningful, deterministic order reflecting
+the CSV file's own row order), so returning results never requires
+holding a whole run in memory again. Bounded by Task 14's own 10,000-row
+import limit — the same order of magnitude Task 14 itself already holds
+in memory for one import. No outbox publisher, Kafka consumer, or
+producer tuning of any kind — this task has no Kafka involvement at all.
 
 ## Ledger Immutability (implemented, Task 2)
 

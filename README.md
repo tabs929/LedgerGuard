@@ -5,7 +5,7 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–14 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–15 implemented
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
@@ -15,9 +15,10 @@ documentation (Task 8), continuous integration (Task 9), idempotency for
 deposits and transfers (Task 10), a transactional outbox for durable
 event persistence (Task 11), publishing pending outbox events to Kafka
 (Task 12), consuming those events with durable, database-backed
-duplicate-event protection (Task 13), and importing external settlement
-CSV files as immutable observations (Task 14). Reconciliation and
-authentication remain unimplemented — see `docs/TASKS.md`.
+duplicate-event protection (Task 13), importing external settlement
+CSV files as immutable observations (Task 14), and comparing those
+observations against the ledger through settlement reconciliation
+(Task 15). Authentication remains unimplemented — see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -103,8 +104,8 @@ Testcontainers, with no tests skipped. See "Continuous Integration" below.
 
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
 implemented** — no task has been assigned it so far. There is also no
-authentication and no reconciliation — those are explicitly out of scope
-until later Phase 2/3 tasks per `docs/TASKS.md` and `CLAUDE.md`.
+authentication — explicitly out of scope until a later Phase 3 task per
+`docs/TASKS.md` and `CLAUDE.md`.
 
 ## Idempotency
 
@@ -277,9 +278,10 @@ deliberately doesn't add.
 `POST /api/v1/settlement-imports` (`multipart/form-data`: a `source` text
 field plus a `file` CSV part) imports a bank/payment-processor's
 settlement CSV. **It records immutable external observations only — it
-never reconciles them against LedgerGuard's own ledger** (that comparison
-is a later task) and never mutates any account, ledger, outbox,
-processed-event, or idempotency state.
+never reconciles them against LedgerGuard's own ledger itself** (that
+comparison is Task 15, see "Settlement Reconciliation" below) and never
+mutates any account, ledger, outbox, processed-event, or idempotency
+state.
 
 The CSV must use the exact header
 `external_reference,transaction_id,amount,currency,settled_at`, UTF-8
@@ -304,13 +306,52 @@ unchanged), are both append-only. `settlement_record` has **no foreign
 key to `ledger_transaction`** — see `docs/ARCHITECTURE.md`'s "Settlement
 Import" section for why.
 
+## Settlement Reconciliation
+
+Three endpoints under `/api/v1/settlement-imports/{importId}/reconciliation`
+(`POST` the command, `GET` the summary, `GET .../results` for paginated
+item-level results) compare the settlement observations *first recorded
+by* one settlement import against LedgerGuard's own ledger. **Records and
+reports the comparison only — no ledger, account, balance,
+settlement-evidence, outbox, Kafka, processed-event, or idempotency
+mutation of any kind, and no automated correction.**
+
+Only `DEPOSIT` transactions are settlement-eligible — deposits are the
+only transaction type that crosses the system boundary via
+`EXTERNAL_FUNDING`; a reported `TRANSFER` is classified
+`INELIGIBLE_TRANSACTION_TYPE`. For an eligible deposit, its complete
+ledger posting structure is independently revalidated (exactly two
+entries, correct account taxonomy on each leg, equal amounts and
+currencies between the two legs) before its amount/currency are trusted
+as authoritative — **`account.balance` is never read or compared**.
+Seven mutually exclusive outcomes — `MATCHED`,
+`INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`,
+`AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `AMOUNT_AND_CURRENCY_MISMATCH`,
+`INTERNAL_LEDGER_INCONSISTENT` — every one of them except the last (a
+finding about LedgerGuard's own data) is ordinary result data in a
+successful response, never an HTTP-level failure.
+
+A reconciliation run reconciles only the observations a given import
+*first* recorded (`settlement_record.first_import_id`) — an import
+containing only rows already recorded by an earlier import legitimately
+produces a valid zero-result run, made unambiguous by the response's
+`importedFileRows`/`newlyRecordedObservations`/`duplicateRows`/
+`reconciliationResultCount` fields. A run's identity is
+`(settlement_import_id, algorithm_version)`; repeating the same command
+replays the existing committed run (`200`) rather than computing a new
+one. Two new append-only PostgreSQL tables,
+`reconciliation_run`/`reconciliation_result`
+(`V6__add_settlement_reconciliation.sql`, `V1`–`V5` unchanged) — the same
+atomic `INSERT ... ON CONFLICT DO NOTHING` claim pattern as every other
+append-only table in this project, never a JVM lock or cache.
+
 ## Technology Stack
 
 - Java 21
 - Spring Boot 4.0.7
 - Maven with Maven Wrapper
 - PostgreSQL (via Docker Compose for local development)
-- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox, `V4`: processed-event deduplication, `V5`: settlement import)
+- Flyway (`V1`: account/ledger schema, `V2`: idempotency, `V3`: transactional outbox, `V4`: processed-event deduplication, `V5`: settlement import, `V6`: settlement reconciliation)
 - Spring Data JPA, Spring Data JDBC (`NamedParameterJdbcTemplate`, for Task 13's and Task 14's JDBC-based repositories)
 - Spring Kafka (Task 12 publishing, Task 13 consumption — no downstream business logic)
 - Apache Commons CSV (Task 14 settlement CSV parsing)
@@ -437,7 +478,7 @@ instructions, not a claim that this exact sequence was executed.
 ./mvnw verify
 ```
 
-This runs the full test suite (417 tests), including Testcontainers-backed
+This runs the full test suite (482 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
@@ -450,9 +491,11 @@ suite, an OpenAPI documentation test suite, an idempotency test suite
 a Kafka publisher test suite plus a small configuration-validation
 unit-test suite (Task 12), a Kafka consumer test suite plus focused
 unit tests for validation, hashing, and duplicate comparison (Task 13),
-and a settlement-import schema/behavior/concurrency test suite plus
+a settlement-import schema/behavior/concurrency test suite plus
 focused unit tests for CSV parsing, hashing, and configuration validation
-(Task 14).
+(Task 14), and a settlement-reconciliation schema/behavior/concurrency
+test suite plus a focused unit-test suite for the matching/classification
+algorithm (Task 15).
 The idempotency suite verifies header validation, exact response replay,
 same- and cross-operation conflict detection, that a failed attempt never
 consumes the key, and — against real PostgreSQL advisory locking, never
@@ -492,8 +535,22 @@ conflict, that neither `account`, `ledger_transaction`, `ledger_entry`,
 `idempotency_key`, `outbox_event`, nor `processed_event` is ever touched,
 and three genuine concurrency scenarios (identical files, byte-distinct
 files sharing one row, and conflicting rows) proving real PostgreSQL
-constraint arbitration rather than request serialization. The deposit and
-transfer suites both verify
+constraint arbitration rather than request serialization. The
+settlement-reconciliation suite (also no Kafka Testcontainer) verifies a
+matched real deposit, a real transfer correctly classified ineligible, an
+unknown transaction, exact amount/currency/combined mismatches, a
+malformed internal ledger structure classified inconsistent (staying a
+normal 201/200 response, never an HTTP error), a direct
+proof that `account.balance` is never consulted, a forced genuine
+PostgreSQL-level failure (a temporary CHECK constraint on
+`reconciliation_result`) proving the whole run rolls back with no
+partial results and that a retry succeeds once removed, an all-duplicate
+import producing a valid zero-result run, a case where the file's row count
+exceeds the reconciliation result count, that a duplicated observation is
+reconciled only under the import that first recorded it, same-import
+replay, and a real four-way concurrency test proving exactly one
+committed run with every loser correctly loading the winner. The deposit
+and transfer suites both verify
 balanced double-entry
 postings, balance correctness, a genuine database-failure rollback
 scenario, and real concurrency against PostgreSQL row locking (no mocks,
@@ -540,21 +597,23 @@ reports are uploaded as a short-retention build artifact for diagnosis.
 - `docs/ARCHITECTURE.md` — package structure and architectural decisions
   (database layer, account creation, deposit, transfer, account-query,
   error-handling, API-documentation, CI, idempotency, the transactional
-  outbox, Kafka publishing, Kafka consumption, and settlement import are
-  all implemented)
+  outbox, Kafka publishing, Kafka consumption, settlement import, and
+  settlement reconciliation are all implemented)
 - `docs/DATA_MODEL.md` — account/ledger schema and accounting semantics.
   The `account`/`ledger_transaction`/`ledger_entry` schema is implemented
   (Flyway V1); account creation, deposits, and transfers all read/write
   them; the balance/history endpoints read all three but write none of
   them. `idempotency_key` (Flyway V2, Task 10), `outbox_event` (Flyway
-  V3, Task 11), `processed_event` (Flyway V4, Task 13), and
-  `settlement_import`/`settlement_record` (Flyway V5, Task 14) are all
-  separate tables; Task 12 added no new migration.
+  V3, Task 11), `processed_event` (Flyway V4, Task 13),
+  `settlement_import`/`settlement_record` (Flyway V5, Task 14), and
+  `reconciliation_run`/`reconciliation_result` (Flyway V6, Task 15) are
+  all separate tables; Task 12 added no new migration.
 - `docs/API_SPEC.md` — `POST /api/v1/accounts`, `POST
   /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
   /api/v1/accounts/{id}/balance`, `GET
-  /api/v1/accounts/{id}/transactions`, and `POST
-  /api/v1/settlement-imports` are all implemented and documented
+  /api/v1/accounts/{id}/transactions`, `POST
+  /api/v1/settlement-imports`, and the three Task 15 reconciliation
+  endpoints are all implemented and documented
   exactly as built, including the shared error-response contract, the
   OpenAPI/Swagger endpoints, and the `Idempotency-Key` contract (Task 10);
   the remaining endpoints are still planned contracts.

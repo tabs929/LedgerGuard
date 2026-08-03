@@ -4,6 +4,8 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> {
@@ -20,5 +22,13 @@ public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> 
 	 * and created_at ordering directly.
 	 */
 	Page<LedgerEntry> findByAccountIdOrderByCreatedAtDescIdDesc(UUID accountId, Pageable pageable);
+
+	/**
+	 * Every entry for a set of transactions in one query — Task 15's
+	 * {@code reconciliation.LedgerDataLoader} uses this to bulk-load every
+	 * entry for every reported transaction in one settlement import,
+	 * rather than one query per transaction.
+	 */
+	List<LedgerEntry> findByTransactionIdIn(Collection<UUID> transactionIds);
 
 }

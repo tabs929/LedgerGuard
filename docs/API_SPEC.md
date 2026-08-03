@@ -3,8 +3,9 @@
 > **Status: Phase 1 (Tasks 1–9) complete. Phase 2, Task 10 (idempotency
 > for deposits and transfers), Task 11 (transactional outbox), Task 12
 > (Kafka publishing of outbox events), Task 13 (Kafka consumption and
-> duplicate-event protection), and Task 14 (settlement CSV import)
-> implemented.** None of Tasks 11–13 add any new endpoint, request field,
+> duplicate-event protection), Task 14 (settlement CSV import), and
+> Task 15 (settlement reconciliation) implemented.** None of Tasks 11–13
+> add any new endpoint, request field,
 > response field, status code, or header — the outbox, its Kafka
 > publisher, and its Kafka consumer are all internal
 > persistence/background-processing details (see `docs/ARCHITECTURE.md`'s
@@ -13,9 +14,12 @@
 > is unchanged from Task 10. `POST /api/v1/accounts`,
 > `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`, `GET
 > /api/v1/accounts/{id}/balance`, `GET
-> /api/v1/accounts/{id}/transactions`, and the new `POST
-> /api/v1/settlement-imports` (Task 14) all exist and match the contracts
-> below exactly. Both deposits and transfers are USD-only and always post
+> /api/v1/accounts/{id}/transactions`, `POST
+> /api/v1/settlement-imports` (Task 14), and the three Task 15
+> reconciliation endpoints under
+> `/api/v1/settlement-imports/{importId}/reconciliation` all exist and
+> match the contracts below exactly. Both deposits and transfers are
+> USD-only and always post
 > a balanced double-entry ledger transaction in the same database
 > transaction as the materialized balance updates; the two read endpoints
 > never modify that state. `POST /api/v1/accounts/{id}/deposits` and
@@ -24,7 +28,10 @@
 > "Idempotency" further down; `POST /api/v1/settlement-imports` does
 > **not** use that header — its own idempotent-replay behavior is keyed
 > on the uploaded file's content, not a caller-supplied header (see its
-> section below). Every documented error response, from every endpoint,
+> section below). The Task 15 command endpoint likewise uses no
+> `Idempotency-Key` header — its replay behavior is keyed structurally on
+> `(settlement import id, algorithm version)`, not a caller-supplied
+> value. Every documented error response, from every endpoint,
 > goes through one centralized `@RestControllerAdvice`
 > (`common.GlobalExceptionHandler`) and matches the "Error Response Shape"
 > section below exactly. Every endpoint, every request/response
@@ -33,13 +40,16 @@
 > `GET /swagger-ui/index.html` — see "OpenAPI/Swagger" below. Plain
 > `GET /api/v1/accounts/{id}` remains unimplemented — no task has been
 > assigned it so far — no controller, service, or DTO exists for it yet.
-> Reconciliation and authentication remain unimplemented — see
-> `docs/TASKS.md` for what Tasks 15+ still cover. `processed_event` is
+> Authentication remains unimplemented — see
+> `docs/TASKS.md` for what Task 16+ still covers. `processed_event` is
 > never exposed as a public resource — there is no consumer
 > administration, replay, or health-detail endpoint; likewise
 > `settlement_import`/`settlement_record` have no list, get, retry,
-> update, delete, reconciliation, or administration endpoint — `POST
-> /api/v1/settlement-imports` is the only settlement endpoint.
+> update, delete, or administration endpoint (Task 15's reconciliation
+> endpoints are the one exception, and only in the form of a command plus
+> two reads); `reconciliation_run`/`reconciliation_result` themselves have
+> no update, delete, retry, correction, export, administration, or
+> reconciliation-by-source endpoint.
 
 All endpoints are versioned under `/api/v1` and are unauthenticated in
 Phase 1 (authentication is a Phase 3 concern).
@@ -315,6 +325,107 @@ newlines inside quoted fields (Apache Commons CSV — never hand-rolled
 comma-splitting). Raw field values are never reflected into an error
 message, log line, or API response.
 
+## Settlement Reconciliation (implemented, Task 15)
+
+Compares the settlement observations first recorded by one settlement
+import against LedgerGuard's own ledger. **Records and reports the
+comparison only — never reconciliation-driven mutation of any kind.**
+See `docs/ARCHITECTURE.md`'s "Settlement Reconciliation" section for the
+full matching algorithm, classification rules, and concurrency contract.
+
+### POST /api/v1/settlement-imports/{importId}/reconciliation
+
+No request body. Reconciles the settlement observations with
+`first_import_id = {importId}` — not necessarily every row that import's
+uploaded file contained; see "Reconciliation scope" below.
+
+Response 201 (a new run was recorded) or 200 (this import was already
+reconciled under the current algorithm version; the original committed
+run is returned as a replay, `replayed: true`):
+```
+{
+  "runId": uuid,
+  "settlementImportId": uuid,
+  "algorithmVersion": 1,
+  "importedFileRows": integer,
+  "newlyRecordedObservations": integer,
+  "duplicateRows": integer,
+  "reconciliationResultCount": integer,
+  "matchedCount": integer,
+  "discrepancyCount": integer,
+  "inconsistentCount": integer,
+  "replayed": boolean,
+  "createdAt": iso8601
+}
+```
+
+Response 400: `{importId}` is not a syntactically valid UUID.
+Response 404: no settlement import exists with `{importId}`.
+
+**Reconciliation scope:** `importedFileRows`/`newlyRecordedObservations`/
+`duplicateRows` are exactly this import's own `settlement_import` row
+counts — included specifically so `reconciliationResultCount` (which
+always equals `newlyRecordedObservations`) is never mistaken for "every
+row the file contained." `reconciliationResultCount` may legitimately be
+`0` (an import containing only rows already recorded by an earlier
+import).
+
+**Discrepancies are result data, not HTTP errors:** an unmatched
+transaction reference, an ineligible transaction type, an amount/currency
+mismatch, or an internal ledger inconsistency are all ordinary
+`discrepancyCount`/`inconsistentCount` contributions in a successful 2xx
+response — never a 4xx/5xx for the overall command.
+
+### GET /api/v1/settlement-imports/{importId}/reconciliation
+
+Returns the existing committed run (same shape as the command's 200/201
+body, `replayed` always `false`). Does not trigger reconciliation.
+
+Response 404: no settlement import exists with `{importId}`, **or** it
+exists but has never been reconciled — two distinct, safely-worded
+`ApiError` messages for the two cases.
+
+### GET /api/v1/settlement-imports/{importId}/reconciliation/results?page=&size=
+
+Paginated item-level results, using the same custom `PagedResponse`
+envelope as `GET /api/v1/accounts/{id}/transactions` (never Spring Data's
+own `Page` shape). Ordered by the originating settlement observation's
+`source_row_number` ascending — a stable, deterministic order reflecting
+the CSV file's own row order.
+
+```
+{
+  "content": [
+    {
+      "resultId": uuid,
+      "settlementRecordId": uuid,
+      "reportedTransactionId": uuid,
+      "outcome": "MATCHED" | "INTERNAL_TRANSACTION_NOT_FOUND" | "INELIGIBLE_TRANSACTION_TYPE"
+                 | "AMOUNT_MISMATCH" | "CURRENCY_MISMATCH" | "AMOUNT_AND_CURRENCY_MISMATCH"
+                 | "INTERNAL_LEDGER_INCONSISTENT",
+      "reportedAmount": string,
+      "reportedCurrency": string,
+      "internalAmount": string | null,
+      "internalCurrency": string | null,
+      "createdAt": iso8601
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": integer,
+  "totalPages": integer
+}
+```
+
+`internalAmount`/`internalCurrency` are `null` together exactly when
+`outcome` is `INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`,
+or `INTERNAL_LEDGER_INCONSISTENT`. `size` is capped at 100, the same
+bound `GET /api/v1/accounts/{id}/transactions` already uses.
+
+Response 400: `{importId}` is not a syntactically valid UUID, or
+`page`/`size` is malformed or out of bounds.
+Response 404: same two distinct cases as `GET .../reconciliation` above.
+
 ## Idempotency (implemented, Task 10)
 
 `POST /api/v1/accounts/{id}/deposits` and `POST /api/v1/transfers` both
@@ -420,6 +531,9 @@ behind each one.
 - `GET /api/v1/accounts/{id}/balance` (Task 6) — see above.
 - `GET /api/v1/accounts/{id}/transactions` (Task 6) — see above.
 - `POST /api/v1/settlement-imports` (Task 14) — see above.
+- `POST /api/v1/settlement-imports/{importId}/reconciliation` (Task 15) — see above.
+- `GET /api/v1/settlement-imports/{importId}/reconciliation` (Task 15) — see above.
+- `GET /api/v1/settlement-imports/{importId}/reconciliation/results` (Task 15) — see above.
 - `GET /v3/api-docs` and `GET /swagger-ui/index.html` (Task 8) — see
   "OpenAPI/Swagger" below.
 - Spring Boot Actuator's built-in health check:
@@ -439,10 +553,14 @@ actual request/response shapes.
 - **Swagger UI:** `GET /swagger-ui/index.html` (the conventional
   `GET /swagger-ui.html` short form also redirects there).
 
-Documents exactly the six endpoints above — `POST /api/v1/accounts`,
+Documents exactly the nine endpoints above — `POST /api/v1/accounts`,
 `POST /api/v1/accounts/{id}/deposits`, `POST /api/v1/transfers`,
 `GET /api/v1/accounts/{id}/balance`, `GET /api/v1/accounts/{id}/transactions`,
-`POST /api/v1/settlement-imports` — with their exact request/response schemas, documented status codes, and
+`POST /api/v1/settlement-imports`,
+`POST /api/v1/settlement-imports/{importId}/reconciliation`,
+`GET /api/v1/settlement-imports/{importId}/reconciliation`,
+`GET /api/v1/settlement-imports/{importId}/reconciliation/results`
+— with their exact request/response schemas, documented status codes, and
 the shared `ApiError` envelope reused across every error response. No
 security scheme is declared (Phase 1 has no authentication — declaring one
 would falsely imply these endpoints are protected). No `EXTERNAL_FUNDING`

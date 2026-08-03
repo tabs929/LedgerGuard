@@ -6,6 +6,8 @@ import com.tarun.ledgerguard.account.InsufficientFundsException;
 import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
 import com.tarun.ledgerguard.idempotency.IdempotencyConflictException;
+import com.tarun.ledgerguard.reconciliation.ReconciliationNotFoundException;
+import com.tarun.ledgerguard.reconciliation.SettlementImportNotFoundException;
 import com.tarun.ledgerguard.settlement.InvalidSettlementRequestException;
 import com.tarun.ledgerguard.settlement.SettlementConflictException;
 import com.tarun.ledgerguard.settlement.SettlementFileTooLargeException;
@@ -135,6 +137,24 @@ public class GlobalExceptionHandler {
 	public ResponseEntity<ApiError> handleSettlementConflict(SettlementConflictException ex,
 			HttpServletRequest request) {
 		return build(HttpStatus.CONFLICT, ex.getMessage(), request);
+	}
+
+	// -- settlement reconciliation (Task 15) -------------------------------
+
+	// Distinct from ReconciliationNotFoundException below: this importId
+	// does not correspond to any settlement_import row at all.
+	@ExceptionHandler(SettlementImportNotFoundException.class)
+	public ResponseEntity<ApiError> handleSettlementImportNotFound(SettlementImportNotFoundException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.NOT_FOUND, ex.getMessage(), request);
+	}
+
+	// The import exists but has never been reconciled -- a read-only GET
+	// has nothing to return; POST is what creates the run.
+	@ExceptionHandler(ReconciliationNotFoundException.class)
+	public ResponseEntity<ApiError> handleReconciliationNotFound(ReconciliationNotFoundException ex,
+			HttpServletRequest request) {
+		return build(HttpStatus.NOT_FOUND, ex.getMessage(), request);
 	}
 
 	// -- request-shape validation (400) ----------------------------------

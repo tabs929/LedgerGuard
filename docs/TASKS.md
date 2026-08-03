@@ -462,5 +462,114 @@ the approved plan (see project history / plan file) and will be captured in
       total (417 overall). Every PostgreSQL-only suite relies on the
       Task 12/13 Kafka beans already being disabled under the `test`
       profile; none of the new tests start a Kafka Testcontainer.
-- [ ] 15. Reconciliation
+- [x] 15. Reconciliation — three endpoints under
+      `/api/v1/settlement-imports/{importId}/reconciliation`:
+      `POST` (the command), `GET` (the summary), `GET .../results`
+      (paginated item-level results, ordered by the originating
+      observation's `source_row_number`). **Records and reports the
+      comparison only — no ledger/balance/account/settlement-evidence/
+      outbox/Kafka/processed-event/idempotency mutation of any kind, and
+      no automated correction.** A run reconciles the settlement
+      observations FIRST recorded by one import
+      (`settlement_record.first_import_id = settlement_import.id`) — not
+      necessarily every row that import's file contained, since Task 14
+      deliberately stores no import-to-observation many-to-many mapping;
+      an all-duplicate import legitimately produces a zero-result run,
+      and the response's `importedFileRows`/`newlyRecordedObservations`/
+      `duplicateRows`/`reconciliationResultCount` fields make this
+      unambiguous. New `reconciliation` package:
+      `ReconciliationController` (path/pagination validation only),
+      `ReconciliationService` (orchestration and 404 checks),
+      `ReconciliationProcessor` (a separate `@Transactional` bean, the
+      same self-invocation-avoidance pattern as
+      `SettlementImportProcessor`/`LedgerEventProcessor`, explicitly
+      `READ COMMITTED` — required, not just preferred, so a losing
+      concurrent claim's follow-up read reliably observes the winner's
+      just-committed row), `ReconciliationMatcher` (a pure, DB-free
+      matching function, fully unit-tested in isolation), `LedgerDataLoader`
+      (three bulk queries per run regardless of row count — settlement
+      observations, `ledger_transaction` rows, `ledger_entry` rows —
+      never one query per observation),
+      `ReconciliationRunRepository`/`ReconciliationResultRepository`
+      (`NamedParameterJdbcTemplate`-based atomic
+      `INSERT ... ON CONFLICT DO NOTHING`, the same reason as every
+      other append-only claim table in this project), and two small,
+      deliberately independent read-only repositories
+      (`SettlementImportSummaryRepository`/`SettlementObservationRepository`)
+      that query `settlement_import`/`settlement_record` directly rather
+      than depending on the `settlement` package's own package-private
+      types — Task 15 depends on nothing from Task 14's internals.
+      Only `DEPOSIT` is settlement-eligible (deposits are the only
+      transaction type that crosses the system boundary via
+      `EXTERNAL_FUNDING`); a reported `TRANSFER` is classified
+      `INELIGIBLE_TRANSACTION_TYPE`, never compared against any
+      amount/currency. For an eligible deposit, the complete posting
+      structure is independently revalidated before its values are
+      trusted — exactly two entries, one DEBIT against
+      `SYSTEM`/`ASSET`/`EXTERNAL_FUNDING`, one CREDIT against
+      `CUSTOMER`/`LIABILITY`/`CUSTOMER_WALLET`, both positive, equal
+      amounts (`BigDecimal.compareTo`, never `equals` — reported values
+      are `NUMERIC(19,2)`, internal values are `NUMERIC(19,4)`, different
+      scales for numerically-equal amounts; never `float`/`double`), and
+      equal currencies; any violation is `INTERNAL_LEDGER_INCONSISTENT`.
+      `account.balance` is never read or compared anywhere in the
+      algorithm. Seven mutually exclusive outcomes: `MATCHED`,
+      `INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`,
+      `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`,
+      `AMOUNT_AND_CURRENCY_MISMATCH`, `INTERNAL_LEDGER_INCONSISTENT` —
+      every one of them except the last (a data-integrity finding about
+      LedgerGuard's own data) is expected result data in a successful
+      2xx response, never an HTTP-level command failure. No
+      `settled_at` comparison (no internal timestamp shares its
+      meaning) and no missing-external detection (Task 14 records
+      nothing about expected provider coverage, settlement period, or
+      completeness). Exactly one new migration,
+      `V6__add_settlement_reconciliation.sql` (`V1`–`V5` unmodified):
+      `reconciliation_run` (one row per committed
+      `(settlement_import_id, algorithm_version)`, unique on that pair —
+      not `settlement_import_id` alone, so a future approved algorithm
+      version can produce a new run without colliding with version 1) and
+      `reconciliation_result` (one row per reconciled observation, unique
+      `(run_id, settlement_record_id)`, foreign keys to
+      `reconciliation_run` and `settlement_record`, reported/internal
+      amount and currency snapshotted at creation time). Both tables are
+      append-only (the same `BEFORE UPDATE`/`BEFORE DELETE`-rejecting
+      trigger style as `V1`/`V3`/`V4`/`V5`). A repeated command for the
+      same `(import, algorithm version)` replays the existing committed
+      run (200); concurrent identical commands collapse into one run via
+      atomic `INSERT ... ON CONFLICT DO NOTHING` — never a JVM lock,
+      static map, or cache — with the loser reliably loading the winner's
+      committed row under `READ COMMITTED`. `DepositService`/
+      `TransferService` are untouched; no outbox publisher tuning. Verified
+      by `ReconciliationSchemaMigrationIntegrationTest` (20 tests:
+      `V1`–`V6` migration/schema/constraint/trigger checks, including that
+      the composite unique constraint genuinely permits a second
+      algorithm version for the same import), `ReconciliationIntegrationTest`
+      (23 tests: matched deposit, ineligible transfer, unknown
+      transaction, exact amount/currency/combined mismatches, multiple
+      observations per import, the same transaction reported by two
+      different imports reconciled independently, a malformed internal
+      ledger structure (explicitly asserting the command's own HTTP status
+      stays 201/200 — `INTERNAL_LEDGER_INCONSISTENT` is ordinary result
+      data, never an HTTP/server error), proof that `account.balance` is
+      never consulted, a forced genuine PostgreSQL-level failure (a
+      temporary `CHECK (1 = 0) NOT VALID` constraint on
+      `reconciliation_result`, added and removed within the test) proving
+      the whole run rolls back with no partial run/results and that a
+      retry succeeds once the constraint is removed, an all-duplicate
+      zero-result run, `importedFileRows` exceeding
+      `reconciliationResultCount`, first-import-id-only duplicate
+      scoping, same-import-same-version replay, `GET` returning the
+      committed run, a real four-way concurrency test proving exactly one
+      committed run and that every loser loads the winner, financial/
+      event-table non-effects, and request-level validation),
+      `ReconciliationOpenApiIntegrationTest` (6 tests: endpoint/status-code/
+      `ApiError`-schema documentation, no extra settlement/reconciliation
+      endpoint), and `ReconciliationMatcherTest` (16 unit tests: the
+      complete classification matrix, including exact-decimal comparison
+      across different scales and full internal-ledger-inconsistency
+      coverage) — 65 new tests total (482 overall). Every PostgreSQL-only
+      suite relies on the Task 12/13 Kafka beans already being disabled
+      under the `test` profile; reconciliation has no Kafka dependency at
+      all.
 - [ ] 16. Phase 2 reliability, failure, and concurrency hardening

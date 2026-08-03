@@ -147,7 +147,12 @@ class OpenApiDocumentationIntegrationTest {
 				// Task 14: the only settlement endpoint -- no list, get,
 				// retry, update, delete, reconciliation, or administration
 				// endpoint exists for settlement_import/settlement_record.
-				"/api/v1/settlement-imports");
+				"/api/v1/settlement-imports",
+				// Task 15: the only three reconciliation endpoints -- no
+				// update, delete, retry, correction, export,
+				// administration, or reconciliation-by-source endpoint.
+				"/api/v1/settlement-imports/{importId}/reconciliation",
+				"/api/v1/settlement-imports/{importId}/reconciliation/results");
 		while (pathNames.hasNext()) {
 			String path = pathNames.next();
 			if (path.startsWith("/api/v1/")) {

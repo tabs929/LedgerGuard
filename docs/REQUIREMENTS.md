@@ -3,8 +3,9 @@
 > **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
 > has begun — Task 10 (idempotency), Task 11 (transactional outbox),
 > Task 12 (Kafka publishing of outbox events), Task 13 (Kafka
-> consumption and duplicate-event protection), and Task 14 (settlement
-> CSV import) are also implemented. See `docs/TASKS.md` for the per-task
+> consumption and duplicate-event protection), Task 14 (settlement
+> CSV import), and Task 15 (settlement reconciliation) are also
+> implemented. See `docs/TASKS.md` for the per-task
 > breakdown and what each one covered.
 
 ## Scope
@@ -75,9 +76,11 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   `EXTERNAL_FUNDING` account) and transfers between customer accounts exist
   in Phase 1/2. A withdrawal operation is designed for structurally (see
   `docs/DATA_MODEL.md`) but not implemented.
-- **No reconciliation:** Task 14 records external settlement observations
-  durably, but never compares them against LedgerGuard's own ledger —
-  that comparison is Task 15, still to come.
+- **No reconciliation-driven correction:** Task 15 compares external
+  settlement observations against the ledger and durably records the
+  classification, but never corrects a discrepancy, never mutates the
+  ledger/accounts/settlement evidence, and performs no automated action
+  of any kind based on the result.
 - **No exactly-once delivery:** Task 12 is at-least-once publication.
   Kafka producer idempotence (enabled) suppresses duplicate broker-retry
   sends within one producer session — it does not close the window
@@ -137,10 +140,32 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   or idempotency mutation of any kind. See `docs/ARCHITECTURE.md`'s
   "Settlement Import" section and `docs/DATA_MODEL.md`'s "Settlement
   Import Tables" section.
-- Reconciliation is the remaining Phase 2 scope per `CLAUDE.md`;
-  idempotency (Task 10), the transactional outbox (Task 11), Kafka
-  publishing (Task 12), Kafka consumption/dedup (Task 13), and settlement
-  CSV import (Task 14) are done so far.
+- **Task 15 — Settlement reconciliation (implemented):** compares the
+  settlement observations first recorded by one settlement import
+  (`settlement_record.first_import_id = settlement_import.id`) against
+  LedgerGuard's own ledger. Only `DEPOSIT` transactions are
+  settlement-eligible; a reported `TRANSFER` is classified
+  `INELIGIBLE_TRANSACTION_TYPE`. The authoritative internal amount/currency
+  come from a freshly-revalidated `ledger_entry` posting structure —
+  never `account.balance`. Seven mutually exclusive outcomes: `MATCHED`,
+  `INTERNAL_TRANSACTION_NOT_FOUND`, `INELIGIBLE_TRANSACTION_TYPE`,
+  `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `AMOUNT_AND_CURRENCY_MISMATCH`,
+  `INTERNAL_LEDGER_INCONSISTENT` — every one of them (except the last, a
+  data-integrity finding) is expected result data in a successful 2xx
+  response, never an HTTP-level failure. A run's identity is
+  `(settlement_import_id, algorithm_version)`; a repeated command for the
+  same import and version (Task 15 always uses version 1) replays the
+  existing committed run. Zero financial mutation: no ledger/account/
+  balance/settlement-evidence/outbox/Kafka/processed-event/idempotency
+  change of any kind, and no automated correction. See
+  `docs/ARCHITECTURE.md`'s "Settlement Reconciliation" section and
+  `docs/DATA_MODEL.md`'s "Settlement Reconciliation Tables" section.
+- Phase 2 is now feature-complete except for Task 16 (reliability,
+  failure, and concurrency hardening beyond what Tasks 10–15 already
+  cover) per `CLAUDE.md`; idempotency (Task 10), the transactional outbox
+  (Task 11), Kafka publishing (Task 12), Kafka consumption/dedup
+  (Task 13), settlement CSV import (Task 14), and settlement
+  reconciliation (Task 15) are done so far.
 
 ## Non-Goals
 
