@@ -572,4 +572,57 @@ the approved plan (see project history / plan file) and will be captured in
       suite relies on the Task 12/13 Kafka beans already being disabled
       under the `test` profile; reconciliation has no Kafka dependency at
       all.
-- [ ] 16. Phase 2 reliability, failure, and concurrency hardening
+- [x] 16. Phase 2 reliability, failure, and concurrency hardening — a
+      test-led audit of Tasks 1–15's existing concurrency, idempotency,
+      rollback, outbox, Kafka, settlement, and reconciliation test
+      coverage found it already extensive; five genuine, approved gaps
+      were closed and **zero production code was changed** — the audit
+      found no correctness defect, only test coverage gaps. New/
+      strengthened tests: (1) `IdempotencyIntegrationTest` gained
+      `simultaneousIdenticalTransferRequestsCommitExactlyOnce` and
+      `simultaneousConflictingTransferRequestsWithTheSameKeyProduceExactlyOneWinner`
+      — transfer now has the same true concurrent-race proof deposit
+      already had (previously only sequential retry was tested for
+      transfer). (2) New top-level `MixedWorkloadConsistencyIntegrationTest`
+      — a single bounded concurrent workload mixing deposits and
+      transfers (including opposite-direction pairs) across four shared
+      accounts, followed by a global consistency audit queried directly
+      from PostgreSQL: every `ledger_transaction` has exactly two
+      balanced entries, every account's materialized balance equals its
+      own ledger-derived balance (computed via the real per-account-class
+      formula, never predicted from HTTP responses), no negative balance,
+      no orphaned `ledger_entry`/`outbox_event`/`idempotency_key`
+      reference, and outbox/idempotency-key counts match the transaction
+      count exactly (Task 10/11's 1:1 guarantees holding under real
+      contention). Does not assume every submitted transfer succeeds —
+      each response is accepted as either 201 or 422, and the audit is
+      correct either way since it only trusts committed rows.
+      (3) `SettlementImportIntegrationTest` gained
+      `forcedSettlementRecordInsertionFailureRollsBackTheWholeImportAndSucceedsAfterCorrection`
+      — the one settlement-import rollback scenario that was previously
+      untested with a genuine PostgreSQL-level failure (a temporary
+      `CHECK (1 = 0) NOT VALID` constraint, the same test-only technique
+      Tasks 11/13/15 already established), proving no partial
+      `settlement_import`/`settlement_record` state and a clean retry
+      after the constraint is removed. (4)
+      `OutboxPublisherIntegrationTest` gained
+      `pendingEventRemainsRecoverableByANewlyConstructedPublisherInstance`
+      — a brand-new `OutboxPublisher` instance, constructed with `new`
+      (never registered with Spring, sharing no in-memory state with the
+      application's managed bean) and wrapped in an explicit
+      `PlatformTransactionManager` transaction (manual construction
+      bypasses the `@Transactional` AOP proxy), successfully claims and
+      publishes a pending row — direct proof of restart-style recovery,
+      not just an architectural inference from statelessness.
+      (5) `DepositIntegrationTest.concurrentDepositsIntoSameWalletDoNotLoseUpdates`
+      strengthened with an exact outbox-row-count assertion and a
+      ledger-derived-vs-materialized-balance cross-check. All concurrency
+      coordination uses `ExecutorService` + `CountDownLatch` ready/start
+      gating + timed `invokeAll`/`Future.get`, never `Thread.sleep`;
+      `shutdownNow()` in every new test's `finally` block. Verified by
+      `./mvnw verify` run twice in succession with identical results (498
+      tests both times) to rule out flakiness. See
+      `docs/TEST_STRATEGY.md`'s "Reliability and Concurrency Hardening
+      Tests" section for the full list, and `docs/ARCHITECTURE.md`'s
+      "Reliability Hardening" section for what this task did and
+      deliberately did not claim.

@@ -437,6 +437,73 @@ class SettlementImportIntegrationTest {
 		assertThat(countRows("settlement_record")).isEqualTo(recordsBefore);
 	}
 
+	// Task 16: every other rollback test above is triggered by ordinary
+	// business logic (a within-file conflict, an invalid row). This test
+	// forces a genuine PostgreSQL-level failure -- a temporary CHECK
+	// constraint that rejects every new settlement_record insert -- so
+	// the failure happens strictly *after* SettlementImportProcessor has
+	// already claimed one or more rows in its per-row loop but *before*
+	// the owning settlement_import row is ever inserted (that insert
+	// happens last, once final counts are known -- see
+	// docs/ARCHITECTURE.md's "Settlement Import" section). This proves
+	// whole-file atomicity under a real database failure, not just a
+	// business-rule rejection.
+	@Test
+	void forcedSettlementRecordInsertionFailureRollsBackTheWholeImportAndSucceedsAfterCorrection() throws Exception {
+		String source = uniqueSource();
+		byte[] content = csv(
+				row("EXT-FORCE-1", UUID.randomUUID(), "1.00", "USD", "2026-07-15T10:00:00Z"),
+				row("EXT-FORCE-2", UUID.randomUUID(), "2.00", "USD", "2026-07-15T10:00:00Z"))
+				.getBytes(StandardCharsets.UTF_8);
+
+		long importsBefore = countRows("settlement_import");
+		long recordsBefore = countRows("settlement_record");
+		long accountsBefore = countRows("account");
+		long transactionsBefore = countRows("ledger_transaction");
+		long entriesBefore = countRows("ledger_entry");
+		long idempotencyBefore = countRows("idempotency_key");
+		long outboxBefore = countRows("outbox_event");
+		long processedEventBefore = countRows("processed_event");
+		long reconciliationRunBefore = countRows("reconciliation_run");
+		long reconciliationResultBefore = countRows("reconciliation_result");
+
+		try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
+			statement.execute("ALTER TABLE settlement_record ADD CONSTRAINT chk_test_block_insert CHECK (1 = 0) NOT VALID");
+		}
+
+		try {
+			ResponseEntity<Map> response = postImport(source, content);
+			assertThat(response.getStatusCode().is5xxServerError()).isTrue();
+
+			// No partial import: neither the import row, nor any record
+			// row (no partial deduplication state), nor any other table
+			// this operation must never touch.
+			assertThat(countRows("settlement_import")).isEqualTo(importsBefore);
+			assertThat(countRows("settlement_record")).isEqualTo(recordsBefore);
+			assertThat(countRows("account")).isEqualTo(accountsBefore);
+			assertThat(countRows("ledger_transaction")).isEqualTo(transactionsBefore);
+			assertThat(countRows("ledger_entry")).isEqualTo(entriesBefore);
+			assertThat(countRows("idempotency_key")).isEqualTo(idempotencyBefore);
+			assertThat(countRows("outbox_event")).isEqualTo(outboxBefore);
+			assertThat(countRows("processed_event")).isEqualTo(processedEventBefore);
+			assertThat(countRows("reconciliation_run")).isEqualTo(reconciliationRunBefore);
+			assertThat(countRows("reconciliation_result")).isEqualTo(reconciliationResultBefore);
+		}
+		finally {
+			try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
+				statement.execute("ALTER TABLE settlement_record DROP CONSTRAINT chk_test_block_insert");
+			}
+		}
+
+		// A byte-identical retry (same source, same exact file bytes)
+		// succeeds cleanly once the test-only failure mechanism is gone.
+		ResponseEntity<Map> retried = postImport(source, content);
+		assertThat(retried.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+		assertThat(retried.getBody().get("insertedRows")).isEqualTo(2);
+		assertThat(countRows("settlement_import")).isEqualTo(importsBefore + 1);
+		assertThat(countRows("settlement_record")).isEqualTo(recordsBefore + 2);
+	}
+
 	@Test
 	void returned201MeansTheTransactionCommitted() throws SQLException {
 		String source = uniqueSource();

@@ -34,6 +34,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -306,24 +307,26 @@ class DepositIntegrationTest {
 
 		int concurrentDeposits = 20;
 		BigDecimal amountEach = new BigDecimal("5.00");
+		List<UUID> transactionIds = new ArrayList<>();
 		ExecutorService executor = Executors.newFixedThreadPool(concurrentDeposits);
 		try {
 			List<Callable<ResponseEntity<DepositResponse>>> tasks = new ArrayList<>();
 			for (int i = 0; i < concurrentDeposits; i++) {
 				tasks.add(() -> postDeposit(accountId, Map.of("amount", "5.00", "currency", "USD")));
 			}
-			List<Future<ResponseEntity<DepositResponse>>> futures = executor.invokeAll(tasks);
+			List<Future<ResponseEntity<DepositResponse>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
 
 			int successCount = 0;
 			for (Future<ResponseEntity<DepositResponse>> future : futures) {
-				ResponseEntity<DepositResponse> result = future.get();
+				ResponseEntity<DepositResponse> result = future.get(5, TimeUnit.SECONDS);
 				assertThat(result.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+				transactionIds.add(result.getBody().transactionId());
 				successCount++;
 			}
 			assertThat(successCount).isEqualTo(concurrentDeposits);
 		}
 		finally {
-			executor.shutdown();
+			executor.shutdownNow();
 		}
 
 		BigDecimal expectedTotal = amountEach.multiply(BigDecimal.valueOf(concurrentDeposits));
@@ -332,6 +335,18 @@ class DepositIntegrationTest {
 
 		long entryCountForAccount = countLedgerEntriesForAccount(accountId);
 		assertThat(entryCountForAccount).isEqualTo(concurrentDeposits);
+
+		// Task 16: every committed deposit -- not just the aggregate
+		// balance -- produced exactly one outbox_event (Task 11's
+		// atomicity guarantee holding under real concurrent contention),
+		// and the account's ledger-derived balance (CUSTOMER/LIABILITY:
+		// credits minus debits, per docs/DATA_MODEL.md's balance formula)
+		// agrees exactly with the materialized account.balance column --
+		// never assumed, always recomputed from the immutable entries
+		// this run actually committed.
+		assertThat(transactionIds).hasSize(concurrentDeposits);
+		assertThat(countOutboxEventsForTransactions(transactionIds)).isEqualTo(concurrentDeposits);
+		assertThat(fetchLedgerDerivedLiabilityBalance(accountId)).isEqualByComparingTo(fetchBalance(accountId));
 	}
 
 	// ------------------------------------------------------------------
@@ -455,6 +470,39 @@ class DepositIntegrationTest {
 
 	private long countLedgerEntries() throws SQLException {
 		return countRows("SELECT COUNT(*) FROM ledger_entry");
+	}
+
+	private long countOutboxEventsForTransactions(List<UUID> transactionIds) throws SQLException {
+		try (Connection connection = dataSource.getConnection();
+				PreparedStatement statement = connection.prepareStatement(
+						"SELECT COUNT(*) FROM outbox_event WHERE aggregate_id = ANY (?)")) {
+			statement.setArray(1, connection.createArrayOf("uuid", transactionIds.toArray()));
+			try (ResultSet resultSet = statement.executeQuery()) {
+				resultSet.next();
+				return resultSet.getLong(1);
+			}
+		}
+	}
+
+	/**
+	 * Recomputes this CUSTOMER/LIABILITY account's balance directly from
+	 * its own immutable ledger_entry rows (credits minus debits, per
+	 * docs/DATA_MODEL.md's balance formula for a LIABILITY account) --
+	 * never trusting the materialized account.balance column, so the
+	 * caller can independently verify the two agree.
+	 */
+	private BigDecimal fetchLedgerDerivedLiabilityBalance(UUID accountId) throws SQLException {
+		try (Connection connection = dataSource.getConnection();
+				PreparedStatement statement = connection.prepareStatement(
+						"SELECT COALESCE(SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END), 0) "
+								+ "- COALESCE(SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE 0 END), 0) AS derived "
+								+ "FROM ledger_entry WHERE account_id = ?")) {
+			statement.setObject(1, accountId);
+			try (ResultSet resultSet = statement.executeQuery()) {
+				resultSet.next();
+				return resultSet.getBigDecimal("derived");
+			}
+		}
 	}
 
 	private long countLedgerEntriesForAccount(UUID accountId) throws SQLException {

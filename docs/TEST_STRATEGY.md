@@ -3,8 +3,9 @@
 > **Status: all Phase 1 test-writing tasks are implemented, plus Task 10
 > (idempotency), Task 11 (transactional outbox), Task 12 (Kafka
 > publishing), Task 13 (Kafka consumption and duplicate-event
-> protection), Task 14 (settlement CSV import), and Task 15 (settlement
-> reconciliation), and every test runs
+> protection), Task 14 (settlement CSV import), Task 15 (settlement
+> reconciliation), and Task 16 (reliability, failure, and concurrency
+> hardening) — every task in Phase 2 is now complete — and every test runs
 > automatically in CI (Task 9) on every push/PR.** The connectivity smoke
 > test (Task 1), schema-verification tests (Task 2), account creation's
 > tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
@@ -18,9 +19,12 @@
 > validation/duplicate/conflict/rollback tests (Task 13, real PostgreSQL
 > **and** real Kafka Testcontainers), the settlement CSV
 > parsing/hashing/duplicate/conflict/concurrency/financial-non-effect
-> tests (Task 14, real PostgreSQL, no Kafka), and the settlement
+> tests (Task 14, real PostgreSQL, no Kafka), the settlement
 > reconciliation matching/classification/replay/concurrency/
-> financial-non-effect tests (Task 15, real PostgreSQL, no Kafka) all
+> financial-non-effect tests (Task 15, real PostgreSQL, no Kafka), and
+> the mixed-workload/global-consistency, transfer-idempotency-race,
+> settlement-forced-rollback, and outbox-new-instance-recovery hardening
+> tests (Task 16, zero production changes required) all
 > exist (see "Currently
 > Implemented" below) and all run in `.github/workflows/ci.yml` (see "CI"
 > below). Only `GET /api/v1/accounts/{id}` remains untested, since that
@@ -795,6 +799,112 @@ the same container already committed — rather than a fault-injection
 mock, since no ordinary, well-formed reconciliation input can otherwise
 trigger a genuine mid-transaction constraint violation.
 
+## Reliability and Concurrency Hardening Tests (implemented, Task 16)
+
+A test-led audit of Tasks 1–15's existing concurrency, idempotency,
+rollback, outbox, Kafka, settlement, and reconciliation test suites (all
+of the tests already documented above) found coverage already extensive.
+The audit closed five genuine, approved gaps — **no production code was
+changed**; every new/strengthened test passed against the existing
+implementation on its first run.
+
+- **Transfer idempotency race** (`IdempotencyIntegrationTest`) — until
+  now, only deposit had a true concurrent-race proof
+  (`simultaneousIdenticalDepositRequestsCommitExactlyOnce`,
+  `simultaneousConflictingDepositRequestsWithTheSameKeyProduceExactlyOneWinner`);
+  transfer had only sequential retry coverage. Two new tests,
+  `simultaneousIdenticalTransferRequestsCommitExactlyOnce` and
+  `simultaneousConflictingTransferRequestsWithTheSameKeyProduceExactlyOneWinner`,
+  mirror the deposit versions exactly (same `ready`/`start`
+  `CountDownLatch` gating, timed `invokeAll`), proving `TransferService`
+  gets the same exactly-once-commit guarantee from `IdempotencyService`'s
+  advisory-lock mechanism under a genuine simultaneous race, not just
+  sequential replay.
+- **Mixed concurrent workload and global consistency audit**
+  (`MixedWorkloadConsistencyIntegrationTest`, new top-level test class) —
+  a single bounded workload of 6 concurrent deposits and 8 concurrent
+  transfers (including opposite-direction pairs between the same two
+  accounts, and pairs across different account combinations) across four
+  shared customer accounts, gated by the same `ready`/`start` latch
+  pattern, followed by a consistency audit queried directly from
+  PostgreSQL — never from the HTTP responses that triggered it. The audit
+  does not assume every submitted transfer succeeds (each response is
+  only required to be an ordinary 201 or 422, never an unhandled error);
+  every expected value it checks is derived from the ledger_entry rows
+  this run actually committed. It verifies: every `ledger_transaction`
+  has exactly two entries with debits equal to credits (`BigDecimal`
+  comparison); every account's materialized `balance` equals its own
+  ledger-derived balance, computed with the real per-account-class
+  formula (`ASSET`: debits − credits; `LIABILITY`: credits − debits) —
+  never a hypothetical/predicted value; no negative balance; no orphaned
+  `ledger_entry` (account/transaction references checked directly, not
+  just trusted from the foreign key); no orphaned `outbox_event`/
+  `idempotency_key` reference (checked against the real
+  `outbox_event.aggregate_id`/`idempotency_key.ledger_transaction_id`
+  foreign keys declared in `V3`/`V2`, confirmed by inspection rather than
+  assumed) — and, since every call in this workload used its own distinct
+  idempotency key, that both counts equal the committed transaction count
+  exactly, not merely "non-orphaned." A spot check confirms the
+  immutability triggers still reject a mutation against a row this
+  workload itself just committed (the exhaustive proof of every trigger
+  remains `SchemaMigrationIntegrationTest`'s job, not duplicated here).
+- **Settlement import forced rollback** (`SettlementImportIntegrationTest`)
+  — every other settlement rollback test is triggered by ordinary
+  business logic (a within-file conflict, an invalid row); the new
+  `forcedSettlementRecordInsertionFailureRollsBackTheWholeImportAndSucceedsAfterCorrection`
+  forces a genuine PostgreSQL-level failure (the same temporary
+  `CHECK (1 = 0) NOT VALID` technique used elsewhere) on
+  `settlement_record`, so the failure lands strictly after
+  `SettlementImportProcessor` has already claimed one or more rows in its
+  per-row loop but before `settlement_import` itself is ever inserted
+  (that insert happens last — see `docs/ARCHITECTURE.md`'s "Settlement
+  Import" section). Confirms no partial `settlement_import`, no partial
+  `settlement_record`, no partial deduplication state, and no change to
+  `account`, `ledger_transaction`, `ledger_entry`, `idempotency_key`,
+  `outbox_event`, `processed_event`, `reconciliation_run`, or
+  `reconciliation_result` — then a byte-identical retry succeeds cleanly
+  once the constraint is removed.
+- **Outbox recovery by a newly constructed instance**
+  (`OutboxPublisherIntegrationTest`) — proves restart-style recovery
+  directly rather than only inferring it from `OutboxPublisher` having no
+  instance fields: `pendingEventRemainsRecoverableByANewlyConstructedPublisherInstance`
+  builds a fresh `OutboxPublisher` with `new` (never registered with
+  Spring, sharing no in-memory state with the application's own managed
+  bean, built from the same underlying repository/`KafkaTemplate`/
+  properties beans a freshly started application process would itself
+  inject) and calls it wrapped in an explicit `PlatformTransactionManager`
+  transaction (`TransactionTemplate` — a test-only technique, since manual
+  construction bypasses Spring's `@Transactional` AOP proxy, which only
+  wraps container-managed beans). The pending row is claimed and
+  published successfully, proving the component genuinely carries no
+  required instance state.
+- **Strengthened**: `DepositIntegrationTest.concurrentDepositsIntoSameWalletDoNotLoseUpdates`
+  now also asserts exactly one `outbox_event` row per committed deposit
+  (Task 11's atomicity guarantee, explicitly checked under real
+  contention, not just assumed) and that the account's ledger-derived
+  balance equals its materialized balance.
+
+All new concurrency tests use `ExecutorService` + a `ready`/`start`
+`CountDownLatch` pair (each worker signals readiness, then all release
+together) + timed `invokeAll`/individual `Future.get(timeout, ...)` calls
++ `executor.shutdownNow()` in `finally` — never `Thread.sleep` as the
+correctness mechanism, and no concurrency API left able to wait
+indefinitely. `./mvnw verify` was run twice in immediate succession after
+these additions, with identical results both times (498 tests, 0
+failures), specifically to rule out timing-dependent flakiness in the new
+tests.
+
+**What Task 16 explicitly does not claim**: it does not promise
+distributed exactly-once delivery across PostgreSQL and Kafka (the
+existing model — atomic database transactions, transactional outbox,
+at-least-once delivery, idempotent consumer processing, effectively-once
+database side effects for a given event — is unchanged and is what these
+tests prove held under real concurrency, not a stronger guarantee); it
+does not claim every possible failure mode has been eliminated, only that
+the specific scenarios above are proven correct against real PostgreSQL
+(and, where broker behavior matters, real Kafka) — never mocked for a
+guarantee that depends on real database or broker behavior.
+
 ## Currently Implemented
 
 `LedgerGuardApplicationTests` (Task 1):
@@ -870,11 +980,30 @@ new `SourceNormalizerTest` — 108 new tests, all introduced by Task 14).
 `ReconciliationOpenApiIntegrationTest`, and `ReconciliationMatcherTest`
 (Task 15) — see "Settlement Reconciliation Tests" above.
 
-Total: 482 tests (417 from Phase 1 + Tasks 10–14, plus 20 in the new
-`ReconciliationSchemaMigrationIntegrationTest`, 23 in the new
-`ReconciliationIntegrationTest`, 6 in the new
-`ReconciliationOpenApiIntegrationTest`, and 16 in the new
-`ReconciliationMatcherTest` — 65 new tests, all introduced by Task 15).
+`StaticUiIntegrationTest` (11 tests) — verifies the plain HTML/CSS/JS
+demonstration UI under `src/main/resources/static/` is served correctly
+by Spring Boot's default static-resource handling, and — just as
+importantly — that it shadows no existing REST, actuator, or Swagger/
+OpenAPI path; also covers a pre-existing latent defect this suite first
+exposed and Task 16 leaves as-is (unrelated to Task 16's own scope): a
+`NoResourceFoundException` for a genuinely unmapped path was being
+misreported as 500 by the shared `Exception`-catching fallback in
+`GlobalExceptionHandler` before that fix.
+
+`MixedWorkloadConsistencyIntegrationTest`, plus the transfer
+idempotency-race, settlement forced-rollback, and outbox new-instance
+tests added to existing suites (Task 16) — see "Reliability and
+Concurrency Hardening Tests" above.
+
+Total: 498 tests (482 from Phase 1 + Tasks 10–15, plus 11 in the new
+`StaticUiIntegrationTest` — 493 after the demonstration UI — plus 5 new
+tests from Task 16's hardening: 2 in `IdempotencyIntegrationTest`
+(transfer races), 1 new `MixedWorkloadConsistencyIntegrationTest`, 1 in
+`SettlementImportIntegrationTest` (forced rollback), and 1 in
+`OutboxPublisherIntegrationTest` (new-instance recovery) — 493 → 498).
+`DepositIntegrationTest.concurrentDepositsIntoSameWalletDoNotLoseUpdates`
+was strengthened with two additional assertions, not counted as a new
+test.
 
 ## CI (implemented, Task 9)
 

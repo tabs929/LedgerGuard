@@ -5,7 +5,7 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2, Tasks 10–15 implemented
+## Status: Phase 1 complete (Tasks 1–9); Phase 2 complete (Tasks 10–16)
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
@@ -16,9 +16,13 @@ deposits and transfers (Task 10), a transactional outbox for durable
 event persistence (Task 11), publishing pending outbox events to Kafka
 (Task 12), consuming those events with durable, database-backed
 duplicate-event protection (Task 13), importing external settlement
-CSV files as immutable observations (Task 14), and comparing those
+CSV files as immutable observations (Task 14), comparing those
 observations against the ledger through settlement reconciliation
-(Task 15). Authentication remains unimplemented — see `docs/TASKS.md`.
+(Task 15), and a reliability/concurrency hardening pass (Task 16) that
+added focused tests proving these guarantees hold under real concurrent
+load, forced failures, and duplicate delivery — **no production code
+changed**, since the audit found no correctness defect. Authentication
+remains unimplemented — see `docs/TASKS.md`.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -533,7 +537,7 @@ instructions, not a claim that this exact sequence was executed.
 ./mvnw verify
 ```
 
-This runs the full test suite (482 tests), including Testcontainers-backed
+This runs the full test suite (498 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that
@@ -548,9 +552,12 @@ unit-test suite (Task 12), a Kafka consumer test suite plus focused
 unit tests for validation, hashing, and duplicate comparison (Task 13),
 a settlement-import schema/behavior/concurrency test suite plus
 focused unit tests for CSV parsing, hashing, and configuration validation
-(Task 14), and a settlement-reconciliation schema/behavior/concurrency
+(Task 14), a settlement-reconciliation schema/behavior/concurrency
 test suite plus a focused unit-test suite for the matching/classification
-algorithm (Task 15).
+algorithm (Task 15), and a reliability-hardening pass (Task 16) that
+added a mixed-workload/global-consistency test plus targeted additions
+to the idempotency, settlement-import, and outbox-publisher suites —
+**zero production code changed**.
 The idempotency suite verifies header validation, exact response replay,
 same- and cross-operation conflict detection, that a failed attempt never
 consumes the key, and — against real PostgreSQL advisory locking, never
@@ -604,7 +611,19 @@ import producing a valid zero-result run, a case where the file's row count
 exceeds the reconciliation result count, that a duplicated observation is
 reconciled only under the import that first recorded it, same-import
 replay, and a real four-way concurrency test proving exactly one
-committed run with every loser correctly loading the winner. The deposit
+committed run with every loser correctly loading the winner. The Task 16
+hardening pass added: a true concurrent idempotency race for transfer
+(mirroring deposit's existing race test); a single mixed concurrent
+deposit/transfer workload across four shared accounts followed by a
+global consistency audit computed directly from PostgreSQL (every
+ledger transaction balanced, every account's materialized balance
+matching its own ledger-derived balance, no orphaned references) rather
+than from HTTP responses; a genuine forced-database-failure rollback test
+for settlement import (the one rollback scenario that previously only
+had business-logic-triggered coverage); and direct proof that a
+newly constructed, non-Spring-managed `OutboxPublisher` instance —
+sharing no state with the application's own bean — can still claim and
+publish a pending event. The deposit
 and transfer suites both verify
 balanced double-entry
 postings, balance correctness, a genuine database-failure rollback

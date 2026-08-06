@@ -110,6 +110,12 @@ class OutboxPublisherIntegrationTest {
 	OutboxPublisherScheduler outboxPublisherScheduler;
 
 	@Autowired
+	KafkaTemplate<String, String> kafkaTemplate;
+
+	@Autowired
+	org.springframework.transaction.PlatformTransactionManager transactionManager;
+
+	@Autowired
 	OutboxPublisherProperties publisherProperties;
 
 	private static final ObjectMapper JSON = new ObjectMapper();
@@ -393,6 +399,49 @@ class OutboxPublisherIntegrationTest {
 		for (UUID transactionId : transactionIds) {
 			assertThat(fetchPublishedAt(transactionId)).isNotNull();
 		}
+	}
+
+	// Task 16: proves OutboxPublisher carries no required instance state --
+	// a pending row remains fully recoverable by a publisher instance the
+	// Spring container never constructed and that shares no in-memory
+	// state whatsoever with the application's own managed bean, using
+	// exactly the kind of dependencies a freshly started application
+	// process would itself inject (the real, shared, already-stateless
+	// repository/KafkaTemplate/properties beans). This is what "restart
+	// recovery" actually reduces to for this component: everything it
+	// needs comes from PostgreSQL and its constructor arguments, nothing
+	// from prior calls on any particular object.
+	//
+	// Manual `new` construction bypasses Spring's @Transactional AOP
+	// proxy (that proxy only wraps container-managed beans), so the call
+	// is wrapped here in an explicit PlatformTransactionManager
+	// transaction -- a test-only technique that reproduces the same
+	// atomic claim+publish+mark-published boundary the proxy would
+	// normally provide, without adding any production transaction-manager
+	// exposure.
+	@Test
+	void pendingEventRemainsRecoverableByANewlyConstructedPublisherInstance() throws Exception {
+		UUID accountId = createUsdCustomerAccount("Publisher Recovery New Instance");
+		ResponseEntity<Map> response = postDeposit(accountId, "12.00", UUID.randomUUID().toString());
+		UUID transactionId = UUID.fromString((String) response.getBody().get("transactionId"));
+		UUID eventId = fetchEventId(transactionId);
+
+		// Still pending -- nothing has published it yet (poll-delay-millis
+		// is effectively disabled for this whole test class).
+		assertThat(fetchPublishedAt(transactionId)).isNull();
+
+		OutboxPublisher freshInstance = new OutboxPublisher(outboxEventRepository, kafkaTemplate, publisherProperties);
+		new org.springframework.transaction.support.TransactionTemplate(transactionManager)
+				.executeWithoutResult(status -> freshInstance.publishIfPending(eventId));
+
+		assertThat(fetchPublishedAt(transactionId)).isNotNull();
+		List<ConsumerRecord<String, String>> records = consumeAllRecordsForKey(transactionId.toString(), 1);
+		assertThat(records).hasSize(1);
+		JsonNode value = JSON.readTree(records.get(0).value());
+		assertThat(value.get("eventType").asText()).isEqualTo("DEPOSIT_COMPLETED");
+		assertThat(value.get("transactionId").asText()).isEqualTo(transactionId.toString());
+		assertThat(fetchBalance(accountId)).isEqualByComparingTo("12.00");
+		assertThat(countOutboxRowsForAggregate(transactionId)).isEqualTo(1);
 	}
 
 	// ------------------------------------------------------------------

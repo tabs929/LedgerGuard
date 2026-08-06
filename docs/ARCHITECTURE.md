@@ -1,16 +1,18 @@
 # Architecture
 
-> **Status: Phase 1 complete (Tasks 1–9). Phase 2, Tasks 10 (idempotency),
-> 11 (transactional outbox), 12 (Kafka publishing), 13 (Kafka
-> consumption and duplicate-event protection), 14 (settlement CSV
-> import), and 15 (settlement reconciliation) implemented.** Database
+> **Status: Phase 1 complete (Tasks 1–9). Phase 2 complete (Tasks 10–16):
+> idempotency, transactional outbox, Kafka publishing, Kafka consumption,
+> settlement CSV import, settlement reconciliation, and reliability
+> hardening.** Database
 > layer (Task 2), account creation (Task 3), deposits (Task 4), transfers
 > (Task 5), account balance/transaction-history reads (Task 6), global
 > error handling (Task 7), OpenAPI documentation (Task 8), CI (Task 9),
 > idempotency for deposits/transfers (Task 10), the transactional outbox
 > (Task 11), publishing pending outbox events to Kafka (Task 12), durably
 > deduplicated Kafka consumption (Task 13), settlement CSV import
-> (Task 14), and settlement reconciliation (Task 15) are all implemented;
+> (Task 14), settlement reconciliation (Task 15), and reliability/
+> concurrency hardening (Task 16 — test-only; no production code changed)
+> are all implemented;
 > only plain account lookup by id remains unimplemented — no task has
 > ever been assigned it. The `account`
 > package has account creation,
@@ -1377,6 +1379,84 @@ holding a whole run in memory again. Bounded by Task 14's own 10,000-row
 import limit — the same order of magnitude Task 14 itself already holds
 in memory for one import. No outbox publisher, Kafka consumer, or
 producer tuning of any kind — this task has no Kafka involvement at all.
+
+## Reliability Hardening (implemented, Task 16)
+
+Task 16 is a **test-only** hardening task — a reliability audit of Tasks
+1–15's existing concurrency, idempotency, rollback, outbox, Kafka,
+settlement, and reconciliation test coverage, closing five genuine gaps
+the audit found. **No production code was changed**: every new test
+passed against the existing implementation, confirming (rather than
+correcting) the guarantees below. See `docs/TEST_STRATEGY.md`'s
+"Reliability and Concurrency Hardening Tests" section for the exact new
+tests and what each one proves.
+
+### The reliability model, stated precisely
+
+LedgerGuard's reliability model is, and after Task 16 remains:
+
+- **Atomic PostgreSQL transactions** for every financial write — a
+  deposit or transfer's ledger entries, materialized balance updates,
+  idempotency record, and outbox event all commit or roll back together,
+  in one transaction (Tasks 4/5/10/11).
+- **Deterministic row locking** (ascending account-id order, never by
+  role) prevents avoidable deadlocks between concurrent operations that
+  touch the same two accounts in different orders (Tasks 4/5, "Deterministic
+  Lock Ordering" above).
+- **Idempotent command handling** via a PostgreSQL transaction-scoped
+  advisory lock, keyed by the caller's Idempotency-Key — the database,
+  not a JVM-local lock or cache, arbitrates concurrent identical/
+  conflicting requests (Task 10, "Idempotency" above).
+- **Transactional outbox** for reliable event publication — an event is
+  never published without its business transaction having already
+  committed, and a business transaction that rolls back leaves no
+  publishable event (Task 11).
+- **At-least-once Kafka delivery** — Task 12's producer never guarantees
+  a message is sent exactly once; a crash between broker acknowledgement
+  and marking `published_at` can cause a redelivery on retry (Task 12,
+  "Kafka Publishing" above).
+- **Idempotent consumer processing** — Task 13's consumer makes the
+  *PostgreSQL-side effect* of processing a given `eventId` effectively
+  once, via the same atomic-claim pattern as idempotency (Task 13,
+  "Kafka Consumption" above).
+- **Immutable settlement and reconciliation history** — every settlement
+  and reconciliation table is append-only, enforced by database triggers,
+  never by application-level convention alone (Tasks 14/15).
+
+**This is explicitly *not* a claim of distributed exactly-once delivery
+across PostgreSQL and Kafka** — that combination remains at-least-once
+delivery made effectively-once at the PostgreSQL layer for a given event,
+exactly as Tasks 12/13 originally documented. Task 16 does not change
+this model; it adds direct proof that the model holds under real
+concurrent load, forced failures, and (for the outbox) a genuinely new
+component instance — not a stronger guarantee than what Tasks 1–15
+already built.
+
+### What Task 16 tested that was new
+
+- A true concurrent race for transfer idempotency (previously only
+  proven for deposit).
+- A single mixed workload — deposits and transfers, including
+  opposite-direction pairs, across several shared accounts at once —
+  followed by a global consistency audit computed directly from
+  committed `ledger_entry` rows (never predicted from HTTP responses,
+  and never assuming every submitted transfer succeeds).
+- A genuine PostgreSQL-level forced failure for settlement import
+  (previously only business-logic-triggered rollbacks were tested there).
+- Direct proof that a brand-new, non-Spring-managed `OutboxPublisher`
+  instance — sharing no in-memory state with the application's own bean —
+  can claim and publish a pending event, rather than only inferring this
+  from the class having no instance fields.
+
+### What Task 16 does not claim
+
+- Not every possible failure mode has been eliminated — only the
+  specific scenarios above are proven correct, against real PostgreSQL
+  and (where broker behavior matters) real Kafka, never mocked for a
+  guarantee that depends on real database or broker behavior.
+- No new retry framework, dead-letter design, cache, distributed lock, or
+  automatic broad retry around a financial transaction was added — none
+  was needed, since the audit found no correctness defect to justify one.
 
 ## Ledger Immutability (implemented, Task 2)
 

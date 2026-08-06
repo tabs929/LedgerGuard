@@ -1,10 +1,12 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
-> **Status: Phase 1 complete.** All 9 tasks below are implemented. Phase 2
-> has begun — Task 10 (idempotency), Task 11 (transactional outbox),
-> Task 12 (Kafka publishing of outbox events), Task 13 (Kafka
+> **Status: Phase 1 complete.** All 9 tasks below are implemented. **Phase
+> 2 is now also complete** — Task 10 (idempotency), Task 11 (transactional
+> outbox), Task 12 (Kafka publishing of outbox events), Task 13 (Kafka
 > consumption and duplicate-event protection), Task 14 (settlement
-> CSV import), and Task 15 (settlement reconciliation) are also
+> CSV import), Task 15 (settlement reconciliation), and Task 16
+> (reliability, failure, and concurrency hardening — test-only, no
+> production changes) are all
 > implemented. See `docs/TASKS.md` for the per-task
 > breakdown and what each one covered.
 
@@ -160,12 +162,28 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   change of any kind, and no automated correction. See
   `docs/ARCHITECTURE.md`'s "Settlement Reconciliation" section and
   `docs/DATA_MODEL.md`'s "Settlement Reconciliation Tables" section.
-- Phase 2 is now feature-complete except for Task 16 (reliability,
-  failure, and concurrency hardening beyond what Tasks 10–15 already
-  cover) per `CLAUDE.md`; idempotency (Task 10), the transactional outbox
-  (Task 11), Kafka publishing (Task 12), Kafka consumption/dedup
-  (Task 13), settlement CSV import (Task 14), and settlement
-  reconciliation (Task 15) are done so far.
+- **Task 16 — Reliability, failure, and concurrency hardening
+  (implemented):** a test-led audit of Tasks 1–15's existing concurrency,
+  idempotency, rollback, outbox, Kafka, settlement, and reconciliation
+  test coverage, which found it already extensive. Closed five genuine
+  gaps (a true concurrent idempotency race for transfer, not just
+  deposit; a mixed concurrent deposit/transfer workload across shared
+  accounts followed by a global PostgreSQL-level consistency audit; a
+  genuine forced-database-failure rollback test for settlement import;
+  direct proof that a newly constructed, non-Spring-managed
+  `OutboxPublisher` instance recovers a pending event; and a strengthened
+  concurrent-deposit test). **No production code was changed** — the
+  audit found no correctness defect. Does not claim distributed
+  exactly-once delivery across PostgreSQL and Kafka, and does not claim
+  every possible failure mode has been eliminated. See
+  `docs/ARCHITECTURE.md`'s "Reliability Hardening" section and
+  `docs/TEST_STRATEGY.md`'s "Reliability and Concurrency Hardening Tests"
+  section.
+- **Phase 2 is now fully complete** per `CLAUDE.md`: idempotency
+  (Task 10), the transactional outbox (Task 11), Kafka publishing
+  (Task 12), Kafka consumption/dedup (Task 13), settlement CSV import
+  (Task 14), settlement reconciliation (Task 15), and reliability
+  hardening (Task 16) are all done.
 
 ## Non-Goals
 

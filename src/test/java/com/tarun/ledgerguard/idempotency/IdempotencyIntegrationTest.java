@@ -415,6 +415,96 @@ class IdempotencyIntegrationTest {
 		assertThat(finalBalance).isIn(new BigDecimal("10.0000"), new BigDecimal("20.0000"));
 	}
 
+	// Task 16: the deposit races above already prove IdempotencyService's
+	// advisory-lock-based concurrency handling; transfer uses the exact
+	// same execute(...) wrapper (same advisory lock acquired before any
+	// account row lock), but until now nothing exercised a genuine
+	// concurrent race for it -- only sequential retry
+	// (identicalTransferRetryReplaysTheExactOriginalResponseAndCreatesNothingNew()
+	// above). This closes that gap.
+	@Test
+	void simultaneousIdenticalTransferRequestsCommitExactlyOnce() throws Exception {
+		UUID sourceId = createFundedAccount("Concurrent Identical Transfer Source", "1000.00");
+		UUID destinationId = createUsdCustomerAccount("Concurrent Identical Transfer Destination");
+		String key = UUID.randomUUID().toString();
+		long transactionsBefore = countLedgerTransactions();
+
+		int concurrentRequests = 15;
+		ExecutorService executor = Executors.newFixedThreadPool(concurrentRequests);
+		try {
+			List<Callable<ResponseEntity<String>>> tasks = new ArrayList<>();
+			for (int i = 0; i < concurrentRequests; i++) {
+				tasks.add(() -> postTransferRaw(sourceId, destinationId, "5.00", key));
+			}
+			List<Future<ResponseEntity<String>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
+
+			List<String> bodies = new ArrayList<>();
+			for (Future<ResponseEntity<String>> future : futures) {
+				ResponseEntity<String> result = future.get(5, TimeUnit.SECONDS);
+				assertThat(result.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+				bodies.add(result.getBody());
+			}
+			assertThat(bodies).allMatch(body -> body.equals(bodies.get(0)));
+		}
+		finally {
+			executor.shutdownNow();
+		}
+
+		assertThat(countLedgerTransactions()).isEqualTo(transactionsBefore + 1);
+		assertThat(fetchBalance(sourceId)).isEqualByComparingTo("995.00");
+		assertThat(fetchBalance(destinationId)).isEqualByComparingTo("5.00");
+		assertThat(countIdempotencyRows(key)).isEqualTo(1);
+	}
+
+	@Test
+	void simultaneousConflictingTransferRequestsWithTheSameKeyProduceExactlyOneWinner() throws Exception {
+		UUID sourceId = createFundedAccount("Concurrent Conflicting Transfer Source", "1000.00");
+		UUID destinationA = createUsdCustomerAccount("Concurrent Conflicting Transfer Destination A");
+		UUID destinationB = createUsdCustomerAccount("Concurrent Conflicting Transfer Destination B");
+		String key = UUID.randomUUID().toString();
+
+		int perGroup = 8;
+		ExecutorService executor = Executors.newFixedThreadPool(perGroup * 2);
+		try {
+			List<Callable<ResponseEntity<String>>> tasks = new ArrayList<>();
+			for (int i = 0; i < perGroup; i++) {
+				tasks.add(() -> postTransferRaw(sourceId, destinationA, "10.00", key));
+				tasks.add(() -> postTransferRaw(sourceId, destinationB, "10.00", key));
+			}
+			List<Future<ResponseEntity<String>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
+
+			List<ResponseEntity<String>> results = new ArrayList<>();
+			for (Future<ResponseEntity<String>> future : futures) {
+				results.add(future.get(5, TimeUnit.SECONDS));
+			}
+
+			List<ResponseEntity<String>> created = results.stream()
+					.filter(r -> r.getStatusCode() == HttpStatus.CREATED)
+					.collect(Collectors.toList());
+			List<ResponseEntity<String>> conflicted = results.stream()
+					.filter(r -> r.getStatusCode() == HttpStatus.CONFLICT)
+					.collect(Collectors.toList());
+
+			assertThat(created.size() + conflicted.size()).isEqualTo(perGroup * 2);
+			assertThat(created).isNotEmpty();
+			assertThat(created).allMatch(r -> r.getBody().equals(created.get(0).getBody()));
+		}
+		finally {
+			executor.shutdownNow();
+		}
+
+		assertThat(countIdempotencyRows(key)).isEqualTo(1);
+		// Exactly one destination received the single committed transfer --
+		// which one is not guaranteed by the API contract, so only the
+		// combined invariant (source debited by exactly one transfer's
+		// worth, exactly one destination credited) is asserted.
+		assertThat(fetchBalance(sourceId)).isEqualByComparingTo("990.00");
+		BigDecimal destinationATotal = fetchBalance(destinationA);
+		BigDecimal destinationBTotal = fetchBalance(destinationB);
+		assertThat(destinationATotal.add(destinationBTotal)).isEqualByComparingTo("10.00");
+		assertThat(List.of(destinationATotal, destinationBTotal)).contains(new BigDecimal("0.0000"));
+	}
+
 	// ------------------------------------------------------------------
 	// helpers
 	// ------------------------------------------------------------------
