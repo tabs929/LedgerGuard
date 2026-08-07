@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.idempotency;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -67,10 +68,8 @@ class IdempotencyIntegrationTest {
 	@Test
 	void missingIdempotencyKeyOnDepositReturns400() throws SQLException {
 		UUID accountId = createUsdCustomerAccount("Header Missing Deposit");
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
 		ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
-				new HttpEntity<>(Map.of("amount", "10.00", "currency", "USD"), headers), String.class);
+				new HttpEntity<>(Map.of("amount", "10.00", "currency", "USD"), authHeaders()), String.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -78,12 +77,10 @@ class IdempotencyIntegrationTest {
 	void missingIdempotencyKeyOnTransferReturns400() throws SQLException {
 		UUID sourceId = createUsdCustomerAccount("Header Missing Transfer Source");
 		UUID destinationId = createUsdCustomerAccount("Header Missing Transfer Destination");
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
 		Map<String, Object> body = Map.of("sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(), "amount", "10.00", "currency", "USD");
 		ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/transfers",
-				new HttpEntity<>(body, headers), String.class);
+				new HttpEntity<>(body, authHeaders()), String.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -203,8 +200,7 @@ class IdempotencyIntegrationTest {
 
 		postDepositRaw(accountId, "10.00", key);
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", key);
 		ResponseEntity<String> conflict = restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", "10.00", "currency", "EUR"), headers), String.class);
@@ -509,11 +505,20 @@ class IdempotencyIntegrationTest {
 	// helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	// Every account and every request in this class belongs to the same
+	// test-customer-a principal -- Task 17 cross-principal idempotency
+	// isolation is covered separately in
+	// OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders authHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<Map> response = restTemplate.postForEntity(
-				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
+				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), authHeaders()),
 				Map.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return UUID.fromString((String) response.getBody().get("id"));
@@ -531,16 +536,14 @@ class IdempotencyIntegrationTest {
 	}
 
 	private ResponseEntity<String> postDepositRaw(UUID accountId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", amount, "currency", "USD"), headers), String.class);
 	}
 
 	private ResponseEntity<String> postTransferRaw(UUID sourceId, UUID destinationId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		Map<String, Object> body = Map.of("sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(), "amount", amount, "currency", "USD");

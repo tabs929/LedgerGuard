@@ -8,6 +8,7 @@ import com.tarun.ledgerguard.account.dto.DepositResponse;
 import com.tarun.ledgerguard.account.dto.TransactionHistoryItem;
 import com.tarun.ledgerguard.common.ApiError;
 import com.tarun.ledgerguard.common.PagedResponse;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -20,6 +21,8 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.Pattern;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -83,8 +86,9 @@ public class AccountController {
 					+ "(only USD is supported in Phase 1)",
 					content = @Content(schema = @Schema(implementation = ApiError.class)))
 	})
-	public AccountResponse createAccount(@Valid @RequestBody CreateAccountRequest request) {
-		return accountService.createCustomerWalletAccount(request);
+	public AccountResponse createAccount(@Valid @RequestBody CreateAccountRequest request,
+			@AuthenticationPrincipal Jwt jwt) {
+		return accountService.createCustomerWalletAccount(request, AuthenticatedPrincipal.fromJwt(jwt));
 	}
 
 	@PostMapping("/{id}/deposits")
@@ -127,8 +131,9 @@ public class AccountController {
 			@RequestHeader("Idempotency-Key")
 			@Pattern(regexp = "^[A-Za-z0-9._:-]{1,128}$",
 					message = "must be 1-128 characters from [A-Za-z0-9._:-]")
-			String idempotencyKey) {
-		return depositService.deposit(accountId, request, idempotencyKey);
+			String idempotencyKey,
+			@AuthenticationPrincipal Jwt jwt) {
+		return depositService.deposit(accountId, request, idempotencyKey, AuthenticatedPrincipal.fromJwt(jwt));
 	}
 
 	@GetMapping("/{id}/balance")
@@ -145,8 +150,9 @@ public class AccountController {
 	})
 	public AccountBalanceResponse getBalance(
 			@Parameter(description = "Customer wallet account id", required = true)
-			@PathVariable("id") UUID accountId) {
-		return accountQueryService.getBalance(accountId);
+			@PathVariable("id") UUID accountId,
+			@AuthenticationPrincipal Jwt jwt) {
+		return accountQueryService.getBalance(accountId, AuthenticatedPrincipal.fromJwt(jwt));
 	}
 
 	@GetMapping("/{id}/transactions")
@@ -178,8 +184,9 @@ public class AccountController {
 			@Parameter(description = "Zero-based page number")
 			@RequestParam(name = "page", defaultValue = "0") @Min(0) int page,
 			@Parameter(description = "Items per page (1-100)")
-			@RequestParam(name = "size", defaultValue = "20") @Min(1) @Max(100) int size) {
-		return accountQueryService.getTransactionHistory(accountId, page, size);
+			@RequestParam(name = "size", defaultValue = "20") @Min(1) @Max(100) int size,
+			@AuthenticationPrincipal Jwt jwt) {
+		return accountQueryService.getTransactionHistory(accountId, AuthenticatedPrincipal.fromJwt(jwt), page, size);
 	}
 
 }

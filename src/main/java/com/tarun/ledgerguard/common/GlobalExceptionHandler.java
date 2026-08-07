@@ -7,6 +7,7 @@ import com.tarun.ledgerguard.account.SameAccountTransferException;
 import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
 import com.tarun.ledgerguard.idempotency.IdempotencyConflictException;
 import com.tarun.ledgerguard.reconciliation.ReconciliationNotFoundException;
+import com.tarun.ledgerguard.security.InvalidCredentialsException;
 import com.tarun.ledgerguard.reconciliation.SettlementImportNotFoundException;
 import com.tarun.ledgerguard.settlement.InvalidSettlementRequestException;
 import com.tarun.ledgerguard.settlement.SettlementConflictException;
@@ -88,6 +89,19 @@ public class GlobalExceptionHandler {
 	@ExceptionHandler(IdempotencyConflictException.class)
 	public ResponseEntity<ApiError> handleIdempotencyConflict(IdempotencyConflictException ex, HttpServletRequest request) {
 		return build(HttpStatus.CONFLICT, ex.getMessage(), request);
+	}
+
+	// -- authentication (Task 17) ------------------------------------------
+
+	// Unknown username or wrong password at POST /api/v1/auth/token --
+	// this is an ordinary permitAll() MVC endpoint, not a filter-chain
+	// rejection, so it is handled here rather than by
+	// JwtAuthenticationEntryPoint. ex.getMessage() is always the fixed,
+	// generic string -- never anything that could disclose which case
+	// occurred.
+	@ExceptionHandler(InvalidCredentialsException.class)
+	public ResponseEntity<ApiError> handleInvalidCredentials(InvalidCredentialsException ex, HttpServletRequest request) {
+		return build(HttpStatus.UNAUTHORIZED, ex.getMessage(), request);
 	}
 
 	// -- settlement import (Task 14) --------------------------------------

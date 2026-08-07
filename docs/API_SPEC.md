@@ -4,7 +4,11 @@
 > for deposits and transfers), Task 11 (transactional outbox), Task 12
 > (Kafka publishing of outbox events), Task 13 (Kafka consumption and
 > duplicate-event protection), Task 14 (settlement CSV import), and
-> Task 15 (settlement reconciliation) implemented.** None of Tasks 11–13
+> Task 15 (settlement reconciliation) implemented. Phase 3, Task 17
+> (stateless JWT authentication and ownership-based authorization)
+> implemented** — every endpoint below now requires a bearer token except
+> `POST /api/v1/auth/token` itself; see "Authentication" further down for
+> the full access matrix. None of Tasks 11–13
 > add any new endpoint, request field,
 > response field, status code, or header — the outbox, its Kafka
 > publisher, and its Kafka consumer are all internal
@@ -523,20 +527,68 @@ behind each one.
   original exception is logged server-side only, never returned to the
   client.
 
+## Authentication (implemented, Task 17)
+
+```
+POST /api/v1/auth/token
+```
+
+The only public authentication endpoint. Authenticates one of the fixed,
+configuration-backed demo identities (`ledgerguard.security.users`) and
+issues a short-lived (900s default), signed HS256 JWT.
+
+**Request:**
+```json
+{ "username": "demo-customer", "password": "demo-customer-password" }
+```
+
+**Response `200`:**
+```json
+{ "accessToken": "<JWT>", "tokenType": "Bearer", "expiresInSeconds": 900 }
+```
+
+**Response `401`:** unknown username or wrong password — identical status
+and message (`"Invalid username or password."`) either way, so a client
+can never distinguish which one occurred.
+
+The token's `roles` claim carries exactly one server-configured role
+(`CUSTOMER` or `OPERATIONS`) — there is no request field to choose or
+override it. Every endpoint below except this one requires
+`Authorization: Bearer <token>`; missing/malformed/invalid/expired →
+`401`; a validly authenticated role lacking the required capability →
+`403`; a CUSTOMER accessing/mutating an account they do not own → `404`
+(identical to a nonexistent id, consistent with the existing
+SYSTEM-account precedent below). See `docs/ARCHITECTURE.md`'s
+"Authentication and Authorization" section for the full design.
+
+**Access matrix:**
+
+| Endpoint | CUSTOMER | OPERATIONS |
+|---|---|---|
+| `POST /api/v1/auth/token` | Yes | Yes |
+| `POST /api/v1/accounts` | Yes (owner = self) | No |
+| `POST /api/v1/accounts/{id}/deposits` | Own account only | No |
+| `POST /api/v1/transfers` | From own account only; any valid destination | No |
+| `GET /api/v1/accounts/{id}/balance`, `/transactions` | Own accounts only | Any account |
+| `POST /api/v1/settlement-imports` | No | Yes |
+| `POST`/`GET /api/v1/settlement-imports/{importId}/reconciliation`, `/results` | No | Yes |
+| Static UI, `/actuator/health`, Swagger/OpenAPI | Yes | Yes |
+
 ## Currently Available Endpoints
 
-- `POST /api/v1/accounts` (Task 3) — see above.
-- `POST /api/v1/accounts/{id}/deposits` (Task 4) — see above.
-- `POST /api/v1/transfers` (Task 5) — see above.
-- `GET /api/v1/accounts/{id}/balance` (Task 6) — see above.
-- `GET /api/v1/accounts/{id}/transactions` (Task 6) — see above.
-- `POST /api/v1/settlement-imports` (Task 14) — see above.
-- `POST /api/v1/settlement-imports/{importId}/reconciliation` (Task 15) — see above.
-- `GET /api/v1/settlement-imports/{importId}/reconciliation` (Task 15) — see above.
-- `GET /api/v1/settlement-imports/{importId}/reconciliation/results` (Task 15) — see above.
+- `POST /api/v1/auth/token` (Task 17) — see above. Public.
+- `POST /api/v1/accounts` (Task 3; authenticated, Task 17) — see above.
+- `POST /api/v1/accounts/{id}/deposits` (Task 4; authenticated, Task 17) — see above.
+- `POST /api/v1/transfers` (Task 5; authenticated, Task 17) — see above.
+- `GET /api/v1/accounts/{id}/balance` (Task 6; authenticated, Task 17) — see above.
+- `GET /api/v1/accounts/{id}/transactions` (Task 6; authenticated, Task 17) — see above.
+- `POST /api/v1/settlement-imports` (Task 14; OPERATIONS only, Task 17) — see above.
+- `POST /api/v1/settlement-imports/{importId}/reconciliation` (Task 15; OPERATIONS only, Task 17) — see above.
+- `GET /api/v1/settlement-imports/{importId}/reconciliation` (Task 15; OPERATIONS only, Task 17) — see above.
+- `GET /api/v1/settlement-imports/{importId}/reconciliation/results` (Task 15; OPERATIONS only, Task 17) — see above.
 - `GET /v3/api-docs` and `GET /swagger-ui/index.html` (Task 8) — see
-  "OpenAPI/Swagger" below.
-- Spring Boot Actuator's built-in health check:
+  "OpenAPI/Swagger" below. Public.
+- Spring Boot Actuator's built-in health check (public):
 
 ```
 GET /actuator/health
@@ -560,12 +612,17 @@ Documents exactly the nine endpoints above — `POST /api/v1/accounts`,
 `POST /api/v1/settlement-imports/{importId}/reconciliation`,
 `GET /api/v1/settlement-imports/{importId}/reconciliation`,
 `GET /api/v1/settlement-imports/{importId}/reconciliation/results`
-— with their exact request/response schemas, documented status codes, and
-the shared `ApiError` envelope reused across every error response. No
-security scheme is declared (Phase 1 has no authentication — declaring one
-would falsely imply these endpoints are protected). No `EXTERNAL_FUNDING`
-or other `SYSTEM` account is exposed as something a client can act on — no
-request field, no path, no example account id.
+plus `POST /api/v1/auth/token` — with their exact request/response
+schemas, documented status codes, and the shared `ApiError` envelope
+reused across every error response. Task 17 declares a `bearerAuth`
+(HTTP bearer, JWT format) security scheme, applied globally except on
+`POST /api/v1/auth/token` itself (which documents an empty per-operation
+`security: []`, overriding the global requirement — it is the one
+endpoint that must not require a token). No `EXTERNAL_FUNDING` or other
+`SYSTEM` account is exposed as something a client can act on — no
+request field, no path, no example account id. No password hash, signing
+key, or other credential material is ever present in the generated
+document.
 
 **API metadata:**
 - Title: `LedgerGuard API`

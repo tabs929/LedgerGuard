@@ -3,6 +3,7 @@ package com.tarun.ledgerguard.account;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tarun.ledgerguard.account.dto.AccountResponse;
 import com.tarun.ledgerguard.account.dto.DepositResponse;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -308,11 +309,23 @@ class DepositIntegrationTest {
 		int concurrentDeposits = 20;
 		BigDecimal amountEach = new BigDecimal("5.00");
 		List<UUID> transactionIds = new ArrayList<>();
+		// Obtained once up front and reused by every concurrent task -- the
+		// token itself carries no per-request state, and fetching it once
+		// avoids 20 redundant round trips to /api/v1/auth/token racing each
+		// other during the timed section below.
+		String token = TestAuthSupport.customerAToken(restTemplate);
 		ExecutorService executor = Executors.newFixedThreadPool(concurrentDeposits);
 		try {
 			List<Callable<ResponseEntity<DepositResponse>>> tasks = new ArrayList<>();
 			for (int i = 0; i < concurrentDeposits; i++) {
-				tasks.add(() -> postDeposit(accountId, Map.of("amount", "5.00", "currency", "USD")));
+				tasks.add(() -> {
+					HttpHeaders headers = new HttpHeaders();
+					headers.setContentType(MediaType.APPLICATION_JSON);
+					headers.setBearerAuth(token);
+					headers.set("Idempotency-Key", UUID.randomUUID().toString());
+					return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
+							new HttpEntity<>(Map.of("amount", "5.00", "currency", "USD"), headers), DepositResponse.class);
+				});
 			}
 			List<Future<ResponseEntity<DepositResponse>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
 
@@ -353,27 +366,30 @@ class DepositIntegrationTest {
 	// helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	private HttpHeaders authHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<AccountResponse> response = restTemplate.postForEntity(
-				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
+				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), authHeaders()),
 				AccountResponse.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return response.getBody().id();
 	}
 
 	private ResponseEntity<DepositResponse> postDeposit(UUID accountId, Map<String, Object> body) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(body, headers), DepositResponse.class);
 	}
 
 	private ResponseEntity<String> postDepositRaw(UUID accountId, Map<String, Object> body) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		try {
 			String json = JSON.writeValueAsString(body);
@@ -418,12 +434,19 @@ class DepositIntegrationTest {
 	}
 
 	private UUID insertCustomerWalletDirectly(String ownerName, String currency) throws SQLException {
+		// customer_subject must match test-customer-a (the principal every
+		// helper in this class authenticates as) so the deposit call that
+		// follows still passes the Task 17 ownership check and reaches the
+		// currency-mismatch logic under test, rather than failing earlier
+		// with a 404 for an unowned account.
 		try (Connection connection = dataSource.getConnection();
 				PreparedStatement statement = connection.prepareStatement(
-						"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency) "
-								+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', ?, ?) RETURNING id")) {
+						"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, "
+								+ "customer_subject) "
+								+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', ?, ?, ?) RETURNING id")) {
 			statement.setString(1, ownerName);
 			statement.setString(2, currency);
+			statement.setString(3, TestAuthSupport.CUSTOMER_A_USERNAME);
 			try (ResultSet resultSet = statement.executeQuery()) {
 				resultSet.next();
 				return (UUID) resultSet.getObject("id");

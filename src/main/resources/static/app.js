@@ -25,6 +25,16 @@
 	};
 
 	// ------------------------------------------------------------------
+	// Task 17: authentication state. The access token lives ONLY in this
+	// module-level variable -- never localStorage, sessionStorage, a URL,
+	// a log line, or the "developer details" panel's raw request headers.
+	// Reloading the page always signs the user out, by design.
+	// ------------------------------------------------------------------
+
+	let currentToken = null;
+	let currentIdentity = null; // { username, role } decoded for display only
+
+	// ------------------------------------------------------------------
 	// centralized fetch + response handling
 	// ------------------------------------------------------------------
 
@@ -32,7 +42,8 @@
 	 * Issues one request and normalizes the outcome, regardless of
 	 * whether it succeeded, returned a non-JSON body, or never reached
 	 * the network at all. Never throws — every caller gets back a plain
-	 * result object it can render directly.
+	 * result object it can render directly. Automatically attaches the
+	 * in-memory bearer token, if one is held, to every request.
 	 */
 	async function apiRequest(method, path, { headers, body, isFormData } = {}) {
 		const controller = new AbortController();
@@ -43,6 +54,9 @@
 			headers: Object.assign({}, headers),
 			signal: controller.signal
 		};
+		if (currentToken) {
+			init.headers["Authorization"] = `Bearer ${currentToken}`;
+		}
 		if (body !== undefined) {
 			if (isFormData) {
 				init.body = body;
@@ -260,6 +274,90 @@
 		populateDatalist("recent-import-ids", importIds);
 		populateRecentList("recent-accounts-list", accountIds);
 		populateRecentList("recent-imports-list", importIds);
+	}
+
+	// ------------------------------------------------------------------
+	// 0. sign in / sign out
+	// ------------------------------------------------------------------
+
+	/**
+	 * Decodes a JWT's payload claims for DISPLAY ONLY -- no signature
+	 * verification is performed or implied client-side; the server always
+	 * re-validates the token on every request. Never throws; returns null
+	 * on any malformed input.
+	 */
+	function decodeJwtPayloadForDisplay(token) {
+		try {
+			const parts = token.split(".");
+			if (parts.length !== 3) {
+				return null;
+			}
+			const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+			const padded = base64 + "===".slice((base64.length + 3) % 4);
+			return JSON.parse(window.atob(padded));
+		} catch (err) {
+			return null;
+		}
+	}
+
+	function renderIdentity() {
+		const banner = byId("auth-identity");
+		const signInForm = byId("sign-in-form");
+		const signOutButton = byId("sign-out-button");
+		if (currentIdentity) {
+			banner.textContent = `Signed in as ${currentIdentity.username} (${currentIdentity.role})`;
+			banner.hidden = false;
+			signInForm.hidden = true;
+			signOutButton.hidden = false;
+		} else {
+			banner.textContent = "";
+			banner.hidden = true;
+			signInForm.hidden = false;
+			signOutButton.hidden = true;
+		}
+	}
+
+	function signOut() {
+		currentToken = null;
+		currentIdentity = null;
+		renderIdentity();
+		byId("sign-in-status").textContent = "Signed out.";
+	}
+
+	function initAuth() {
+		const form = byId("sign-in-form");
+		const submitButton = form.querySelector("button[type=submit]");
+		const status = byId("sign-in-status");
+
+		form.addEventListener("submit", async (event) => {
+			event.preventDefault();
+			setButtonBusy(submitButton, true, "Signing in…", "Sign in");
+			status.textContent = "";
+
+			const username = byId("sign-in-username").value.trim();
+			const password = byId("sign-in-password").value;
+
+			const result = await apiPostJson("/api/v1/auth/token", { username, password });
+			renderDevDetails(byId("sign-in-dev-details"), result);
+
+			if (result.ok && result.body && result.body.accessToken) {
+				currentToken = result.body.accessToken;
+				const claims = decodeJwtPayloadForDisplay(currentToken);
+				const role = claims && Array.isArray(claims.roles) ? claims.roles[0] : "unknown role";
+				currentIdentity = { username: (claims && claims.sub) || username, role };
+				byId("sign-in-password").value = "";
+				renderIdentity();
+			} else {
+				currentToken = null;
+				currentIdentity = null;
+				status.textContent = describeApiError(result);
+				renderIdentity();
+			}
+			setButtonBusy(submitButton, false, "Signing in…", "Sign in");
+		});
+
+		byId("sign-out-button").addEventListener("click", signOut);
+		renderIdentity();
 	}
 
 	// ------------------------------------------------------------------
@@ -840,6 +938,8 @@
 	// ------------------------------------------------------------------
 
 	document.addEventListener("DOMContentLoaded", () => {
+		initAuth();
+
 		byId("status-refresh").addEventListener("click", refreshStatus);
 		refreshStatus();
 

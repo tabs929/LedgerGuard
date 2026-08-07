@@ -2,6 +2,7 @@ package com.tarun.ledgerguard.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -57,10 +58,15 @@ class OpenApiDocumentationIntegrationTest {
 
 	private static final ObjectMapper JSON = new ObjectMapper();
 
+	// Task 17: "password" is now a legitimate field NAME in TokenRequest's
+	// generated schema (never a value) -- documenting that the endpoint
+	// accepts a password field is required, accurate API documentation,
+	// not a leak. What must never appear is an actual secret value, so
+	// this checks for that instead of banning the word "password" outright.
 	private static final List<String> FORBIDDEN_SNIPPETS = List.of(
 			"Exception", "java.lang", "java.sql", "org.springframework", "org.hibernate",
 			"org.postgresql", "com.zaxxer", "SQLState", "Caused by", "chk_", "idx_",
-			"ledger_entry", "ledger_transaction", "password", "credential", "localhost:5432");
+			"ledger_entry", "ledger_transaction", "credential", "localhost:5432");
 
 	// ------------------------------------------------------------------
 	// OpenAPI document availability
@@ -152,7 +158,9 @@ class OpenApiDocumentationIntegrationTest {
 				// update, delete, retry, correction, export,
 				// administration, or reconciliation-by-source endpoint.
 				"/api/v1/settlement-imports/{importId}/reconciliation",
-				"/api/v1/settlement-imports/{importId}/reconciliation/results");
+				"/api/v1/settlement-imports/{importId}/reconciliation/results",
+				// Task 17: the only authentication endpoint.
+				"/api/v1/auth/token");
 		while (pathNames.hasNext()) {
 			String path = pathNames.next();
 			if (path.startsWith("/api/v1/")) {
@@ -423,13 +431,42 @@ class OpenApiDocumentationIntegrationTest {
 	}
 
 	@Test
-	void noAuthenticationSchemeIsDeclared() throws Exception {
+	void noActualSecretValueAppearsInTheOpenApiDocument() throws Exception {
+		String raw = restTemplate.getForEntity("/v3/api-docs", String.class).getBody();
+		assertThat(raw).isNotNull();
+		// No BCrypt hash prefix, no signing-key material -- "password" as a
+		// bare field NAME is expected (see FORBIDDEN_SNIPPETS above); an
+		// actual credential value is not.
+		assertThat(raw).doesNotContain("$2a$").doesNotContain("$2b$").doesNotContain("JWT_SIGNING_KEY");
+	}
+
+	@Test
+	void bearerAuthenticationSchemeIsDeclaredAndAppliedGlobally() throws Exception {
+		// Task 17: every endpoint except POST /api/v1/auth/token requires a
+		// bearer JWT -- the OpenAPI document must say so accurately.
 		JsonNode root = fetchDocument();
-		JsonNode components = root.get("components");
-		boolean hasSecuritySchemes = components != null && components.has("securitySchemes")
-				&& components.get("securitySchemes").size() > 0;
-		assertThat(hasSecuritySchemes).isFalse();
-		assertThat(root.has("security")).isFalse();
+		JsonNode securitySchemes = root.get("components").get("securitySchemes");
+		assertThat(securitySchemes.has("bearerAuth")).isTrue();
+		assertThat(securitySchemes.get("bearerAuth").get("type").asText()).isEqualTo("http");
+		assertThat(securitySchemes.get("bearerAuth").get("scheme").asText()).isEqualTo("bearer");
+		assertThat(securitySchemes.get("bearerAuth").get("bearerFormat").asText()).isEqualTo("JWT");
+
+		JsonNode globalSecurity = root.get("security");
+		assertThat(globalSecurity).isNotNull();
+		boolean requiresBearerAuth = java.util.stream.StreamSupport.stream(globalSecurity.spliterator(), false)
+				.anyMatch(requirement -> requirement.has("bearerAuth"));
+		assertThat(requiresBearerAuth).isTrue();
+	}
+
+	@Test
+	void authTokenEndpointOverridesTheGlobalSecurityRequirement() throws Exception {
+		// The one endpoint that must NOT require a token is the one that
+		// issues one -- springdoc documents this via an empty per-operation
+		// security array overriding the document-level requirement.
+		JsonNode operation = fetchDocument().get("paths").get("/api/v1/auth/token").get("post");
+		JsonNode security = operation.get("security");
+		assertThat(security).isNotNull();
+		assertThat(security.isEmpty()).isTrue();
 	}
 
 	@Test
@@ -475,19 +512,19 @@ class OpenApiDocumentationIntegrationTest {
 				"/api/v1/accounts/" + accountId + "/deposits", jsonEntity(depositBody), Map.class);
 		assertThat(depositResponse.getStatusCode().value()).isEqualTo(201);
 
-		ResponseEntity<Map> balanceResponse = restTemplate.getForEntity(
+		ResponseEntity<Map> balanceResponse = getWithAuth(
 				"/api/v1/accounts/" + accountId + "/balance", Map.class);
 		assertThat(balanceResponse.getStatusCode().value()).isEqualTo(200);
 		assertThat(new BigDecimal(String.valueOf(balanceResponse.getBody().get("balance"))))
 				.isEqualByComparingTo("40.00");
 
-		ResponseEntity<Map> historyResponse = restTemplate.getForEntity(
+		ResponseEntity<Map> historyResponse = getWithAuth(
 				"/api/v1/accounts/" + accountId + "/transactions", Map.class);
 		assertThat(historyResponse.getStatusCode().value()).isEqualTo(200);
 		assertThat((List<?>) historyResponse.getBody().get("content")).hasSize(1);
 
 		// Global error handling still returns the shared envelope, unchanged.
-		ResponseEntity<Map> notFound = restTemplate.getForEntity(
+		ResponseEntity<Map> notFound = getWithAuth(
 				"/api/v1/accounts/" + UUID.randomUUID() + "/balance", Map.class);
 		assertThat(notFound.getStatusCode().value()).isEqualTo(404);
 		assertThat(notFound.getBody().keySet()).containsExactlyInAnyOrder("timestamp", "status", "error", "message", "path");
@@ -545,10 +582,24 @@ class OpenApiDocumentationIntegrationTest {
 	}
 
 	private org.springframework.http.HttpEntity<Map<String, Object>> jsonEntity(Map<String, Object> body) {
-		org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		org.springframework.http.HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return new org.springframework.http.HttpEntity<>(body, headers);
+	}
+
+	// Every account in this class belongs to the same test-customer-a
+	// principal -- Task 17 cross-principal ownership/authorization is
+	// covered separately in OwnershipAuthorizationIntegrationTest.
+	private org.springframework.http.HttpHeaders authHeaders() {
+		org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private <T> ResponseEntity<T> getWithAuth(String url, Class<T> responseType) {
+		return restTemplate.exchange(url, org.springframework.http.HttpMethod.GET,
+				new org.springframework.http.HttpEntity<>(authHeaders()), responseType);
 	}
 
 	private void assertThatRejected(PreparedStatement statement) throws SQLException {

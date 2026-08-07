@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.reconciliation;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -76,19 +77,35 @@ class ReconciliationIntegrationTest {
 	// HTTP helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String owner) {
-		Map<String, Object> body = Map.of("ownerName", owner, "currency", "USD");
+	// Every customer account/deposit/transfer in this class belongs to the
+	// same test-customer-a principal; every settlement-import/reconciliation
+	// call authenticates as test-operations. Task 17 cross-principal
+	// ownership isolation is covered separately in
+	// OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders customerHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
-		ResponseEntity<Map> response = restTemplate.postForEntity("/api/v1/accounts", new HttpEntity<>(body, headers), Map.class);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private HttpHeaders operationsHeaders() {
+		HttpHeaders headers = new HttpHeaders();
+		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.operationsToken(restTemplate));
+		return headers;
+	}
+
+	private UUID createUsdCustomerAccount(String owner) {
+		Map<String, Object> body = Map.of("ownerName", owner, "currency", "USD");
+		ResponseEntity<Map> response = restTemplate.postForEntity("/api/v1/accounts", new HttpEntity<>(body, customerHeaders()), Map.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return UUID.fromString((String) response.getBody().get("id"));
 	}
 
 	private UUID depositAndGetTransactionId(UUID accountId, String amount) {
 		Map<String, Object> body = Map.of("amount", amount, "currency", "USD");
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = customerHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<Map> response = restTemplate.postForEntity(
 				"/api/v1/accounts/" + accountId + "/deposits", new HttpEntity<>(body, headers), Map.class);
@@ -117,7 +134,7 @@ class ReconciliationIntegrationTest {
 				return "settlement.csv";
 			}
 		});
-		HttpHeaders headers = new HttpHeaders();
+		HttpHeaders headers = operationsHeaders();
 		headers.setContentType(MediaType.MULTIPART_FORM_DATA);
 		return restTemplate.postForEntity("/api/v1/settlement-imports", new HttpEntity<>(body, headers), Map.class);
 	}
@@ -129,17 +146,19 @@ class ReconciliationIntegrationTest {
 	}
 
 	private ResponseEntity<Map> postReconcile(UUID importId) {
-		return restTemplate.postForEntity("/api/v1/settlement-imports/" + importId + "/reconciliation", null, Map.class);
+		return restTemplate.postForEntity("/api/v1/settlement-imports/" + importId + "/reconciliation",
+				new HttpEntity<>(operationsHeaders()), Map.class);
 	}
 
 	private ResponseEntity<Map> getRun(UUID importId) {
-		return restTemplate.getForEntity("/api/v1/settlement-imports/" + importId + "/reconciliation", Map.class);
+		return restTemplate.exchange("/api/v1/settlement-imports/" + importId + "/reconciliation", HttpMethod.GET,
+				new HttpEntity<>(operationsHeaders()), Map.class);
 	}
 
 	private ResponseEntity<Map> getResults(UUID importId, int page, int size) {
-		return restTemplate.getForEntity(
+		return restTemplate.exchange(
 				"/api/v1/settlement-imports/" + importId + "/reconciliation/results?page=" + page + "&size=" + size,
-				Map.class);
+				HttpMethod.GET, new HttpEntity<>(operationsHeaders()), Map.class);
 	}
 
 	private String uniqueSource() {
@@ -191,8 +210,7 @@ class ReconciliationIntegrationTest {
 				"sourceAccountId", sourceAccount.toString(),
 				"destinationAccountId", destinationAccount.toString(),
 				"amount", "50.00", "currency", "USD");
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = customerHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<Map> transferResponse = restTemplate.postForEntity(
 				"/api/v1/transfers", new HttpEntity<>(transferBody, headers), Map.class);
@@ -604,7 +622,8 @@ class ReconciliationIntegrationTest {
 	@Test
 	void malformedImportIdReturns400() {
 		ResponseEntity<Map> response = restTemplate.exchange(
-				"/api/v1/settlement-imports/not-a-uuid/reconciliation", HttpMethod.POST, null, Map.class);
+				"/api/v1/settlement-imports/not-a-uuid/reconciliation", HttpMethod.POST,
+				new HttpEntity<>(operationsHeaders()), Map.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 

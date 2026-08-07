@@ -2,6 +2,7 @@ package com.tarun.ledgerguard.outbox;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -599,18 +600,29 @@ class OutboxIntegrationTest {
 	@Test
 	void v1AndV2TablesAndConstraintsStillExistUnchanged() throws SQLException {
 		assertThat(constraintNames("account")).contains("chk_account_taxonomy_combination");
-		assertThat(constraintNames("idempotency_key")).contains("uq_idempotency_key");
+		// Task 17's V7 replaces uq_idempotency_key with a composite
+		// (principal_subject, idempotency_key) uniqueness constraint --
+		// V1-V6 themselves remain byte-for-byte unchanged.
+		assertThat(constraintNames("idempotency_key")).contains("uq_idempotency_key_principal");
 	}
 
 	// ------------------------------------------------------------------
 	// helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	// Every account/deposit/transfer in this class belongs to the same
+	// test-customer-a principal -- Task 17 cross-principal ownership is
+	// covered separately in OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders authHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<Map> response = restTemplate.postForEntity(
-				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
+				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), authHeaders()),
 				Map.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return UUID.fromString((String) response.getBody().get("id"));
@@ -624,24 +636,21 @@ class OutboxIntegrationTest {
 	}
 
 	private ResponseEntity<Map> postDeposit(UUID accountId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", amount, "currency", "USD"), headers), Map.class);
 	}
 
 	private ResponseEntity<String> postDepositRaw(UUID accountId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", amount, "currency", "USD"), headers), String.class);
 	}
 
 	private ResponseEntity<Map> postTransfer(UUID sourceId, UUID destinationId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		Map<String, Object> body = Map.of("sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(), "amount", amount, "currency", "USD");
@@ -649,8 +658,7 @@ class OutboxIntegrationTest {
 	}
 
 	private ResponseEntity<String> postTransferRaw(UUID sourceId, UUID destinationId, String amount, String idempotencyKey) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", idempotencyKey);
 		Map<String, Object> body = Map.of("sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(), "amount", amount, "currency", "USD");

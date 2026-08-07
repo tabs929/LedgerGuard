@@ -5,6 +5,8 @@ import com.tarun.ledgerguard.account.dto.TransactionHistoryItem;
 import com.tarun.ledgerguard.common.PagedResponse;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.Role;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -36,16 +38,17 @@ public class AccountQueryService {
 	}
 
 	@Transactional(readOnly = true)
-	public AccountBalanceResponse getBalance(UUID accountId) {
-		Account account = resolveCustomerWallet(accountId);
+	public AccountBalanceResponse getBalance(UUID accountId, AuthenticatedPrincipal principal) {
+		Account account = resolveCustomerWallet(accountId, principal);
 		return new AccountBalanceResponse(account.getId(), account.getBalance(), account.getCurrency());
 	}
 
 	@Transactional(readOnly = true)
-	public PagedResponse<TransactionHistoryItem> getTransactionHistory(UUID accountId, int page, int size) {
-		// Existence/taxonomy check only -- the account itself carries no
-		// history data; entries are fetched separately below.
-		resolveCustomerWallet(accountId);
+	public PagedResponse<TransactionHistoryItem> getTransactionHistory(UUID accountId, AuthenticatedPrincipal principal,
+			int page, int size) {
+		// Existence/taxonomy/ownership check only -- the account itself
+		// carries no history data; entries are fetched separately below.
+		resolveCustomerWallet(accountId, principal);
 
 		Page<LedgerEntry> entries = ledgerEntryRepository.findByAccountIdOrderByCreatedAtDescIdDesc(
 				accountId, PageRequest.of(page, size));
@@ -65,12 +68,20 @@ public class AccountQueryService {
 	// A SYSTEM account id (or any non-customer-wallet row) is treated
 	// identically to a nonexistent id, per docs/API_SPEC.md -- same rule
 	// deposits and transfers already apply to their own account inputs.
-	private Account resolveCustomerWallet(UUID accountId) {
+	// Task 17: a CUSTOMER principal reading an account they do not own is
+	// treated identically as well (404, not 403) -- this account-specific
+	// ownership violation follows the project's existing SYSTEM-account
+	// precedent of never disclosing that a restricted id is valid.
+	// OPERATIONS may read any customer wallet.
+	private Account resolveCustomerWallet(UUID accountId, AuthenticatedPrincipal principal) {
 		Account account = accountRepository.findById(accountId)
 				.orElseThrow(() -> new AccountNotFoundException(accountId));
 		if (account.getAccountCategory() != AccountCategory.CUSTOMER
 				|| account.getAccountClass() != AccountClass.LIABILITY
 				|| account.getAccountPurpose() != AccountPurpose.CUSTOMER_WALLET) {
+			throw new AccountNotFoundException(accountId);
+		}
+		if (principal.role() == Role.CUSTOMER && !account.getCustomerSubject().equals(principal.subject())) {
 			throw new AccountNotFoundException(accountId);
 		}
 		return account;

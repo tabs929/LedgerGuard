@@ -22,6 +22,7 @@
 </header>
 
 <nav class="section-nav" aria-label="Page sections">
+	<a href="#sign-in">Sign in</a>
 	<a href="#status">Status</a>
 	<a href="#create-account">Create account</a>
 	<a href="#account-lookup">Account lookup</a>
@@ -32,6 +33,31 @@
 </nav>
 
 <main>
+
+	<section id="sign-in" class="card" aria-labelledby="sign-in-heading">
+		<h2 id="sign-in-heading">Sign in</h2>
+		<p class="card-description">Calls <code>POST /api/v1/auth/token</code>. The access token is held only in
+			this page's memory for the current session — never in localStorage, sessionStorage, a URL, or a log.
+			Reloading the page signs you out.</p>
+		<p id="auth-identity" class="muted" role="status" aria-live="polite" hidden></p>
+		<form id="sign-in-form" novalidate>
+			<div class="form-row">
+				<label for="sign-in-username">Username</label>
+				<input type="text" id="sign-in-username" name="username" autocomplete="username" required>
+			</div>
+			<div class="form-row">
+				<label for="sign-in-password">Password</label>
+				<input type="password" id="sign-in-password" name="password" autocomplete="current-password" required>
+			</div>
+			<button type="submit">Sign in</button>
+		</form>
+		<button type="button" id="sign-out-button" hidden>Sign out</button>
+		<p id="sign-in-status" class="muted" role="status" aria-live="polite"></p>
+		<details class="dev-details">
+			<summary>Developer details</summary>
+			<div id="sign-in-dev-details" class="dev-details-body"></div>
+		</details>
+	</section>
 
 	<section id="status" class="card" aria-labelledby="status-heading">
 		<h2 id="status-heading">Backend status</h2>

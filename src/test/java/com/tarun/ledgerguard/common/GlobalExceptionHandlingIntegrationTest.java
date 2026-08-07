@@ -2,6 +2,7 @@ package com.tarun.ledgerguard.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tarun.ledgerguard.account.dto.AccountResponse;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -10,6 +11,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -148,8 +150,7 @@ class GlobalExceptionHandlingIntegrationTest {
 
 	@Test
 	void malformedAccountCreationJsonReturns400() {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		ResponseEntity<String> response = restTemplate.postForEntity(
 				"/api/v1/accounts", new HttpEntity<>("{\"ownerName\": \"Broken", headers), String.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
@@ -253,41 +254,37 @@ class GlobalExceptionHandlingIntegrationTest {
 
 	@Test
 	void malformedPathUuidReturns400ForBalanceAndHistory() {
-		assertThat(restTemplate.getForEntity("/api/v1/accounts/not-a-uuid/balance", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/not-a-uuid/balance").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
-		assertThat(restTemplate.getForEntity("/api/v1/accounts/not-a-uuid/transactions", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/not-a-uuid/transactions").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
 	@Test
 	void malformedPaginationParametersReturn400() {
 		UUID accountId = createUsdCustomerAccount("Malformed Pagination Owner");
-		assertThat(restTemplate.getForEntity(
-				"/api/v1/accounts/" + accountId + "/transactions?page=abc&size=xyz", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/" + accountId + "/transactions?page=abc&size=xyz").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
 	@Test
 	void pageBelowMinimumReturns400() {
 		UUID accountId = createUsdCustomerAccount("Page Below Minimum Owner");
-		assertThat(restTemplate.getForEntity(
-				"/api/v1/accounts/" + accountId + "/transactions?page=-1", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/" + accountId + "/transactions?page=-1").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
 	@Test
 	void sizeBelowMinimumReturns400() {
 		UUID accountId = createUsdCustomerAccount("Size Below Minimum Owner");
-		assertThat(restTemplate.getForEntity(
-				"/api/v1/accounts/" + accountId + "/transactions?size=0", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/" + accountId + "/transactions?size=0").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
 	@Test
 	void sizeAboveMaximumReturns400() {
 		UUID accountId = createUsdCustomerAccount("Size Above Maximum Owner");
-		assertThat(restTemplate.getForEntity(
-				"/api/v1/accounts/" + accountId + "/transactions?size=101", String.class).getStatusCode())
+		assertThat(getRaw("/api/v1/accounts/" + accountId + "/transactions?size=101").getStatusCode())
 				.isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -487,6 +484,20 @@ class GlobalExceptionHandlingIntegrationTest {
 	// helpers
 	// ------------------------------------------------------------------
 
+	// Every account in this class belongs to the same test-customer-a
+	// principal -- Task 17 cross-principal ownership/authorization is
+	// covered separately in OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders authHeaders() {
+		HttpHeaders headers = new HttpHeaders();
+		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private ResponseEntity<String> getRaw(String url) {
+		return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(authHeaders()), String.class);
+	}
+
 	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<AccountResponse> response = restTemplate.postForEntity(
 				"/api/v1/accounts", entity(Map.of("ownerName", ownerName, "currency", "USD")), AccountResponse.class);
@@ -530,8 +541,7 @@ class GlobalExceptionHandlingIntegrationTest {
 
 	private ResponseEntity<String> postRaw(String path, Map<String, Object> body) {
 		try {
-			HttpHeaders headers = new HttpHeaders();
-			headers.setContentType(MediaType.APPLICATION_JSON);
+			HttpHeaders headers = authHeaders();
 			headers.set("Idempotency-Key", UUID.randomUUID().toString());
 			String json = JSON.writeValueAsString(body);
 			return restTemplate.postForEntity(path, new HttpEntity<>(json, headers), String.class);
@@ -542,28 +552,27 @@ class GlobalExceptionHandlingIntegrationTest {
 	}
 
 	private HttpEntity<Map<String, Object>> entity(Map<String, Object> body) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return new HttpEntity<>(body, headers);
 	}
 
 	private ResponseEntity<String> getBalanceRaw(UUID accountId) {
-		return restTemplate.getForEntity("/api/v1/accounts/" + accountId + "/balance", String.class);
+		return getRaw("/api/v1/accounts/" + accountId + "/balance");
 	}
 
 	private ResponseEntity<String> getHistoryRaw(UUID accountId) {
-		return restTemplate.getForEntity("/api/v1/accounts/" + accountId + "/transactions", String.class);
+		return getRaw("/api/v1/accounts/" + accountId + "/transactions");
 	}
 
 	private HttpStatus getHistoryStatus(UUID accountId, Integer page, Integer size) {
 		StringBuilder url = new StringBuilder("/api/v1/accounts/" + accountId + "/transactions?page=" + page + "&size=" + size);
-		return (HttpStatus) restTemplate.getForEntity(url.toString(), String.class).getStatusCode();
+		return (HttpStatus) getRaw(url.toString()).getStatusCode();
 	}
 
 	private Map<String, Object> getHistory(UUID accountId, Integer page, Integer size) {
 		String url = "/api/v1/accounts/" + accountId + "/transactions";
-		ResponseEntity<String> response = restTemplate.getForEntity(url, String.class);
+		ResponseEntity<String> response = getRaw(url);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
 		try {
 			return readJsonObject(response.getBody());

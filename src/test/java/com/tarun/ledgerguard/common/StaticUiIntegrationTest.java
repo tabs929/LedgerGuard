@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.common;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -123,10 +124,11 @@ class StaticUiIntegrationTest {
 	}
 
 	@Test
-	void accountCreationEndpointStillWorksExactlyAsBefore() {
+	void accountCreationEndpointStillWorksExactlyAsBeforeWhenAuthenticated() {
 		Map<String, Object> body = Map.of("ownerName", "Static UI Regression Owner", "currency", "USD");
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
 		ResponseEntity<Map> response = restTemplate.postForEntity(
 				"/api/v1/accounts", new HttpEntity<>(body, headers), Map.class);
 
@@ -137,9 +139,12 @@ class StaticUiIntegrationTest {
 	}
 
 	@Test
-	void unknownApiPathStillReturns404NotTheUiFallback() {
+	void unknownTopLevelPathStillReturns404NotTheUiFallback() {
+		// A path OUTSIDE /api/v1/** falls through Spring Security's
+		// permitAll() catch-all unauthenticated and reaches Spring MVC's
+		// own NoResourceFoundException handling -- true 404, not the UI.
 		ResponseEntity<String> response = restTemplate.getForEntity(
-				"/api/v1/definitely-not-a-real-endpoint-" + UUID.randomUUID(), String.class);
+				"/definitely-not-a-real-path-" + UUID.randomUUID(), String.class);
 
 		assertThat(response.getStatusCode().value()).isEqualTo(404);
 		String responseBody = response.getBody() == null ? "" : response.getBody();
@@ -147,9 +152,25 @@ class StaticUiIntegrationTest {
 	}
 
 	@Test
-	void existingErrorEnvelopeIsUnchanged() {
-		ResponseEntity<Map> response = restTemplate.getForEntity(
-				"/api/v1/accounts/" + UUID.randomUUID() + "/balance", Map.class);
+	void unknownPathUnderApiV1RequiresAuthenticationBeforeRouteExistenceIsEverConsidered() {
+		// Task 17: SecurityConfig protects the whole /api/v1/** namespace,
+		// so an unauthenticated request never reaches Spring MVC's routing
+		// at all -- it is rejected as 401 before route (non-)existence can
+		// be determined, which is also why this can never leak whether a
+		// given /api/v1/... path is implemented.
+		ResponseEntity<String> response = restTemplate.getForEntity(
+				"/api/v1/definitely-not-a-real-endpoint-" + UUID.randomUUID(), String.class);
+
+		assertThat(response.getStatusCode().value()).isEqualTo(401);
+	}
+
+	@Test
+	void existingErrorEnvelopeIsUnchangedForAnAuthenticatedRequest() {
+		HttpHeaders headers = new HttpHeaders();
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		ResponseEntity<Map> response = restTemplate.exchange(
+				"/api/v1/accounts/" + UUID.randomUUID() + "/balance", org.springframework.http.HttpMethod.GET,
+				new HttpEntity<>(headers), Map.class);
 
 		assertThat(response.getStatusCode().value()).isEqualTo(404);
 		assertThat(response.getBody().keySet()).containsExactlyInAnyOrder(

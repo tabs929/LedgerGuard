@@ -21,9 +21,12 @@ import java.util.function.Supplier;
  *
  * <p><b>Concurrency:</b> before touching {@code idempotency_key} or any
  * account row, this acquires a PostgreSQL transaction-scoped advisory lock
- * ({@code pg_advisory_xact_lock}) keyed on a hash of the raw
- * Idempotency-Key string (see {@link IdempotencyCommand#advisoryLockId}).
- * A concurrent request bearing the *same* key blocks inside that call
+ * ({@code pg_advisory_xact_lock}) keyed on a hash of the authenticated
+ * principal's subject together with the raw Idempotency-Key string (see
+ * {@link IdempotencyCommand#advisoryLockId}) -- Task 17 scopes this per
+ * principal so two different customers never serialize against each other
+ * merely for choosing the same literal key string.
+ * A concurrent request bearing the *same* (principal, key) pair blocks inside that call
  * until the first transaction ends — commit or rollback, either way the
  * lock releases automatically since it is transaction-scoped. This is a
  * database-level lock, not an in-memory one, so it is correct across
@@ -62,13 +65,14 @@ public class IdempotencyService {
 		this.objectMapper = objectMapper;
 	}
 
-	public <T> T execute(String idempotencyKey, IdempotencyCommand command, Class<T> responseType,
-			Function<T, UUID> transactionIdExtractor, Supplier<T> operation) {
+	public <T> T execute(String idempotencyKey, String principalSubject, IdempotencyCommand command,
+			Class<T> responseType, Function<T, UUID> transactionIdExtractor, Supplier<T> operation) {
 		entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(:lockId)")
-				.setParameter("lockId", IdempotencyCommand.advisoryLockId(idempotencyKey))
+				.setParameter("lockId", IdempotencyCommand.advisoryLockId(principalSubject, idempotencyKey))
 				.getSingleResult();
 
-		Optional<IdempotencyKeyRecord> existing = repository.findByIdempotencyKey(idempotencyKey);
+		Optional<IdempotencyKeyRecord> existing =
+				repository.findByPrincipalSubjectAndIdempotencyKey(principalSubject, idempotencyKey);
 		if (existing.isPresent()) {
 			IdempotencyKeyRecord record = existing.get();
 			if (!record.matches(command)) {
@@ -79,7 +83,7 @@ public class IdempotencyService {
 
 		T response = operation.get();
 
-		IdempotencyKeyRecord record = new IdempotencyKeyRecord(idempotencyKey, command,
+		IdempotencyKeyRecord record = new IdempotencyKeyRecord(idempotencyKey, principalSubject, command,
 				transactionIdExtractor.apply(response), SUCCESS_STATUS, serialize(response, idempotencyKey));
 		repository.save(record);
 		// Flush now so a UNIQUE-constraint violation on idempotency_key (the

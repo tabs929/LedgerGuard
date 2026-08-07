@@ -5,6 +5,9 @@ import com.tarun.ledgerguard.account.dto.DepositResponse;
 import com.tarun.ledgerguard.idempotency.IdempotencyCommand;
 import com.tarun.ledgerguard.idempotency.IdempotencyService;
 import com.tarun.ledgerguard.outbox.OutboxEventFactory;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.AuthorizationSupport;
+import com.tarun.ledgerguard.security.Role;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
@@ -64,7 +67,16 @@ public class DepositService {
 	}
 
 	@Transactional
-	public DepositResponse deposit(UUID destinationAccountId, DepositRequest request, String idempotencyKey) {
+	public DepositResponse deposit(UUID destinationAccountId, DepositRequest request, String idempotencyKey,
+			AuthenticatedPrincipal principal) {
+		// Task 17 ordering requirement: role, then ownership, then the
+		// idempotency claim/replay, then (only for a genuinely new key) the
+		// financial transaction itself -- so an idempotency replay can never
+		// bypass authorization, and a cross-principal request never even
+		// reaches the idempotency table for an account it doesn't own.
+		AuthorizationSupport.requireRole(principal, Role.CUSTOMER);
+		requireOwnedCustomerWallet(destinationAccountId, principal);
+
 		String normalizedCurrency = request.currency().toUpperCase(Locale.ROOT);
 		// @Digits(fraction = 4) on DepositRequest already guarantees no more
 		// than 4 fractional digits, so this only pads scale -- never rounds.
@@ -73,8 +85,33 @@ public class DepositService {
 		BigDecimal amount = request.amount().setScale(4, RoundingMode.UNNECESSARY);
 
 		IdempotencyCommand command = IdempotencyCommand.forDeposit(destinationAccountId, amount, normalizedCurrency);
-		return idempotencyService.execute(idempotencyKey, command, DepositResponse.class, DepositResponse::transactionId,
-				() -> doDeposit(destinationAccountId, normalizedCurrency, amount));
+		return idempotencyService.execute(idempotencyKey, principal.subject(), command, DepositResponse.class,
+				DepositResponse::transactionId, () -> doDeposit(destinationAccountId, normalizedCurrency, amount));
+	}
+
+	// Unlocked existence/taxonomy/ownership check, performed before the
+	// idempotency claim/replay above. The actual mutation path (doDeposit)
+	// re-resolves and locks the row independently -- this method never
+	// substitutes for that locking. Critically, the account loaded here is
+	// detached from the persistence context immediately afterward: leaving
+	// it managed would make doDeposit's later PESSIMISTIC_WRITE query
+	// return this same (by-then-stale) in-memory instance from Hibernate's
+	// first-level cache instead of re-reading the just-locked row's true
+	// balance, silently reintroducing the lost-update race Task 4's
+	// deterministic locking was built to prevent -- confirmed empirically
+	// by a failing concurrent-deposit test before this detach was added.
+	private void requireOwnedCustomerWallet(UUID accountId, AuthenticatedPrincipal principal) {
+		Account account = accountRepository.findById(accountId)
+				.orElseThrow(() -> new AccountNotFoundException(accountId));
+		if (account.getAccountCategory() != AccountCategory.CUSTOMER
+				|| account.getAccountClass() != AccountClass.LIABILITY
+				|| account.getAccountPurpose() != AccountPurpose.CUSTOMER_WALLET) {
+			throw new AccountNotFoundException(accountId);
+		}
+		if (!account.getCustomerSubject().equals(principal.subject())) {
+			throw new AccountNotFoundException(accountId);
+		}
+		entityManager.detach(account);
 	}
 
 	private DepositResponse doDeposit(UUID destinationAccountId, String normalizedCurrency, BigDecimal amount) {

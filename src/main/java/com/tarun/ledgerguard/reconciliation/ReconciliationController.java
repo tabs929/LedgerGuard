@@ -2,6 +2,7 @@ package com.tarun.ledgerguard.reconciliation;
 
 import com.tarun.ledgerguard.common.ApiError;
 import com.tarun.ledgerguard.common.PagedResponse;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -11,6 +12,8 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -56,8 +59,9 @@ public class ReconciliationController {
 					content = @Content(schema = @Schema(implementation = ApiError.class)))
 	})
 	@PostMapping
-	public ResponseEntity<ReconciliationSummaryResponse> reconcile(@PathVariable UUID importId) {
-		ReconciliationSummaryResponse response = service.reconcile(importId);
+	public ResponseEntity<ReconciliationSummaryResponse> reconcile(@PathVariable UUID importId,
+			@AuthenticationPrincipal Jwt jwt) {
+		ReconciliationSummaryResponse response = service.reconcile(importId, AuthenticatedPrincipal.fromJwt(jwt));
 		HttpStatus status = response.replayed() ? HttpStatus.OK : HttpStatus.CREATED;
 		return ResponseEntity.status(status).body(response);
 	}
@@ -75,8 +79,8 @@ public class ReconciliationController {
 					content = @Content(schema = @Schema(implementation = ApiError.class)))
 	})
 	@GetMapping
-	public ReconciliationSummaryResponse getRun(@PathVariable UUID importId) {
-		return service.getRun(importId);
+	public ReconciliationSummaryResponse getRun(@PathVariable UUID importId, @AuthenticationPrincipal Jwt jwt) {
+		return service.getRun(importId, AuthenticatedPrincipal.fromJwt(jwt));
 	}
 
 	@Operation(summary = "Get one reconciliation run's item-level results",
@@ -96,8 +100,9 @@ public class ReconciliationController {
 	public PagedResponse<ReconciliationResultResponse> getResults(
 			@PathVariable UUID importId,
 			@RequestParam(name = "page", defaultValue = "0") @Min(0) int page,
-			@RequestParam(name = "size", defaultValue = "20") @Min(1) @Max(100) int size) {
-		return service.getResults(importId, page, size);
+			@RequestParam(name = "size", defaultValue = "20") @Min(1) @Max(100) int size,
+			@AuthenticationPrincipal Jwt jwt) {
+		return service.getResults(importId, AuthenticatedPrincipal.fromJwt(jwt), page, size);
 	}
 
 }

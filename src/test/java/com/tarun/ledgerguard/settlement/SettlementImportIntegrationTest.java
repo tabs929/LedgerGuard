@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.settlement;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -112,6 +113,7 @@ class SettlementImportIntegrationTest {
 		}
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+		headers.setBearerAuth(TestAuthSupport.operationsToken(restTemplate));
 		return restTemplate.postForEntity("/api/v1/settlement-imports", new HttpEntity<>(body, headers), Map.class);
 	}
 

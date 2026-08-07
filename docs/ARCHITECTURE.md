@@ -1725,3 +1725,161 @@ happens to exist.
 Task 9 changed no application code, no database object, and no test
 assertion — it only adds a workflow file that runs the pre-existing,
 already-passing verification suite automatically.
+
+## Authentication and Authorization (implemented, Task 17)
+
+Stateless JWT authentication and CUSTOMER/OPERATIONS ownership-based
+authorization, added in Phase 3 per `CLAUDE.md`'s explicit "Authentication
+and authorization are introduced only in Phase 3."
+
+**Two layers of defense.** `security.SecurityConfig`'s
+`SecurityFilterChain` is the coarse, first layer: URL/method/role rules
+(`hasAuthority("CUSTOMER")`, `hasAuthority("OPERATIONS")`,
+`hasAnyAuthority(...)`) gate every `/api/v1/**` and `/actuator/**` path
+except the public ones (`POST /api/v1/auth/token`, `/actuator/health/**`,
+the static UI, Swagger/OpenAPI). This alone is insufficient: it cannot
+express *ownership* (which specific account a CUSTOMER may touch), and a
+hypothetical caller invoking a service directly would bypass it entirely.
+The second, mandatory layer is service-layer enforcement:
+`AccountService`, `AccountQueryService`, `DepositService`,
+`TransferService`, `SettlementImportService`, and `ReconciliationService`
+each independently re-verify the role (via the shared
+`security.AuthorizationSupport.requireRole`, which throws a plain Spring
+Security `AccessDeniedException` so it is caught by the same
+`ExceptionTranslationFilter`/`ApiAccessDeniedHandler` pair as a
+filter-chain-level denial) and, for account-scoped operations, ownership
+— so calling a service through any other entry point still cannot bypass
+authorization.
+
+**Authentication flow.** `POST /api/v1/auth/token` authenticates one of
+the fixed, configuration-backed identities
+(`ledgerguard.security.users[]` — username + BCrypt hash + role; never a
+plaintext password, never database-backed) and returns a short-lived
+(900s default) HS256 JWT (`security.JwtIssuer`) with `sub` = username,
+`roles` = the one server-assigned role, `iss`/`aud` fixed to
+`ledgerguard`/`ledgerguard-api`, and `iat`/`exp`. Unknown username and
+wrong password return the identical 401 status and message
+(`InvalidCredentialsException`, "Invalid username or password.") — the
+lookup runs a full `BCryptPasswordEncoder.matches` against a fixed dummy
+hash even for a nonexistent username, so the two cases cost the same and
+never trivially differ in timing. `security.SecurityConfig` also
+publishes the `JwtDecoder` every subsequent request is validated against:
+signature (HS256, the same symmetric key), issuer, audience, and
+expiration (`JwtTimestampValidator`, with a small configurable clock-skew
+allowance). Authorities are read from the token's own `roles` claim via
+an explicitly configured `JwtGrantedAuthoritiesConverter` (claim name
+`roles`, no prefix) — deliberately not Spring's default `scope`/`SCOPE_`
+convention, since these are LedgerGuard's own roles, not OAuth2 scopes.
+
+**Startup validation.** `security.SecurityConfigurationValidator`
+(`@PostConstruct`) fails application startup — not silently, not on
+first request — if `ledgerguard.security` is misconfigured: duplicate or
+blank usernames, a missing/invalid role, a password hash that is not a
+syntactically valid BCrypt hash, a non-positive or excessive JWT
+expiration/clock-skew, or a signing key that is missing, not valid
+Base64, or decodes to fewer than 32 bytes (256 bits).
+
+**Ownership.** `account.customer_subject` (Flyway V7) is the stable
+owner of a `CUSTOMER` wallet, sourced exclusively from
+`AuthenticatedPrincipal.subject()` (itself built from the validated JWT's
+`sub`+`roles` claims) — never from request JSON, which has no field for
+it. A CUSTOMER may read (`GET .../balance`, `.../transactions`),
+deposit into, or transfer *from* only an account whose
+`customer_subject` equals their own subject; OPERATIONS may read any
+account but never deposits or transfers. A transfer's *destination* is
+never ownership-checked — a CUSTOMER may send funds to any valid
+CUSTOMER_WALLET account they do not own, and the response never exposes
+that account's balance (`TransferResponse` simply has no such field).
+Every ownership violation returns 404 — `AccountNotFoundException`,
+reused as-is — deliberately extending this project's own pre-existing
+SYSTEM-account-as-404 precedent (an id that is valid-but-restricted is
+indistinguishable from one that does not exist), rather than introducing
+a new 403-for-ownership policy that would leak the id's existence.
+Blanket, non-resource-specific role denials (e.g. OPERATIONS attempting
+`POST /api/v1/accounts`) return 403 instead, since no specific resource
+id is involved and 403 discloses nothing extra. See
+`docs/DATA_MODEL.md`'s "Customer Ownership and Principal-Scoped
+Idempotency (V7)" section for the exact schema and backfill.
+
+**Idempotency isolation.** `idempotency_key` uniqueness is now
+`(principal_subject, idempotency_key)`, not `idempotency_key` alone (V7)
+— see `docs/DATA_MODEL.md`. `IdempotencyService.execute(...)` takes the
+authenticated principal's subject explicitly and both stores and looks
+up by it. Critically, for both `DepositService.deposit(...)` and
+`TransferService.transfer(...)`, the sequence is: (1) validate the role;
+(2) load and validate ownership of the primary/source account,
+*unlocked*, strictly before any idempotency work; (3) only then claim or
+replay the principal-scoped idempotency record; (4) execute the
+financial transaction only for a genuinely new key. This means
+authorization is checked before any stored response can be returned, and
+a different principal reusing another principal's exact key string never
+even reaches the idempotency table for an account they do not own —
+independent of (and in addition to) the schema-level scoping itself. The
+advisory lock key (`IdempotencyCommand.advisoryLockId`) is likewise
+principal-aware, so two different principals choosing the same literal
+key string never unnecessarily serialize against each other.
+
+**A subtle correctness bug found and fixed during this task:** the new
+unlocked ownership pre-check loads the `Account` entity via
+`AccountRepository.findById(...)`, which places it in the JPA
+persistence context (first-level cache). Left there, `doDeposit`'s/
+`doTransfer`'s later `@Lock(PESSIMISTIC_WRITE)` query returns that same,
+by-then-stale managed instance instead of re-reading the just-locked
+row's true balance — Hibernate does not overwrite an already-managed
+entity's field values from a subsequent query result by default. This
+silently reintroduced the exact lost-update race Tasks 4–5's
+deterministic row locking was built to prevent, and was caught
+empirically by the project's own existing concurrent-deposit/transfer
+tests (a 20-way concurrent deposit test lost the overwhelming majority
+of its updates). The fix: `DepositService`/`TransferService` explicitly
+call `entityManager.detach(account)` immediately after the ownership
+check, forcing a fresh, correctly-locked read.
+
+**401/403 response shape.** Spring Security's filter chain runs before
+Spring MVC's `@RestControllerAdvice`, so `common.GlobalExceptionHandler`
+cannot produce a body for a filter-chain-level rejection.
+`security.JwtAuthenticationEntryPoint` (401) and
+`security.ApiAccessDeniedHandler` (403) instead use a shared
+`security.SecurityApiErrorSupport` to write the identical `ApiError`
+envelope `GlobalExceptionHandler` uses elsewhere — same five fields, no
+stack trace, no JWT/SQL/credential detail. A genuinely unmapped path
+*outside* `/api/v1/**` (e.g. a random top-level typo) still falls through
+the filter chain's final `permitAll()` unauthenticated and reaches Spring
+MVC's existing (Task 16-verified) `NoResourceFoundException` → 404
+handling. A path *under* `/api/v1/**` that happens not to correspond to
+any real route is a different case: the whole namespace requires
+authentication, so an unauthenticated request to it is rejected as 401
+before Spring MVC's routing — and therefore route (non-)existence — is
+ever reached. This is intentional: it means an unauthenticated caller can
+never distinguish "this API path doesn't exist" from "this API path
+exists but I'm not authenticated," which is the stricter, more
+information-hiding behavior of the two.
+
+**Configuration.** `ledgerguard.security.jwt.signing-key` has no default
+in `application.yml` — it must come from the `JWT_SIGNING_KEY`
+environment variable in any real environment (see `.env.example`);
+`SecurityConfigurationValidator` fails startup if it is absent, malformed,
+or too short. The `test` profile (`application-test.yml`) configures a
+fixed, clearly test-only signing key and three isolated test identities
+(`test-customer-a`, `test-customer-b`, `test-operations`) — completely
+separate from the demo/dev identities, so no integration test ever
+authenticates as `demo-customer`/`demo-operations`. `test-customer-a` and
+`test-customer-b` exist specifically so cross-principal ownership and
+idempotency-isolation tests have two real, independently authenticatable
+CUSTOMER principals.
+
+**UI.** The demo UI's access token lives only in an in-memory JavaScript
+variable (`src/main/resources/static/app.js`), attached automatically to
+every request via the existing centralized `apiRequest()` wrapper —
+never written to `localStorage`, `sessionStorage`, a URL, or a log.
+Reloading the page always signs the user out. The existing
+recent-account-id/recent-import-id `localStorage` convenience is
+unaffected.
+
+**Scope.** No external OAuth/IdP, no refresh tokens, no cookie-based
+sessions, no user registration or database-backed identity store, no
+distributed/Redis-backed session or authorization cache. CSRF is
+disabled — justified, not overlooked: this is a stateless bearer-token
+API with no cookie-based session to fixate. Production hardening of the
+Swagger/OpenAPI/actuator public surface is explicitly deferred to a
+later task.

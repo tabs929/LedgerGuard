@@ -73,17 +73,21 @@ public record IdempotencyCommand(
 
 	/**
 	 * A stable 64-bit id derived from the raw Idempotency-Key header value
-	 * (not this command's fields) for use as the {@code
+	 * together with the authenticated principal's subject (Task 17) -- not
+	 * this command's fields -- for use as the {@code
 	 * pg_advisory_xact_lock(bigint)} argument that serializes concurrent
-	 * requests bearing the same key. A collision between two different
-	 * keys would only cause them to serialize unnecessarily against each
-	 * other -- correctness never depends on this id alone, since the exact
-	 * key string is always compared afterward.
+	 * requests bearing the same key from the same principal. Including the
+	 * principal means two different customers who happen to choose the
+	 * same literal key string never unnecessarily serialize against each
+	 * other. A collision between two different (principal, key) pairs
+	 * would only cause them to serialize unnecessarily -- correctness
+	 * never depends on this id alone, since the exact (principal, key)
+	 * pair is always compared afterward.
 	 */
-	public static long advisoryLockId(String idempotencyKey) {
+	public static long advisoryLockId(String principalSubject, String idempotencyKey) {
 		try {
 			MessageDigest digest = MessageDigest.getInstance("SHA-256");
-			byte[] hash = digest.digest(idempotencyKey.getBytes(StandardCharsets.UTF_8));
+			byte[] hash = digest.digest((principalSubject + ":" + idempotencyKey).getBytes(StandardCharsets.UTF_8));
 			long id = 0L;
 			for (int i = 0; i < 8; i++) {
 				id = (id << 8) | (hash[i] & 0xFF);

@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -74,10 +75,16 @@ class MixedWorkloadConsistencyIntegrationTest {
 
 	@Test
 	void mixedConcurrentWorkloadPreservesAllInvariants() throws Exception {
-		UUID accountA = createUsdCustomerAccount("Mixed Workload A");
-		UUID accountB = createUsdCustomerAccount("Mixed Workload B");
-		UUID accountC = createUsdCustomerAccount("Mixed Workload C");
-		UUID accountD = createUsdCustomerAccount("Mixed Workload D");
+		// One test-customer-a token, fetched once and reused for every
+		// request below (including the concurrent phase) -- all four
+		// accounts belong to the same principal, so ownership checks pass
+		// uniformly and no request races the token endpoint itself.
+		String token = TestAuthSupport.customerAToken(restTemplate);
+
+		UUID accountA = createUsdCustomerAccount("Mixed Workload A", token);
+		UUID accountB = createUsdCustomerAccount("Mixed Workload B", token);
+		UUID accountC = createUsdCustomerAccount("Mixed Workload C", token);
+		UUID accountD = createUsdCustomerAccount("Mixed Workload D", token);
 		List<UUID> customerAccountIds = List.of(accountA, accountB, accountC, accountD);
 
 		// Sequential seeding (not part of the concurrent phase) -- large
@@ -86,7 +93,7 @@ class MixedWorkloadConsistencyIntegrationTest {
 		// keeps the workload's outcome close to deterministic without the
 		// audit itself depending on that.
 		for (UUID accountId : customerAccountIds) {
-			ResponseEntity<Map> seed = postDeposit(accountId, "500.00", UUID.randomUUID().toString());
+			ResponseEntity<Map> seed = postDeposit(accountId, "500.00", UUID.randomUUID().toString(), token);
 			assertThat(seed.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		}
 
@@ -96,7 +103,7 @@ class MixedWorkloadConsistencyIntegrationTest {
 		for (int i = 0; i < depositAmounts.length; i++) {
 			UUID target = customerAccountIds.get(i % customerAccountIds.size());
 			String amount = depositAmounts[i];
-			tasks.add(() -> postDeposit(target, amount, UUID.randomUUID().toString()));
+			tasks.add(() -> postDeposit(target, amount, UUID.randomUUID().toString(), token));
 		}
 		// Eight concurrent transfers, including opposite-direction pairs
 		// between the same two accounts and across different pairs --
@@ -111,7 +118,7 @@ class MixedWorkloadConsistencyIntegrationTest {
 		for (UUID[] pair : transferPairs) {
 			UUID source = pair[0];
 			UUID destination = pair[1];
-			tasks.add(() -> postTransfer(source, destination, "10.00", UUID.randomUUID().toString()));
+			tasks.add(() -> postTransfer(source, destination, "10.00", UUID.randomUUID().toString(), token));
 		}
 
 		int taskCount = tasks.size();
@@ -303,9 +310,10 @@ class MixedWorkloadConsistencyIntegrationTest {
 	// HTTP helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	private UUID createUsdCustomerAccount(String ownerName, String token) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(token);
 		ResponseEntity<Map> response = restTemplate.postForEntity(
 				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
 				Map.class);
@@ -313,17 +321,20 @@ class MixedWorkloadConsistencyIntegrationTest {
 		return UUID.fromString((String) response.getBody().get("id"));
 	}
 
-	private ResponseEntity<Map> postDeposit(UUID accountId, String amount, String idempotencyKey) {
+	private ResponseEntity<Map> postDeposit(UUID accountId, String amount, String idempotencyKey, String token) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(token);
 		headers.set("Idempotency-Key", idempotencyKey);
 		return restTemplate.postForEntity("/api/v1/accounts/" + accountId + "/deposits",
 				new HttpEntity<>(Map.of("amount", amount, "currency", "USD"), headers), Map.class);
 	}
 
-	private ResponseEntity<Map> postTransfer(UUID sourceId, UUID destinationId, String amount, String idempotencyKey) {
+	private ResponseEntity<Map> postTransfer(UUID sourceId, UUID destinationId, String amount, String idempotencyKey,
+			String token) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(token);
 		headers.set("Idempotency-Key", idempotencyKey);
 		Map<String, Object> body = Map.of("sourceAccountId", sourceId.toString(),
 				"destinationAccountId", destinationId.toString(), "amount", amount, "currency", "USD");

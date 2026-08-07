@@ -626,3 +626,51 @@ the approved plan (see project history / plan file) and will be captured in
       Tests" section for the full list, and `docs/ARCHITECTURE.md`'s
       "Reliability Hardening" section for what this task did and
       deliberately did not claim.
+- [x] 17. Authentication and ownership-based authorization (Phase 3) —
+      stateless HS256 JWT authentication (`POST /api/v1/auth/token`,
+      `security.SecurityConfig`/`JwtIssuer`/`TokenController`),
+      configuration-backed CUSTOMER/OPERATIONS demo identities (BCrypt
+      hashes only, never plaintext), and two-layer authorization: a
+      coarse `SecurityFilterChain` URL/role gate plus independent
+      service-layer ownership checks in `AccountService`,
+      `AccountQueryService`, `DepositService`, `TransferService`,
+      `SettlementImportService`, and `ReconciliationService` (via the
+      shared `security.AuthorizationSupport`), so bypassing a controller
+      cannot bypass authorization. `Flyway V7` adds
+      `account.customer_subject` (NOT NULL for CUSTOMER, NULL for
+      SYSTEM, enforced by `chk_account_ownership`; legacy rows backfilled
+      to a fixed `legacy-unowned-customer` sentinel) and
+      `idempotency_key.principal_subject`, changing idempotency
+      uniqueness from `idempotency_key` alone to the composite
+      `(principal_subject, idempotency_key)` — closing a genuine
+      pre-existing gap where two different authenticated principals could
+      otherwise collide, replay, or conflict over the same literal key
+      string. `V1`–`V6` unmodified. A CUSTOMER may transfer to an account
+      they do not own but never read/deposit-into/transfer-from one;
+      ownership violations return 404 (consistent with the existing
+      SYSTEM-account-as-404 precedent), blanket role denials return 403,
+      and authentication failures return 401 — all via the shared
+      `ApiError` envelope, produced for filter-chain-level failures by a
+      dedicated `JwtAuthenticationEntryPoint`/`ApiAccessDeniedHandler`
+      pair (Spring Security runs before `GlobalExceptionHandler`).
+      Authorization is checked before any idempotency claim/replay, so a
+      different principal reusing another principal's exact key string
+      can never retrieve their stored response or mutate any state.
+      Genuinely unmapped top-level paths still return 404 via the
+      existing MVC fallback; an unmapped path *under* `/api/v1/**`
+      correctly returns 401 first (the protected namespace itself, not
+      route existence, is what unauthenticated callers see). During
+      implementation, an unlocked pre-idempotency ownership read was
+      found to leave a stale entity in the JPA persistence context,
+      silently reintroducing a lost-update race under concurrent
+      deposits/transfers — caught by the existing concurrency tests and
+      fixed by explicitly detaching the entity
+      (`DepositService`/`TransferService`). Demo UI gained a sign-in/out
+      section; the access token lives only in an in-memory JS variable,
+      never `localStorage`/`sessionStorage`. `./mvnw verify` run twice in
+      succession with identical results (557 tests both times, up from
+      498) to rule out flakiness. See `docs/ARCHITECTURE.md`'s
+      "Authentication and Authorization" section, `docs/DATA_MODEL.md`'s
+      "Customer Ownership and Principal-Scoped Idempotency (V7)" section,
+      and `docs/API_SPEC.md`'s "Authentication" section and access
+      matrix.

@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.settlement;
 
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -60,6 +61,7 @@ class SettlementImportDisabledIntegrationTest {
 		});
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+		headers.setBearerAuth(TestAuthSupport.operationsToken(restTemplate));
 
 		ResponseEntity<Map> response = restTemplate.postForEntity(
 				"/api/v1/settlement-imports", new HttpEntity<>(body, headers), Map.class);
@@ -72,6 +74,7 @@ class SettlementImportDisabledIntegrationTest {
 		Map<String, Object> accountBody = Map.of("ownerName", "Disabled Settlement Owner", "currency", "USD");
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
 		ResponseEntity<Map> response = restTemplate.postForEntity(
 				"/api/v1/accounts", new HttpEntity<>(accountBody, headers), Map.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);

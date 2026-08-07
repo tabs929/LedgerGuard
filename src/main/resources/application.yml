@@ -86,3 +86,29 @@ ledgerguard:
       max-row-count: 10000
       max-source-length: 64
       max-external-reference-length: 128
+  security:
+    # Task 17: fixed, configuration-backed demo identities -- no user
+    # registration, no database-backed identity store. Only a BCrypt hash
+    # is ever configured, never a plaintext password. These two default
+    # hashes correspond to a documented, clearly-non-production password
+    # (see .env.example) and are meant to be overridden via
+    # DEMO_CUSTOMER_PASSWORD_HASH/DEMO_OPERATIONS_PASSWORD_HASH in any
+    # real deployment, the same convention POSTGRES_PASSWORD=changeme
+    # already uses.
+    users:
+      - username: demo-customer
+        password-hash: ${DEMO_CUSTOMER_PASSWORD_HASH:$2b$10$KxMCQkZFWnvzSR8LtDbmQuKBL6bm0.AcvICXc6v4hbAiKAItdLPDS}
+        role: CUSTOMER
+      - username: demo-operations
+        password-hash: ${DEMO_OPERATIONS_PASSWORD_HASH:$2b$10$r69EIVfioUczWi/S0Dk5Je7QImoc5vQxLhOJWMtzVVYEza3bxduau}
+        role: OPERATIONS
+    jwt:
+      # No default -- must be supplied via the JWT_SIGNING_KEY environment
+      # variable in every real environment (see .env.example). Blank here
+      # deliberately fails SecurityConfigurationValidator's startup check
+      # rather than silently running with a guessable key.
+      signing-key: ${JWT_SIGNING_KEY:}
+      issuer: ledgerguard
+      audience: ledgerguard-api
+      expiration-seconds: 900
+      clock-skew-seconds: 30

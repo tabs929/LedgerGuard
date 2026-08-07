@@ -1,6 +1,7 @@
 package com.tarun.ledgerguard.transfer;
 
 import com.tarun.ledgerguard.common.ApiError;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
 import com.tarun.ledgerguard.transfer.dto.TransferRequest;
 import com.tarun.ledgerguard.transfer.dto.TransferResponse;
 import io.swagger.v3.oas.annotations.Operation;
@@ -13,6 +14,8 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Pattern;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -86,8 +89,9 @@ public class TransferController {
 			@RequestHeader("Idempotency-Key")
 			@Pattern(regexp = "^[A-Za-z0-9._:-]{1,128}$",
 					message = "must be 1-128 characters from [A-Za-z0-9._:-]")
-			String idempotencyKey) {
-		return transferService.transfer(request, idempotencyKey);
+			String idempotencyKey,
+			@AuthenticationPrincipal Jwt jwt) {
+		return transferService.transfer(request, idempotencyKey, AuthenticatedPrincipal.fromJwt(jwt));
 	}
 
 }

@@ -13,6 +13,9 @@ import com.tarun.ledgerguard.account.UnsupportedCurrencyException;
 import com.tarun.ledgerguard.idempotency.IdempotencyCommand;
 import com.tarun.ledgerguard.idempotency.IdempotencyService;
 import com.tarun.ledgerguard.outbox.OutboxEventFactory;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.AuthorizationSupport;
+import com.tarun.ledgerguard.security.Role;
 import com.tarun.ledgerguard.ledger.LedgerEntry;
 import com.tarun.ledgerguard.ledger.LedgerEntryRepository;
 import com.tarun.ledgerguard.ledger.LedgerEntryType;
@@ -76,9 +79,18 @@ public class TransferService {
 	}
 
 	@Transactional
-	public TransferResponse transfer(TransferRequest request, String idempotencyKey) {
+	public TransferResponse transfer(TransferRequest request, String idempotencyKey, AuthenticatedPrincipal principal) {
 		UUID sourceAccountId = request.sourceAccountId();
 		UUID destinationAccountId = request.destinationAccountId();
+
+		// Task 17 ordering requirement: role, then ownership of the SOURCE
+		// account only (a customer may transfer to a recipient they don't
+		// own -- see requireOwnedSourceWallet), then the idempotency
+		// claim/replay, then (only for a genuinely new key) the financial
+		// transaction itself.
+		AuthorizationSupport.requireRole(principal, Role.CUSTOMER);
+		requireOwnedSourceWallet(sourceAccountId, principal);
+
 		// Normalizing here (before the idempotency claim below) is what lets
 		// "100", "100.0" and "100.00" compare as the same command; the
 		// same-account/currency-support checks below stay in doTransfer so
@@ -90,8 +102,38 @@ public class TransferService {
 
 		IdempotencyCommand command =
 				IdempotencyCommand.forTransfer(sourceAccountId, destinationAccountId, amount, normalizedCurrency);
-		return idempotencyService.execute(idempotencyKey, command, TransferResponse.class, TransferResponse::transactionId,
+		return idempotencyService.execute(idempotencyKey, principal.subject(), command, TransferResponse.class,
+				TransferResponse::transactionId,
 				() -> doTransfer(sourceAccountId, destinationAccountId, normalizedCurrency, amount));
+	}
+
+	// Unlocked existence/taxonomy/ownership check on the SOURCE account
+	// only, performed before the idempotency claim/replay above. The
+	// destination account is deliberately not ownership-checked here (or
+	// anywhere) -- a customer may transfer to any valid recipient account
+	// they do not own, per docs/API_SPEC.md. The actual mutation path
+	// (doTransfer) re-resolves and locks both rows independently -- this
+	// method never substitutes for that locking. Critically, the account
+	// loaded here is detached from the persistence context immediately
+	// afterward: leaving it managed would make doTransfer's later
+	// PESSIMISTIC_WRITE query return this same (by-then-stale) in-memory
+	// instance from Hibernate's first-level cache instead of re-reading
+	// the just-locked row's true balance, silently reintroducing the
+	// lost-update race Task 5's deterministic locking was built to
+	// prevent -- confirmed empirically by a failing concurrent-transfer
+	// test before this detach was added.
+	private void requireOwnedSourceWallet(UUID accountId, AuthenticatedPrincipal principal) {
+		Account account = accountRepository.findById(accountId)
+				.orElseThrow(() -> new AccountNotFoundException(accountId));
+		if (account.getAccountCategory() != AccountCategory.CUSTOMER
+				|| account.getAccountClass() != AccountClass.LIABILITY
+				|| account.getAccountPurpose() != AccountPurpose.CUSTOMER_WALLET) {
+			throw new AccountNotFoundException(accountId);
+		}
+		if (!account.getCustomerSubject().equals(principal.subject())) {
+			throw new AccountNotFoundException(accountId);
+		}
+		entityManager.detach(account);
 	}
 
 	private TransferResponse doTransfer(UUID sourceAccountId, UUID destinationAccountId, String normalizedCurrency,

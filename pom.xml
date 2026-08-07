@@ -51,6 +51,22 @@
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
 		<dependency>
+			<!-- Task 17: Spring Security filter chain, authentication, and
+			     authorization. Brings spring-security-crypto (BCryptPasswordEncoder)
+			     transitively, so no separate password-hashing dependency is needed. -->
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
+		</dependency>
+		<dependency>
+			<!-- Task 17: JwtEncoder/JwtDecoder (Nimbus JOSE-backed) for issuing
+			     and validating stateless HS256 JWTs at POST /api/v1/auth/token
+			     and on every protected request. Avoids a third-party JWT
+			     library (e.g. jjwt) since this official starter already
+			     provides both directions. -->
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+		</dependency>
+		<dependency>
 			<groupId>org.flywaydb</groupId>
 			<artifactId>flyway-database-postgresql</artifactId>
 		</dependency>

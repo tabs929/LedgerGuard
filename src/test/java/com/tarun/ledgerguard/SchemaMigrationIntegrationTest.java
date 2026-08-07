@@ -135,8 +135,10 @@ class SchemaMigrationIntegrationTest {
 		assertThatThrownBy(() -> {
 			try (Connection connection = dataSource.getConnection();
 					PreparedStatement statement = connection.prepareStatement(
-							"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, balance) "
-									+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', 'Negative Balance', 'CHF', -1)")) {
+							"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, "
+									+ "balance, customer_subject) "
+									+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', 'Negative Balance', 'CHF', -1, "
+									+ "'schema-test-subject')")) {
 				statement.executeUpdate();
 			}
 		}).isInstanceOf(SQLException.class)
@@ -269,16 +271,24 @@ class SchemaMigrationIntegrationTest {
 				.hasMessageContaining("ledger_entry rows are immutable");
 	}
 
+	// V7's chk_account_ownership requires customer_subject to be non-null
+	// for CUSTOMER rows and null for SYSTEM rows -- this test-only helper
+	// supplies a fixed placeholder subject for CUSTOMER inserts (this
+	// class's own JDBC-only test data has no real authenticated principal
+	// behind it) and leaves it null for SYSTEM.
 	private UUID insertAccount(Connection connection, String category, String accountClass, String purpose,
 			String ownerName, String currency) throws SQLException {
+		String customerSubject = "CUSTOMER".equals(category) ? "schema-test-subject" : null;
 		try (PreparedStatement statement = connection.prepareStatement(
-				"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency) "
-						+ "VALUES (?, ?, ?, ?, ?) RETURNING id")) {
+				"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, "
+						+ "customer_subject) "
+						+ "VALUES (?, ?, ?, ?, ?, ?) RETURNING id")) {
 			statement.setString(1, category);
 			statement.setString(2, accountClass);
 			statement.setString(3, purpose);
 			statement.setString(4, ownerName);
 			statement.setString(5, currency);
+			statement.setString(6, customerSubject);
 			try (ResultSet resultSet = statement.executeQuery()) {
 				resultSet.next();
 				return (UUID) resultSet.getObject("id");

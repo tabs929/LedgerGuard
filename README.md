@@ -5,7 +5,7 @@ platform, built to demonstrate backend software engineering practices:
 double-entry accounting, transactional correctness, and test-driven
 development against a real database.
 
-## Status: Phase 1 complete (Tasks 1–9); Phase 2 complete (Tasks 10–16)
+## Status: Phase 1 complete (Tasks 1–9); Phase 2 complete (Tasks 10–16); Phase 3 in progress (Task 17)
 
 This repository contains the project foundation (Task 1), the initial
 database schema (Task 2), account creation (Task 3), deposits (Task 4),
@@ -18,11 +18,16 @@ event persistence (Task 11), publishing pending outbox events to Kafka
 duplicate-event protection (Task 13), importing external settlement
 CSV files as immutable observations (Task 14), comparing those
 observations against the ledger through settlement reconciliation
-(Task 15), and a reliability/concurrency hardening pass (Task 16) that
+(Task 15), a reliability/concurrency hardening pass (Task 16) that
 added focused tests proving these guarantees hold under real concurrent
 load, forced failures, and duplicate delivery — **no production code
-changed**, since the audit found no correctness defect. Authentication
-remains unimplemented — see `docs/TASKS.md`.
+changed**, since the audit found no correctness defect — and stateless
+JWT authentication with ownership-based authorization (Task 17): every
+endpoint now requires a bearer token, obtained from
+`POST /api/v1/auth/token`, except that endpoint itself. See
+`docs/API_SPEC.md`'s "Authentication" section for the full access matrix
+and `docs/ARCHITECTURE.md`'s "Authentication and Authorization" section
+for the design.
 
 `POST /api/v1/accounts` creates a **customer USD wallet account**. Every
 account created through this endpoint always opens with a **zero balance**
@@ -97,9 +102,9 @@ SQL, no database constraint or table names.
 error envelope are documented via OpenAPI**, generated directly from the
 controllers and DTOs (not a hand-maintained spec file, so it can't drift
 from the real API): the OpenAPI 3.1 JSON document is at `/v3/api-docs`,
-and interactive Swagger UI is at `/swagger-ui/index.html`. No
-authentication scheme is declared, because Phase 1 has none — declaring
-one would falsely imply these endpoints are protected.
+and interactive Swagger UI is at `/swagger-ui/index.html`. A `bearerAuth`
+(HTTP bearer, JWT) security scheme is declared and applied globally,
+except on `POST /api/v1/auth/token` itself (Task 17).
 
 **Every push and pull request to `master` automatically runs the complete
 verification suite** — `.github/workflows/ci.yml` runs the exact same
@@ -107,9 +112,19 @@ verification suite** — `.github/workflows/ci.yml` runs the exact same
 Testcontainers, with no tests skipped. See "Continuous Integration" below.
 
 **Plain account lookup by id (`GET /api/v1/accounts/{id}`) is not
-implemented** — no task has been assigned it so far. There is also no
-authentication — explicitly out of scope until a later Phase 3 task per
-`docs/TASKS.md` and `CLAUDE.md`.
+implemented** — no task has been assigned it so far.
+
+**Authentication and authorization (Task 17)** — every endpoint above
+now requires `Authorization: Bearer <token>`, obtained from
+`POST /api/v1/auth/token`, except that endpoint itself. Two fixed roles,
+CUSTOMER and OPERATIONS, are sourced from server configuration only —
+never a request field. A CUSTOMER may create their own accounts, and
+read/deposit-into/transfer-from only accounts they own (any ownership
+violation is a 404, not a 403 — indistinguishable from a nonexistent id,
+consistent with the existing `SYSTEM`-account precedent), but may
+transfer to any valid recipient account. OPERATIONS may read any
+account and exclusively performs settlement import/reconciliation. See
+`docs/API_SPEC.md`'s "Authentication" section for the full matrix.
 
 ## Idempotency
 
@@ -138,40 +153,60 @@ to retry (e.g. after a network timeout):
 - **Retention is indefinite** in Phase 2 — no expiry, no cleanup job, no
   delete endpoint.
 
+**Authenticating (Task 17):** every curl example below requires a bearer
+token. Obtain one first and export it:
+
+```
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/token \
+  -H 'Content-Type: application/json' \
+  -d '{"username": "demo-customer", "password": "demo-customer-password"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["accessToken"])')
+```
+
+(Use `demo-operations`/`demo-operations-password` for settlement import
+and reconciliation calls instead.) See `.env.example` for how to
+override these default demo credentials in a real deployment.
+
 Example (curl):
 
 ```
 curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
   -d '{"amount": "100.00", "currency": "USD"}'
 
 # Retrying with the same key and body replays the first response exactly:
 curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
   -d '{"amount": "100.00", "currency": "USD"}'
 
 # Same key, different amount -> 409 Conflict:
 curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
   -d '{"amount": "200.00", "currency": "USD"}'
 
 curl -i -X POST http://localhost:8080/api/v1/transfers \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
   -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<destination-id>", "amount": "40.00", "currency": "USD"}'
 
 # Retrying with the same key and body replays the first response exactly:
 curl -i -X POST http://localhost:8080/api/v1/transfers \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
   -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<destination-id>", "amount": "40.00", "currency": "USD"}'
 
 # Same key, different destination -> 409 Conflict:
 curl -i -X POST http://localhost:8080/api/v1/transfers \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Idempotency-Key: 3c2f9b7a-6b34-4b7b-9a3a-1a8e0f2d5c11' \
   -d '{"sourceAccountId": "<source-id>", "destinationAccountId": "<other-destination-id>", "amount": "40.00", "currency": "USD"}'
 ```
@@ -497,6 +532,7 @@ instructions, not a claim that this exact sequence was executed.
    ```
    curl -i -X POST http://localhost:8080/api/v1/accounts/<account-id>/deposits \
      -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $TOKEN" \
      -H 'Idempotency-Key: 8f14e45f-ceea-467e-bd48-9ffb2f9d1a30' \
      -d '{"amount": "100.00", "currency": "USD"}'
    ```
@@ -537,7 +573,7 @@ instructions, not a claim that this exact sequence was executed.
 ./mvnw verify
 ```
 
-This runs the full test suite (498 tests), including Testcontainers-backed
+This runs the full test suite (557 tests), including Testcontainers-backed
 integration tests that each start an isolated PostgreSQL container
 (independent of the Docker Compose service above): a connectivity smoke
 test (`SELECT 1` against the datasource), a schema-verification test that

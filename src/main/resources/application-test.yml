@@ -19,3 +19,29 @@ ledgerguard:
       # LedgerEventConsumerIntegrationTest overrides this back to true
       # alongside a real Kafka Testcontainer.
       enabled: false
+  security:
+    # Task 17: isolated test-only identities and signing key, entirely
+    # separate from the demo/dev identities in application.yml -- no
+    # integration test ever authenticates as demo-customer/demo-operations.
+    # Two distinct CUSTOMER identities (test-customer-a/-b) exist
+    # specifically so cross-principal ownership/idempotency tests have two
+    # real, independently authenticatable principals to use.
+    users:
+      - username: test-customer-a
+        password-hash: $2b$10$MLl.0rfc4ALVk4Bw8I.tL.tilFSjnfifGggS/v/8CAnVAVUKHwpbu
+        role: CUSTOMER
+      - username: test-customer-b
+        password-hash: $2b$10$MDWrsjIUU4CCC5AYWsht9O3pUGTGNy/nORwV.XKUCykaP0pHsRSma
+        role: CUSTOMER
+      - username: test-operations
+        password-hash: $2b$10$87bgmsETy8RYr3zPi49.8OwfNxOG2iYCeMbuHGD6kjX/yBrWI1p4S
+        role: OPERATIONS
+    jwt:
+      # Fixed, clearly test-only key -- never used outside the "test"
+      # profile. 32 raw bytes, Base64-encoded, satisfying the 256-bit
+      # minimum enforced by SecurityConfigurationValidator.
+      signing-key: GSbnYa+DKBQUZstOdoVhhGd5qENdvwqhdeIBGpbmv9g=
+      issuer: ledgerguard
+      audience: ledgerguard-api
+      expiration-seconds: 900
+      clock-skew-seconds: 30

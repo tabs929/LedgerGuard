@@ -52,6 +52,14 @@ public class Account {
 	@Column(name = "balance", nullable = false, precision = 19, scale = 4)
 	private BigDecimal balance;
 
+	// Task 17: the authenticated JWT subject that owns this CUSTOMER wallet.
+	// NULL for every SYSTEM account, enforced by chk_account_ownership
+	// (V7). Never populated from client-supplied JSON -- AccountService
+	// sources it exclusively from the validated JWT of the authenticated
+	// principal.
+	@Column(name = "customer_subject", updatable = false)
+	private String customerSubject;
+
 	// Populated by the database's `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`
 	// default, not by application code. Excluded from the INSERT statement
 	// (insertable = false) and re-read from the database immediately after
@@ -65,13 +73,14 @@ public class Account {
 	}
 
 	public Account(AccountCategory accountCategory, AccountClass accountClass, AccountPurpose accountPurpose,
-			String ownerName, String currency, BigDecimal balance) {
+			String ownerName, String currency, BigDecimal balance, String customerSubject) {
 		this.accountCategory = accountCategory;
 		this.accountClass = accountClass;
 		this.accountPurpose = accountPurpose;
 		this.ownerName = ownerName;
 		this.currency = currency;
 		this.balance = balance;
+		this.customerSubject = customerSubject;
 	}
 
 	public UUID getId() {
@@ -100,6 +109,10 @@ public class Account {
 
 	public BigDecimal getBalance() {
 		return balance;
+	}
+
+	public String getCustomerSubject() {
+		return customerSubject;
 	}
 
 	public Instant getCreatedAt() {

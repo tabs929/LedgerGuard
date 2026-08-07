@@ -1,13 +1,15 @@
 # Phase 1 Requirements — Core Transactional Ledger
 
 > **Status: Phase 1 complete.** All 9 tasks below are implemented. **Phase
-> 2 is now also complete** — Task 10 (idempotency), Task 11 (transactional
+> 2 is complete** — Task 10 (idempotency), Task 11 (transactional
 > outbox), Task 12 (Kafka publishing of outbox events), Task 13 (Kafka
 > consumption and duplicate-event protection), Task 14 (settlement
 > CSV import), Task 15 (settlement reconciliation), and Task 16
 > (reliability, failure, and concurrency hardening — test-only, no
 > production changes) are all
-> implemented. See `docs/TASKS.md` for the per-task
+> implemented. **Phase 3 has begun** — Task 17 (stateless JWT
+> authentication and ownership-based authorization) is implemented; see
+> "Phase 3 Progress" below. See `docs/TASKS.md` for the per-task
 > breakdown and what each one covered.
 
 ## Scope
@@ -68,8 +70,10 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   other currency code.
 - **No FX conversion:** transfers require the source and destination
   currencies to match exactly.
-- **No authentication or authorization:** Spring Security and JWT are
-  introduced in Phase 3. All Phase 1/2 endpoints are unauthenticated.
+- **No authentication or authorization in Phase 1/2:** all endpoints
+  implemented before Task 17 were unauthenticated at the time. Task 17
+  (Phase 3) adds stateless JWT authentication and ownership-based
+  authorization to every one of them — see "Phase 3 Progress" below.
 - **No business reaction to events:** Task 13 consumes and durably
   deduplicates events, but performs no settlement, reconciliation,
   balance update, ledger write, notification, or any other downstream
@@ -184,6 +188,30 @@ Phase 1 builds the core transactional ledger for LedgerGuard:
   (Task 12), Kafka consumption/dedup (Task 13), settlement CSV import
   (Task 14), settlement reconciliation (Task 15), and reliability
   hardening (Task 16) are all done.
+
+## Phase 3 Progress
+
+- **Task 17 — Authentication and ownership-based authorization
+  (implemented):** stateless HS256 JWT authentication via
+  `POST /api/v1/auth/token`, two fixed configuration-backed identities
+  (CUSTOMER, OPERATIONS — BCrypt hashes only), and ownership-based
+  authorization enforced at both the `SecurityFilterChain` and the
+  service layer independently. A CUSTOMER account's owner
+  (`account.customer_subject`, Flyway V7) is sourced exclusively from the
+  authenticated JWT subject — never from request JSON. A CUSTOMER may
+  read/deposit-into/transfer-from only accounts they own (404 if not,
+  consistent with the existing SYSTEM-account-as-404 precedent) but may
+  transfer *to* any valid account; OPERATIONS may read any account and
+  exclusively performs settlement import/reconciliation; neither role can
+  do the other's write operations. Idempotency-key uniqueness is now
+  scoped per authenticated principal (V7's composite
+  `(principal_subject, idempotency_key)`), and ownership is always
+  checked before any idempotency claim or replay, so one principal can
+  never retrieve or influence another's stored response. See
+  `docs/ARCHITECTURE.md`'s "Authentication and Authorization" section,
+  `docs/DATA_MODEL.md`'s "Customer Ownership and Principal-Scoped
+  Idempotency (V7)" section, and `docs/API_SPEC.md`'s "Authentication"
+  section.
 
 ## Non-Goals
 

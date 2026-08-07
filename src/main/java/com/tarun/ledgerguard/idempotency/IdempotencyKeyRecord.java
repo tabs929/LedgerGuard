@@ -36,6 +36,14 @@ public class IdempotencyKeyRecord {
 	@Column(name = "idempotency_key", nullable = false, length = 128, updatable = false)
 	private String idempotencyKey;
 
+	// Task 17: the authenticated JWT subject that claimed this key.
+	// Uniqueness is (principal_subject, idempotency_key), not
+	// idempotency_key alone -- see V7 -- so two different principals
+	// reusing the same literal key string never collide, replay each
+	// other's response, or conflict with each other.
+	@Column(name = "principal_subject", nullable = false, length = 255, updatable = false)
+	private String principalSubject;
+
 	@Enumerated(EnumType.STRING)
 	@Column(name = "operation_type", nullable = false, length = 20, updatable = false)
 	private IdempotencyOperationType operationType;
@@ -72,9 +80,10 @@ public class IdempotencyKeyRecord {
 		// required by JPA
 	}
 
-	public IdempotencyKeyRecord(String idempotencyKey, IdempotencyCommand command, UUID ledgerTransactionId,
-			int responseStatus, String responseBody) {
+	public IdempotencyKeyRecord(String idempotencyKey, String principalSubject, IdempotencyCommand command,
+			UUID ledgerTransactionId, int responseStatus, String responseBody) {
 		this.idempotencyKey = idempotencyKey;
+		this.principalSubject = principalSubject;
 		this.operationType = command.operationType();
 		this.primaryAccountId = command.primaryAccountId();
 		this.secondaryAccountId = command.secondaryAccountId();
@@ -100,6 +109,10 @@ public class IdempotencyKeyRecord {
 
 	public String getIdempotencyKey() {
 		return idempotencyKey;
+	}
+
+	public String getPrincipalSubject() {
+		return principalSubject;
 	}
 
 	public IdempotencyOperationType getOperationType() {

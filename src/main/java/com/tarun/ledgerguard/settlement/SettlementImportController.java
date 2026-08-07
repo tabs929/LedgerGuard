@@ -1,5 +1,6 @@
 package com.tarun.ledgerguard.settlement;
 
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -8,6 +9,8 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -65,8 +68,9 @@ public class SettlementImportController {
 			@RequestParam("source") String source,
 			@Parameter(description = "Settlement CSV file", required = true,
 					schema = @Schema(type = "string", format = "binary"))
-			@RequestParam("file") MultipartFile file) {
-		SettlementImportOutcome outcome = service.importFile(source, file);
+			@RequestParam("file") MultipartFile file,
+			@AuthenticationPrincipal Jwt jwt) {
+		SettlementImportOutcome outcome = service.importFile(source, file, AuthenticatedPrincipal.fromJwt(jwt));
 		HttpStatus status = outcome.replayed() ? HttpStatus.OK : HttpStatus.CREATED;
 		return ResponseEntity.status(status).body(SettlementImportResponse.from(outcome));
 	}

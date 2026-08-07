@@ -18,7 +18,10 @@
 > `V5__add_settlement_import.sql` — see "Settlement Import Tables" below.
 > Task 15 adds exactly one new migration,
 > `V6__add_settlement_reconciliation.sql` — see "Settlement Reconciliation
-> Tables" below. `V1`–`V5` are unmodified by Task 15. The `V1`
+> Tables" below. Task 17 adds exactly one new migration,
+> `V7__add_customer_ownership_and_idempotency_principal.sql` — see
+> "Customer Ownership and Principal-Scoped Idempotency (V7)" below.
+> `V1`–`V6` are unmodified by Task 17. The `V1`
 > tables, constraints, indexes, and triggers described below exist in the
 > database via
 > `src/main/resources/db/migration/V1__init_account_ledger_schema.sql`
@@ -660,6 +663,53 @@ Both tables are append-only, in the same style as `V1`/`V3`/`V4`/`V5`:
 `ReconciliationRunRepository` and `ReconciliationResultRepository` (both
 JDBC-based, the same reason as `ProcessedEventRepository`) expose no
 update or delete method at all.
+
+## Customer Ownership and Principal-Scoped Idempotency (V7, Task 17)
+
+`V7__add_customer_ownership_and_idempotency_principal.sql` makes two
+additive changes, both required by stateless authentication, neither
+touching `V1`–`V6`:
+
+**`account.customer_subject VARCHAR(255)`** — the authenticated JWT
+subject that owns a `CUSTOMER` wallet. Constrained by
+`chk_account_ownership`:
+```sql
+(account_category = 'CUSTOMER' AND customer_subject IS NOT NULL)
+OR (account_category = 'SYSTEM' AND customer_subject IS NULL)
+```
+Never populated from client-supplied JSON — `CreateAccountRequest` has no
+field for it; `AccountService` sources it exclusively from the validated
+JWT. Existing `CUSTOMER` rows (created before authentication existed) are
+backfilled to a single fixed, documented sentinel,
+`'legacy-unowned-customer'` — there is no way to recover true historical
+ownership, and a fixed, searchable sentinel is preferable to a guess. No
+new index is added: ownership is checked by loading an account by its
+primary key and comparing the already-loaded row's `customer_subject`,
+which the primary key index already serves — an index on
+`customer_subject` itself would be speculative, justified only by a
+hypothetical future "list my accounts" endpoint that is out of scope.
+
+**`idempotency_key.principal_subject VARCHAR(255) NOT NULL`** — closes a
+genuine pre-existing gap: uniqueness on `idempotency_key` alone (V2) is
+global, with no notion of which caller claimed it. Once authentication
+exists, two different customers reusing the same literal key string would
+otherwise collide — the second customer's request would either replay
+the first customer's stored response (cross-customer leakage) or
+409-conflict against a key they never chose. `V7` changes the unique
+constraint from `uq_idempotency_key` to
+`uq_idempotency_key_principal UNIQUE (principal_subject, idempotency_key)`.
+Backfill is narrow and deliberately has no fallback: `principal_subject`
+is populated only by joining to the row's own `primary_account_id`'s
+(already-backfilled) `customer_subject`; if any row cannot be mapped this
+way, the subsequent `SET NOT NULL` fails the migration outright rather
+than silently mapping a possibly-corrupted row to a shared sentinel,
+which could otherwise conceal a real data-integrity defect.
+`IdempotencyCommand.advisoryLockId` is likewise now keyed on
+`(principalSubject, idempotencyKey)`, not the raw key alone, so two
+principals choosing the same literal key string never unnecessarily
+serialize against each other. See `docs/ARCHITECTURE.md`'s
+"Authentication and Authorization" section for how ownership is enforced
+ahead of any idempotency claim/replay.
 
 ## Account Creation Enforcement (implemented, Task 3)
 

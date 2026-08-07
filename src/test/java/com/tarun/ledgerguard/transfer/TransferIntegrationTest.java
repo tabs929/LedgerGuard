@@ -3,6 +3,7 @@ package com.tarun.ledgerguard.transfer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tarun.ledgerguard.account.dto.AccountResponse;
 import com.tarun.ledgerguard.transfer.dto.TransferResponse;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -398,8 +399,7 @@ class TransferIntegrationTest {
 		UUID sourceId = createUsdCustomerAccount("Deposit Then Transfer Source");
 		UUID destinationId = createUsdCustomerAccount("Deposit Then Transfer Destination");
 
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<String> depositResponse = restTemplate.postForEntity(
 				"/api/v1/accounts/" + sourceId + "/deposits",
@@ -423,11 +423,12 @@ class TransferIntegrationTest {
 
 		int concurrentTransfers = 20;
 		BigDecimal amountEach = new BigDecimal("10.00"); // only 10 of 20 can succeed
+		String token = TestAuthSupport.customerAToken(restTemplate);
 		ExecutorService executor = Executors.newFixedThreadPool(concurrentTransfers);
 		try {
 			List<Callable<ResponseEntity<String>>> tasks = new ArrayList<>();
 			for (int i = 0; i < concurrentTransfers; i++) {
-				tasks.add(() -> postTransferRaw(sourceId, destinationId, "10.00"));
+				tasks.add(() -> postTransferRaw(sourceId, destinationId, "10.00", token));
 			}
 			List<Future<ResponseEntity<String>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
 
@@ -463,12 +464,13 @@ class TransferIntegrationTest {
 
 		int pairsEachDirection = 10;
 		BigDecimal amountEach = new BigDecimal("5.00");
+		String token = TestAuthSupport.customerAToken(restTemplate);
 		ExecutorService executor = Executors.newFixedThreadPool(pairsEachDirection * 2);
 		try {
 			List<Callable<ResponseEntity<String>>> tasks = new ArrayList<>();
 			for (int i = 0; i < pairsEachDirection; i++) {
-				tasks.add(() -> postTransferRaw(accountA, accountB, "5.00"));
-				tasks.add(() -> postTransferRaw(accountB, accountA, "5.00"));
+				tasks.add(() -> postTransferRaw(accountA, accountB, "5.00", token));
+				tasks.add(() -> postTransferRaw(accountB, accountA, "5.00", token));
 			}
 			List<Future<ResponseEntity<String>>> futures = executor.invokeAll(tasks, 60, TimeUnit.SECONDS);
 
@@ -494,11 +496,19 @@ class TransferIntegrationTest {
 	// helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	// Every account in this class is created by (and transferred as) the
+	// same test-customer-a principal -- Task 17 cross-principal isolation
+	// itself is covered separately in OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders authHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<AccountResponse> response = restTemplate.postForEntity(
-				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
+				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), authHeaders()),
 				AccountResponse.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return response.getBody().id();
@@ -506,8 +516,7 @@ class TransferIntegrationTest {
 
 	private UUID createFundedAccount(String ownerName, String depositAmount) {
 		UUID accountId = createUsdCustomerAccount(ownerName);
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<String> response = restTemplate.postForEntity(
 				"/api/v1/accounts/" + accountId + "/deposits",
@@ -522,8 +531,7 @@ class TransferIntegrationTest {
 				"destinationAccountId", destinationId.toString(),
 				"amount", amount,
 				"currency", "USD");
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		return restTemplate.postForEntity("/api/v1/transfers", new HttpEntity<>(body, headers), TransferResponse.class);
 	}
@@ -537,9 +545,30 @@ class TransferIntegrationTest {
 		return postTransferRawBody(body);
 	}
 
-	private ResponseEntity<String> postTransferRawBody(Map<String, Object> body) {
+	// Used by the concurrency tests below, which fetch one token up front
+	// and reuse it across every task rather than racing 20+ redundant
+	// /api/v1/auth/token round trips during the timed section.
+	private ResponseEntity<String> postTransferRaw(UUID sourceId, UUID destinationId, String amount, String token) {
+		Map<String, Object> body = new LinkedHashMap<>();
+		body.put("sourceAccountId", sourceId.toString());
+		body.put("destinationAccountId", destinationId.toString());
+		body.put("amount", amount);
+		body.put("currency", "USD");
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(token);
+		headers.set("Idempotency-Key", UUID.randomUUID().toString());
+		try {
+			String json = JSON.writeValueAsString(body);
+			return restTemplate.postForEntity("/api/v1/transfers", new HttpEntity<>(json, headers), String.class);
+		}
+		catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	private ResponseEntity<String> postTransferRawBody(Map<String, Object> body) {
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		try {
 			String json = JSON.writeValueAsString(body);
@@ -583,13 +612,19 @@ class TransferIntegrationTest {
 	}
 
 	private UUID insertCustomerWalletDirectly(String ownerName, String currency, String balance) throws SQLException {
+		// customer_subject = test-customer-a so that, when this row is used
+		// as a transfer SOURCE, the Task 17 ownership check (which only
+		// applies to the source) still passes and the test reaches the
+		// currency-mismatch logic under test.
 		try (Connection connection = dataSource.getConnection();
 				PreparedStatement statement = connection.prepareStatement(
-						"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, balance) "
-								+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', ?, ?, ?) RETURNING id")) {
+						"INSERT INTO account (account_category, account_class, account_purpose, owner_name, currency, "
+								+ "balance, customer_subject) "
+								+ "VALUES ('CUSTOMER', 'LIABILITY', 'CUSTOMER_WALLET', ?, ?, ?, ?) RETURNING id")) {
 			statement.setString(1, ownerName);
 			statement.setString(2, currency);
 			statement.setBigDecimal(3, new BigDecimal(balance));
+			statement.setString(4, TestAuthSupport.CUSTOMER_A_USERNAME);
 			try (ResultSet resultSet = statement.executeQuery()) {
 				resultSet.next();
 				return (UUID) resultSet.getObject("id");

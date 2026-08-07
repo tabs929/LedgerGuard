@@ -2,6 +2,7 @@ package com.tarun.ledgerguard.account;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tarun.ledgerguard.account.dto.AccountResponse;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -159,7 +160,8 @@ class AccountCreationIntegrationTest {
 				AccountPurpose.EXTERNAL_FUNDING,
 				"Invalid Combo",
 				"USD",
-				BigDecimal.ZERO.setScale(4));
+				BigDecimal.ZERO.setScale(4),
+				"test-owner-subject");
 
 		assertThatThrownBy(() -> {
 			accountRepository.saveAndFlush(invalid);
@@ -169,12 +171,14 @@ class AccountCreationIntegrationTest {
 	private ResponseEntity<AccountResponse> postAccount(Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
 		return restTemplate.postForEntity("/api/v1/accounts", new HttpEntity<>(body, headers), AccountResponse.class);
 	}
 
 	private ResponseEntity<String> postRaw(Map<String, Object> body) {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
 		try {
 			String json = JSON.writeValueAsString(body);
 			return restTemplate.postForEntity("/api/v1/accounts", new HttpEntity<>(json, headers), String.class);

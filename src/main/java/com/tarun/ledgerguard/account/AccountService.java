@@ -2,6 +2,9 @@ package com.tarun.ledgerguard.account;
 
 import com.tarun.ledgerguard.account.dto.AccountResponse;
 import com.tarun.ledgerguard.account.dto.CreateAccountRequest;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.AuthorizationSupport;
+import com.tarun.ledgerguard.security.Role;
 import jakarta.persistence.EntityManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,7 +18,9 @@ import java.util.Set;
  * (CUSTOMER + LIABILITY + CUSTOMER_WALLET) and the zero opening balance are
  * fixed by this service, not accepted from the caller — CreateAccountRequest
  * has no fields for them, so there is nothing here for a client value to
- * override.
+ * override. Task 17: ownership (customer_subject) is likewise sourced
+ * exclusively from the authenticated principal's validated JWT subject —
+ * never from request JSON, which has no field for it either.
  */
 @Service
 public class AccountService {
@@ -32,7 +37,9 @@ public class AccountService {
 	}
 
 	@Transactional
-	public AccountResponse createCustomerWalletAccount(CreateAccountRequest request) {
+	public AccountResponse createCustomerWalletAccount(CreateAccountRequest request, AuthenticatedPrincipal principal) {
+		AuthorizationSupport.requireRole(principal, Role.CUSTOMER);
+
 		String normalizedCurrency = request.currency().toUpperCase(Locale.ROOT);
 		if (!SUPPORTED_CURRENCIES.contains(normalizedCurrency)) {
 			throw new UnsupportedCurrencyException(normalizedCurrency);
@@ -44,7 +51,8 @@ public class AccountService {
 				AccountPurpose.CUSTOMER_WALLET,
 				request.ownerName(),
 				normalizedCurrency,
-				OPENING_BALANCE);
+				OPENING_BALANCE,
+				principal.subject());
 
 		Account saved = accountRepository.save(account);
 

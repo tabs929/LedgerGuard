@@ -1,6 +1,9 @@
 package com.tarun.ledgerguard.reconciliation;
 
 import com.tarun.ledgerguard.common.PagedResponse;
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.AuthorizationSupport;
+import com.tarun.ledgerguard.security.Role;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -34,19 +37,26 @@ public class ReconciliationService {
 		this.resultRepository = resultRepository;
 	}
 
-	public ReconciliationSummaryResponse reconcile(UUID importId) {
+	public ReconciliationSummaryResponse reconcile(UUID importId, AuthenticatedPrincipal principal) {
+		// Task 17: SecurityConfig's URL rule already restricts this
+		// endpoint to OPERATIONS, but this service-level check means
+		// bypassing the controller cannot bypass authorization either.
+		AuthorizationSupport.requireRole(principal, Role.OPERATIONS);
 		SettlementImportSummary summary = requireImport(importId);
 		ReconciliationRunOutcome outcome = processor.reconcile(importId, ALGORITHM_VERSION);
 		return toSummaryResponse(outcome.run(), summary, outcome.replayed());
 	}
 
-	public ReconciliationSummaryResponse getRun(UUID importId) {
+	public ReconciliationSummaryResponse getRun(UUID importId, AuthenticatedPrincipal principal) {
+		AuthorizationSupport.requireRole(principal, Role.OPERATIONS);
 		SettlementImportSummary summary = requireImport(importId);
 		StoredReconciliationRun run = requireRun(importId);
 		return toSummaryResponse(run, summary, false);
 	}
 
-	public PagedResponse<ReconciliationResultResponse> getResults(UUID importId, int page, int size) {
+	public PagedResponse<ReconciliationResultResponse> getResults(UUID importId, AuthenticatedPrincipal principal,
+			int page, int size) {
+		AuthorizationSupport.requireRole(principal, Role.OPERATIONS);
 		requireImport(importId);
 		StoredReconciliationRun run = requireRun(importId);
 

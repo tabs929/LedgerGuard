@@ -5,7 +5,9 @@
 > publishing), Task 13 (Kafka consumption and duplicate-event
 > protection), Task 14 (settlement CSV import), Task 15 (settlement
 > reconciliation), and Task 16 (reliability, failure, and concurrency
-> hardening) — every task in Phase 2 is now complete — and every test runs
+> hardening) — every task in Phase 2 is now complete — plus Task 17
+> (stateless JWT authentication and ownership-based authorization, the
+> first Phase 3 task) — and every test runs
 > automatically in CI (Task 9) on every push/PR.** The connectivity smoke
 > test (Task 1), schema-verification tests (Task 2), account creation's
 > tests (Task 3), deposit's ledger-balance/rollback/concurrency tests
@@ -904,6 +906,95 @@ does not claim every possible failure mode has been eliminated, only that
 the specific scenarios above are proven correct against real PostgreSQL
 (and, where broker behavior matters, real Kafka) — never mocked for a
 guarantee that depends on real database or broker behavior.
+
+## Authentication and Authorization Tests (implemented, Task 17)
+
+Three new test classes, plus every existing HTTP-driven integration test
+migrated to authenticate through the real `POST /api/v1/auth/token`
+endpoint (never a security bypass, never a permissive test-only mock
+user) via a shared `security.TestAuthSupport` helper and three isolated
+test-only identities (`test-customer-a`, `test-customer-b`,
+`test-operations`) configured in `application-test.yml`, completely
+separate from the demo/dev identities.
+
+`security.SecurityConfigurationValidatorTest` (plain unit test, no Spring
+context): every startup-validation rule in isolation — empty/duplicate/
+blank username, missing role, malformed BCrypt hash, non-positive/
+excessive expiration or clock skew, blank/non-Base64/too-short signing
+key, and that multiple simultaneous problems are all reported together.
+
+`security.AuthenticationAndAuthorizationIntegrationTest` (27 tests,
+PostgreSQL Testcontainers): valid credentials issue a token; unknown
+username and wrong password both return the identical 401/message; a
+token request cannot smuggle in a role field (unknown-JSON-property
+rejection); missing, malformed, wrong-signature, wrong-issuer,
+wrong-audience, and expired bearer tokens all return 401 (the
+wrong-signature/issuer/audience/expiry cases craft a real, validly-shaped
+JWT via Nimbus and sign it with the same test key the running
+application actually validates against, so only the specific defect
+under test is wrong); OPERATIONS is denied 403 on account creation,
+deposit, and transfer; CUSTOMER is denied 403 on settlement import and
+reconciliation; both 401 and 403 responses use the exact shared
+`ApiError` envelope; a created account's `customer_subject` matches the
+authenticated principal regardless of anything in the request body; a
+CUSTOMER cannot read another customer's balance/history or deposit into
+their account (404); a CUSTOMER cannot transfer from another customer's
+account (404) but can transfer to one they don't own without the
+response ever exposing its balance; OPERATIONS can read any customer's
+balance and history. The idempotency-authorization-ordering
+requirement is proven directly: a different customer reusing another
+customer's exact Idempotency-Key string against the first customer's
+account is rejected 404 — never the first customer's stored response —
+with zero mutation to `idempotency_key`, `ledger_transaction`,
+`outbox_event`, or the account's balance; and two different customers
+reusing the identical key string against their *own* accounts are proven
+completely independent (both succeed as genuinely new deposits, never a
+409 conflict), directly demonstrating the V7 composite-uniqueness schema
+change.
+
+`OwnershipSchemaMigrationIntegrationTest` (10 tests, PostgreSQL
+Testcontainers, V1–V7 applied from scratch): `V7` applies successfully;
+`account.customer_subject` and `idempotency_key.principal_subject`
+(`NOT NULL`) exist; `chk_account_ownership` exists and is enforced in
+both directions (a `CUSTOMER` row without a subject is rejected; a
+`SYSTEM` row with one is rejected; a `CUSTOMER` row with one is
+accepted); `uq_idempotency_key_principal` exists and `uq_idempotency_key`
+no longer does; two different principals can insert the identical raw
+key string at the database level, but the same principal cannot reuse it
+twice (a direct, schema-level proof of the composite uniqueness, beneath
+the application-level tests above).
+
+Every existing HTTP-driven integration test file across `account`,
+`transfer`, `idempotency`, `settlement`, `reconciliation`, `outbox`,
+`inbox`, and `common` was updated to authenticate — CUSTOMER for
+account/deposit/transfer flows, OPERATIONS for settlement/reconciliation
+— preserving every pre-existing assertion's original intent and
+strength; none were weakened, skipped, or given a permissive bypass.
+`common.OpenApiDocumentationIntegrationTest` gained assertions that the
+`bearerAuth` security scheme is declared and applied globally except on
+`POST /api/v1/auth/token` (which documents an empty per-operation
+override), and that no actual secret value (BCrypt hash prefix, signing
+key) ever appears in the generated document — the pre-existing blanket
+"no authentication scheme at all" assertion is retired since it
+described Phase 1/2, not Task 17's actual, intended behavior.
+`common.StaticUiIntegrationTest` was updated to reflect a real,
+security-relevant distinction Task 17 introduces: a genuinely unmapped
+path *outside* `/api/v1/**` still returns 404 (the static/public
+fallback), while an unmapped path *under* the now-protected
+`/api/v1/**` namespace correctly returns 401 for an unauthenticated
+caller before route existence is ever considered.
+
+A genuine concurrency bug was found and fixed during this task, not
+merely tested around: the new unlocked ownership pre-check in
+`DepositService`/`TransferService` initially left a stale entity in the
+JPA persistence context, causing the existing
+`DepositIntegrationTest.concurrentDepositsIntoSameWalletDoNotLoseUpdates`,
+`TransferIntegrationTest.concurrentTransfersFromOneSourceDoNotOverspend`,
+and `MixedWorkloadConsistencyIntegrationTest.mixedConcurrentWorkloadPreservesAllInvariants`
+to fail with real lost updates on the first full-suite run after adding
+ownership checks — proving those Task 16 concurrency tests still do
+their job. Fixed with an explicit `entityManager.detach(...)`; see
+`docs/ARCHITECTURE.md`'s "Authentication and Authorization" section.
 
 ## Currently Implemented
 

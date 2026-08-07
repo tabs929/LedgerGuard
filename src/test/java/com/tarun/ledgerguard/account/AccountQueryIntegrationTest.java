@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tarun.ledgerguard.account.dto.AccountBalanceResponse;
 import com.tarun.ledgerguard.account.dto.AccountResponse;
 import com.tarun.ledgerguard.account.dto.TransactionHistoryItem;
+import com.tarun.ledgerguard.security.TestAuthSupport;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.resttestclient.TestRestTemplate;
@@ -13,6 +14,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -150,7 +152,7 @@ class AccountQueryIntegrationTest {
 
 	@Test
 	void malformedUuidForBalanceReturns400() {
-		ResponseEntity<String> response = restTemplate.getForEntity("/api/v1/accounts/not-a-uuid/balance", String.class);
+		ResponseEntity<String> response = getRaw("/api/v1/accounts/not-a-uuid/balance");
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -298,7 +300,7 @@ class AccountQueryIntegrationTest {
 
 	@Test
 	void malformedUuidForHistoryReturns400() {
-		ResponseEntity<String> response = restTemplate.getForEntity("/api/v1/accounts/not-a-uuid/transactions", String.class);
+		ResponseEntity<String> response = getRaw("/api/v1/accounts/not-a-uuid/transactions");
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -398,8 +400,8 @@ class AccountQueryIntegrationTest {
 	@Test
 	void malformedPaginationParametersAreRejected() {
 		UUID accountId = createUsdCustomerAccount("History Owner Malformed Pagination");
-		ResponseEntity<String> response = restTemplate.getForEntity(
-				"/api/v1/accounts/" + accountId + "/transactions?page=abc&size=xyz", String.class);
+		ResponseEntity<String> response = getRaw(
+				"/api/v1/accounts/" + accountId + "/transactions?page=abc&size=xyz");
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
 	}
 
@@ -481,19 +483,30 @@ class AccountQueryIntegrationTest {
 	// helpers
 	// ------------------------------------------------------------------
 
-	private UUID createUsdCustomerAccount(String ownerName) {
+	// Every account in this class is created by (and read back as) the
+	// same test-customer-a principal -- Task 17 cross-principal isolation
+	// itself is covered separately in OwnershipAuthorizationIntegrationTest.
+	private HttpHeaders authHeaders() {
 		HttpHeaders headers = new HttpHeaders();
 		headers.setContentType(MediaType.APPLICATION_JSON);
+		headers.setBearerAuth(TestAuthSupport.customerAToken(restTemplate));
+		return headers;
+	}
+
+	private ResponseEntity<String> getRaw(String url) {
+		return restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(authHeaders()), String.class);
+	}
+
+	private UUID createUsdCustomerAccount(String ownerName) {
 		ResponseEntity<AccountResponse> response = restTemplate.postForEntity(
-				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), headers),
+				"/api/v1/accounts", new HttpEntity<>(Map.of("ownerName", ownerName, "currency", "USD"), authHeaders()),
 				AccountResponse.class);
 		assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 		return response.getBody().id();
 	}
 
 	private com.tarun.ledgerguard.account.dto.DepositResponse deposit(UUID accountId, String amount) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		ResponseEntity<com.tarun.ledgerguard.account.dto.DepositResponse> response = restTemplate.postForEntity(
 				"/api/v1/accounts/" + accountId + "/deposits",
@@ -504,8 +517,7 @@ class AccountQueryIntegrationTest {
 	}
 
 	private com.tarun.ledgerguard.transfer.dto.TransferResponse transfer(UUID sourceId, UUID destinationId, String amount) {
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
+		HttpHeaders headers = authHeaders();
 		headers.set("Idempotency-Key", UUID.randomUUID().toString());
 		Map<String, Object> body = Map.of(
 				"sourceAccountId", sourceId.toString(),
@@ -519,11 +531,12 @@ class AccountQueryIntegrationTest {
 	}
 
 	private ResponseEntity<AccountBalanceResponse> getBalance(UUID accountId) {
-		return restTemplate.getForEntity("/api/v1/accounts/" + accountId + "/balance", AccountBalanceResponse.class);
+		return restTemplate.exchange("/api/v1/accounts/" + accountId + "/balance", HttpMethod.GET,
+				new HttpEntity<>(authHeaders()), AccountBalanceResponse.class);
 	}
 
 	private ResponseEntity<String> getBalanceRaw(UUID accountId) {
-		return restTemplate.getForEntity("/api/v1/accounts/" + accountId + "/balance", String.class);
+		return getRaw("/api/v1/accounts/" + accountId + "/balance");
 	}
 
 	private Map<String, Object> getHistory(UUID accountId, Integer page, Integer size) {
@@ -538,7 +551,7 @@ class AccountQueryIntegrationTest {
 	}
 
 	private ResponseEntity<String> getHistoryRaw(UUID accountId, Integer page, Integer size) {
-		return restTemplate.getForEntity(historyUrl(accountId, page, size), String.class);
+		return getRaw(historyUrl(accountId, page, size));
 	}
 
 	@SuppressWarnings("unchecked")

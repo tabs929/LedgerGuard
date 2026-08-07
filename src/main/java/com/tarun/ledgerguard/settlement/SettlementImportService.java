@@ -1,5 +1,8 @@
 package com.tarun.ledgerguard.settlement;
 
+import com.tarun.ledgerguard.security.AuthenticatedPrincipal;
+import com.tarun.ledgerguard.security.AuthorizationSupport;
+import com.tarun.ledgerguard.security.Role;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -45,7 +48,12 @@ public class SettlementImportService {
 		this.processor = processor;
 	}
 
-	public SettlementImportOutcome importFile(String rawSource, MultipartFile file) {
+	public SettlementImportOutcome importFile(String rawSource, MultipartFile file, AuthenticatedPrincipal principal) {
+		// Task 17: SecurityConfig's URL rule already restricts this
+		// endpoint to OPERATIONS, but this service-level check means
+		// bypassing the controller cannot bypass authorization either.
+		AuthorizationSupport.requireRole(principal, Role.OPERATIONS);
+
 		if (!properties.isEnabled()) {
 			throw new SettlementImportDisabledException();
 		}
